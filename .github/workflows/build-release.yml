@@ -1,0 +1,37 @@
+name: build-frozen-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install . pyinstaller
+      - run: python -m unittest discover -s tests -v
+      - run: python -m sentinel_blue self-test --scenarios 100 --fuzz-iterations 1000 --load-events 250 --json
+      - run: node --check portal-extension/popup.js
+      - run: node --check portal-extension/content.js
+      - run: python tools/build_release.py --output release
+      - run: pyinstaller --clean --onefile --name sentinel-blue --collect-data sentinel_blue packaging/sentinel_blue_entry.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-blue-${{ matrix.os }}
+          path: |
+            dist/sentinel-blue*
+            release/sentinel-blue-*
+            release/SHA256SUMS
