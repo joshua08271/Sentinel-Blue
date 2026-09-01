@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import tempfile
 import time
 from dataclasses import asdict
@@ -17,6 +18,20 @@ from .controller import ControllerApp
 from .risk import RiskModel
 from .simulator import _telemetry_scenarios
 from .store import Store
+
+
+def _windows_security_descriptor_sha256(path: Path, expected: bytes) -> str:
+    if os.name != "nt":
+        return ""
+    from .restoration import _windows_read_file_snapshot
+
+    data, metadata = _windows_read_file_snapshot(path, len(expected))
+    if data != expected:
+        raise ValueError("disposable Windows fixture changed during ACL capture")
+    descriptor = metadata.get("windows_security_descriptor")
+    if not isinstance(descriptor, str) or not descriptor:
+        raise ValueError("disposable Windows fixture lacks a security descriptor")
+    return hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
 
 
 def _materialize_disposable_integrity(
@@ -54,6 +69,9 @@ def _materialize_disposable_integrity(
             "sha256": hashlib.sha256(content).hexdigest(),
             "size": len(content),
             "modified_at": target.stat().st_mtime,
+            "security_descriptor_sha256": _windows_security_descriptor_sha256(
+                target, content
+            ),
         }
         materialized.append(row)
         mapped[str(original["path"])] = (original, row)
@@ -85,6 +103,9 @@ def _materialize_disposable_integrity(
             "path": str(target),
             "sha256": hashlib.sha256(content).hexdigest(),
             "size": len(content),
+            "security_descriptor_sha256": approved_row.get(
+                "security_descriptor_sha256", ""
+            ),
         }
         updated_current.append(changed_row)
         deferred.append((target, content, changed_row))

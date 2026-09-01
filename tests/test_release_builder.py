@@ -1,12 +1,19 @@
 import hashlib
 import io
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.build_release import ROOT, VERSION, _entries, build
-from tools.check_release_consistency import _safe_archive, check_bundle, check_source
+from tools.check_release_consistency import (
+    _expected_release,
+    _safe_archive,
+    check_bundle,
+    check_source,
+)
 
 
 def _zip_bytes(entries: list[tuple[str, bytes]]) -> bytes:
@@ -59,6 +66,84 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertEqual(len(names), 1)
             self.assertTrue(names[0].endswith("/probe/module.py"), names)
 
+    def test_entry_collection_rejects_missing_inputs(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            missing = Path(directory) / "missing"
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                _entries([missing])
+
+    def test_build_constraints_are_exact_and_used(self):
+        constraints_path = ROOT / "packaging" / "build-constraints.txt"
+        lines = [
+            line.strip()
+            for line in constraints_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        versions = {}
+        for line in lines:
+            requirement = line.split(";", 1)[0].strip()
+            self.assertEqual(requirement.count("=="), 1, requirement)
+            name, version = requirement.split("==")
+            self.assertNotIn(name, versions)
+            versions[name] = version
+        self.assertEqual(
+            versions,
+            {
+                "altgraph": "0.17.5",
+                "packaging": "26.3",
+                "pefile": "2024.8.26",
+                "pip": "26.2.1",
+                "pyinstaller": "6.22.2",
+                "pyinstaller-hooks-contrib": "2026.7",
+                "pywin32-ctypes": "0.2.3",
+                "setuptools": "84.0.0",
+            },
+        )
+        for workflow_name in (
+            "continuous-validation.yml",
+            "build-release.yml",
+        ):
+            workflow = (
+                ROOT / ".github" / "workflows" / workflow_name
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                "PIP_CONSTRAINT: packaging/build-constraints.txt",
+                workflow,
+            )
+            self.assertIn('pip install "pip==26.2.1"', workflow)
+            self.assertNotIn("pip install --upgrade pip", workflow)
+        self.assertIn(
+            "python tools/check_release_consistency.py",
+            (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+                encoding="utf-8"
+            ),
+        )
+        self.assertIn(
+            'pip install . "pyinstaller==6.22.2"',
+            (ROOT / ".github" / "workflows" / "continuous-validation.yml").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+
+    def test_github_tag_release_is_bound_to_source_version(self):
+        matching = {
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REF_TYPE": "tag",
+            "GITHUB_REF_NAME": f"v{VERSION}",
+        }
+        with patch.dict(os.environ, matching, clear=True):
+            self.assertEqual(_expected_release(None), f"v{VERSION}")
+            self.assertEqual(check_source(_expected_release(None)), VERSION)
+        mismatched = {**matching, "GITHUB_REF_NAME": "v0.0.0"}
+        with patch.dict(os.environ, mismatched, clear=True):
+            with self.assertRaisesRegex(ValueError, "does not match expected"):
+                check_source(_expected_release(None))
+        missing = {"GITHUB_ACTIONS": "true", "GITHUB_REF_TYPE": "tag"}
+        with patch.dict(os.environ, missing, clear=True):
+            with self.assertRaisesRegex(ValueError, "missing GITHUB_REF_NAME"):
+                _expected_release(None)
+
     def test_builds_core_runtime_source_and_complete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = build(Path(directory))
@@ -70,9 +155,15 @@ class ReleaseBuilderTests(unittest.TestCase):
             with zipfile.ZipFile(Path(directory) / f"sentinel-blue-{VERSION}.pyz") as archive:
                 self.assertIn("sentinel_blue/__main__.py", archive.namelist())
                 self.assertFalse(any(".egg-info/" in name for name in archive.namelist()))
-            with zipfile.ZipFile(Path(directory) / f"sentinel-blue-source-{VERSION}.zip") as archive:
-                self.assertIn(".gitignore", archive.namelist())
-                self.assertFalse(any(".egg-info/" in name for name in archive.namelist()))
+            with zipfile.ZipFile(
+                Path(directory) / f"sentinel-blue-source-{VERSION}.zip"
+            ) as archive:
+                source_names = archive.namelist()
+                self.assertIn(".gitignore", source_names)
+                self.assertIn("README.md", source_names)
+                self.assertIn("SECURITY.md", source_names)
+                self.assertFalse(any(name.startswith("reports/") for name in source_names))
+                self.assertFalse(any(".egg-info/" in name for name in source_names))
             with zipfile.ZipFile(Path(directory) / f"sentinel-blue-complete-lab-{VERSION}.zip") as archive:
                 self.assertEqual(
                     {

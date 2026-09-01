@@ -1,0 +1,10 @@
+# Exact CI/release toolchain observed in the cross-platform 1.9.13 build.
+# Update deliberately and rerun the full Linux/Windows validation matrix.
+altgraph==0.17.5
+packaging==26.3
+pefile==2024.8.26 ; sys_platform == "win32"
+pip==26.2.1
+pyinstaller==6.22.2
+pyinstaller-hooks-contrib==2026.7
+pywin32-ctypes==0.2.3 ; sys_platform == "win32"
+setuptools==84.0.0

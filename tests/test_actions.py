@@ -23,14 +23,80 @@ from sentinel_blue.validation import telemetry_observation_sha256
 class ActionTests(unittest.TestCase):
     @staticmethod
     def _metadata(mode=0o600):
+        descriptor = "test-windows-security-descriptor" if os.name == "nt" else None
         return {
             "mode": mode,
             "uid": -1,
             "gid": -1,
             "xattrs": {},
-            "windows_security_descriptor": None,
-            "windows_security_descriptor_version": None,
+            "windows_security_descriptor": descriptor,
+            "windows_security_descriptor_version": (
+                restoration.WINDOWS_SECURITY_DESCRIPTOR_VERSION
+                if descriptor
+                else None
+            ),
         }
+
+    @classmethod
+    def _approved_item(
+        cls,
+        store: RestorePointStore,
+        target: Path,
+        digest: str,
+        *,
+        metadata: dict | None = None,
+    ) -> dict:
+        item = {"path": str(target), "sha256": digest}
+        if os.name == "nt":
+            if metadata is None:
+                _, metadata = store._read_target(target)
+            fingerprint = store._metadata_security_descriptor_sha256(metadata)
+            if not fingerprint:
+                raise ValueError("Windows test target lacks a security descriptor")
+            item["security_descriptor_sha256"] = fingerprint
+        return item
+
+    @classmethod
+    def _capture_request(
+        cls,
+        store: RestorePointStore,
+        target: Path,
+        digest: str,
+    ) -> dict:
+        return {"files": [cls._approved_item(store, target, digest)]}
+
+    @classmethod
+    def _restore_request(
+        cls,
+        store: RestorePointStore,
+        target: Path,
+        baseline_sha256: str,
+        *,
+        observed_sha256: str | None = None,
+        **extra,
+    ) -> dict:
+        parameters = {
+            "path": str(target),
+            "baseline_sha256": baseline_sha256,
+            **extra,
+        }
+        if observed_sha256 is not None:
+            parameters["observed_sha256"] = observed_sha256
+        if os.name == "nt":
+            current = store._read_target_if_present(target)
+            if current is None:
+                metadata = store._read_manifest().get(str(target))
+                if not isinstance(metadata, dict):
+                    raise ValueError("Windows test baseline metadata is unavailable")
+            else:
+                _, metadata = current
+            fingerprint = store._metadata_security_descriptor_sha256(metadata)
+            if not fingerprint:
+                raise ValueError("Windows test target lacks a security descriptor")
+            parameters["baseline_security_descriptor_sha256"] = fingerprint
+            if observed_sha256 is not None and current is not None:
+                parameters["observed_security_descriptor_sha256"] = fingerprint
+        return parameters
 
     @staticmethod
     def _identity(process_id: int = 4242, boot_id: str = "test-boot") -> dict:
@@ -138,14 +204,19 @@ class ActionTests(unittest.TestCase):
                 patch.object(Path, "is_file", side_effect=AssertionError),
                 patch.object(Path, "is_symlink", side_effect=AssertionError),
             ):
-                result = store.restore(
-                    {
-                        "path": str(target),
-                        "baseline_sha256": expected,
-                        "observed_sha256": hashlib.sha256(before).hexdigest(),
-                    },
-                    allowed=True,
-                )
+                parameters = {
+                    "path": str(target),
+                    "baseline_sha256": expected,
+                    "observed_sha256": hashlib.sha256(before).hexdigest(),
+                }
+                if os.name == "nt":
+                    descriptor = str(record["windows_security_descriptor"])
+                    descriptor_sha256 = hashlib.sha256(
+                        descriptor.encode("ascii")
+                    ).hexdigest()
+                    parameters["baseline_security_descriptor_sha256"] = descriptor_sha256
+                    parameters["observed_security_descriptor_sha256"] = descriptor_sha256
+                result = store.restore(parameters, allowed=True)
         self.assertTrue(result["success"])
         self.assertTrue(result["evidence_preserved"])
         optional_read.assert_called_once_with(target)
@@ -228,7 +299,14 @@ class ActionTests(unittest.TestCase):
                 patch.object(Path, "is_symlink", side_effect=AssertionError),
             ):
                 result = store.capture(
-                    [{"path": str(target), "sha256": digest}]
+                    [
+                        self._approved_item(
+                            store,
+                            target,
+                            digest,
+                            metadata=self._metadata(),
+                        )
+                    ]
                 )
             self.assertTrue(result["success"])
             optional_read.assert_called_once_with(store.blobs / digest, restoration.MAX_FILE_BYTES)
@@ -343,7 +421,7 @@ class ActionTests(unittest.TestCase):
             approved = hashlib.sha256(target.read_bytes()).hexdigest()
             store = RestorePointStore(root / "state", ["127.0.0.0/8"])
             self.assertTrue(
-                store.capture([{"path": str(target), "sha256": approved}])["success"]
+                store.capture([self._approved_item(store, target, approved)])["success"]
             )
             target.write_bytes(b"compromised")
             observed = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -356,11 +434,12 @@ class ActionTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(OSError, "rollback"):
                     store.restore(
-                        {
-                            "path": str(target),
-                            "baseline_sha256": approved,
-                            "observed_sha256": observed,
-                        },
+                        self._restore_request(
+                            store,
+                            target,
+                            approved,
+                            observed_sha256=observed,
+                        ),
                         allowed=True,
                         probes=[{"name": "health"}],
                     )
@@ -379,7 +458,13 @@ class ActionTests(unittest.TestCase):
             for index in range(16):
                 target = root / f"protected-{index}.conf"
                 target.write_text(f"approved-{index}", encoding="utf-8")
-                items.append({"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
+                items.append(
+                    self._approved_item(
+                        executor.restore_points,
+                        target,
+                        hashlib.sha256(target.read_bytes()).hexdigest(),
+                    )
+                )
             with ThreadPoolExecutor(max_workers=8) as pool:
                 results = list(
                     pool.map(
@@ -399,7 +484,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             capture = executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             self.assertTrue(capture["success"])
@@ -408,11 +493,12 @@ class ActionTests(unittest.TestCase):
             observed = hashlib.sha256(target.read_bytes()).hexdigest()
             restored = executor.execute(
                 "restore_integrity",
-                {
-                    "path": str(target),
-                    "baseline_sha256": approved,
-                    "observed_sha256": observed,
-                },
+                self._restore_request(
+                    executor.restore_points,
+                    target,
+                    approved,
+                    observed_sha256=observed,
+                ),
                 {},
             )
             self.assertTrue(restored["success"])
@@ -439,7 +525,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(Path(directory) / "state", allow_restoration=True)
             captured = executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             self.assertTrue(captured["success"])
@@ -517,14 +603,14 @@ class ActionTests(unittest.TestCase):
             self.assertTrue(
                 executor.execute(
                     "capture_restore_point",
-                    {"files": [{"path": str(target), "sha256": approved}]},
+                    self._capture_request(executor.restore_points, target, approved),
                     {},
                 )["success"]
             )
             target.write_text("changed", encoding="utf-8")
             result = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             self.assertTrue(result["success"])
@@ -539,7 +625,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("required-change", encoding="utf-8")
@@ -548,12 +634,13 @@ class ActionTests(unittest.TestCase):
             with patch("sentinel_blue.restoration.run_probes", return_value=[unhealthy]):
                 result = executor.execute(
                     "restore_integrity",
-                    {
-                        "path": str(target),
-                        "baseline_sha256": approved,
-                        "observed_sha256": observed,
-                        "probes": [{"name": "service-monitor-example"}],
-                    },
+                    self._restore_request(
+                        executor.restore_points,
+                        target,
+                        approved,
+                        observed_sha256=observed,
+                        probes=[{"name": "service-monitor-example"}],
+                    ),
                     {},
                 )
             self.assertFalse(result["success"])
@@ -568,7 +655,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("required-change", encoding="utf-8")
@@ -582,7 +669,7 @@ class ActionTests(unittest.TestCase):
             ):
                 result = executor.execute(
                     "restore_integrity",
-                    {"path": str(target), "baseline_sha256": approved},
+                    self._restore_request(executor.restore_points, target, approved),
                     {},
                 )
             self.assertFalse(result["success"])
@@ -598,7 +685,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             manifest = executor.restore_points.manifest_path
@@ -606,7 +693,7 @@ class ActionTests(unittest.TestCase):
             target.write_text("tampered", encoding="utf-8")
             result = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             self.assertFalse(result["success"])
@@ -622,7 +709,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             manifest = executor.restore_points.manifest_path
@@ -641,7 +728,7 @@ class ActionTests(unittest.TestCase):
             target.write_text("tampered", encoding="utf-8")
             result = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             self.assertFalse(result["success"])
@@ -664,24 +751,24 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("prechange", encoding="utf-8")
             original = executor.restore_points._replace_target
             calls = 0
 
-            def interrupt_once(path, data, metadata):
+            def interrupt_once(path, data, metadata, **kwargs):
                 nonlocal calls
                 calls += 1
-                original(path, data, metadata)
+                original(path, data, metadata, **kwargs)
                 if calls == 1:
                     raise OSError("synthetic power loss")
 
             with patch.object(executor.restore_points, "_replace_target", side_effect=interrupt_once):
                 result = executor.execute(
                     "restore_integrity",
-                    {"path": str(target), "baseline_sha256": approved},
+                    self._restore_request(executor.restore_points, target, approved),
                     {},
                 )
             self.assertFalse(result["success"])
@@ -695,14 +782,14 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("prechange", encoding="utf-8")
             original = executor.restore_points._replace_target
 
-            def simulated_process_death(path, data, metadata):
-                original(path, data, metadata)
+            def simulated_process_death(path, data, metadata, **kwargs):
+                original(path, data, metadata, **kwargs)
                 raise SystemExit("synthetic process death")
 
             with patch.object(
@@ -712,7 +799,7 @@ class ActionTests(unittest.TestCase):
             ):
                 with self.assertRaises(SystemExit):
                     executor.restore_points.restore(
-                        {"path": str(target), "baseline_sha256": approved},
+                        self._restore_request(executor.restore_points, target, approved),
                         allowed=True,
                     )
             self.assertEqual(target.read_text(encoding="utf-8"), "approved")
@@ -729,13 +816,13 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("pre-restoration", encoding="utf-8")
             restored = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             transaction_id = restored["pre_state"]["transaction_id"]
@@ -763,13 +850,13 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("pre-restoration", encoding="utf-8")
             restored = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             target.chmod(0o600)
@@ -806,17 +893,18 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("second-change", encoding="utf-8")
             result = executor.execute(
                 "restore_integrity",
-                {
-                    "path": str(target),
-                    "baseline_sha256": approved,
-                    "observed_sha256": "a" * 64,
-                },
+                self._restore_request(
+                    executor.restore_points,
+                    target,
+                    approved,
+                    observed_sha256="a" * 64,
+                ),
                 {},
             )
             self.assertFalse(result["success"])
@@ -831,7 +919,7 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             blob = executor.restore_points.blobs / approved
@@ -840,11 +928,12 @@ class ActionTests(unittest.TestCase):
             target.write_text("tampered", encoding="utf-8")
             result = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             self.assertFalse(result["success"])
-            self.assertIn("non-symlink", result["message"])
+            expected_reason = "reparse point" if os.name == "nt" else "non-symlink"
+            self.assertIn(expected_reason, result["message"])
             self.assertEqual(target.read_text(encoding="utf-8"), "tampered")
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links unavailable")
@@ -856,13 +945,13 @@ class ActionTests(unittest.TestCase):
             executor = ActionExecutor(directory, allow_restoration=True)
             executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                self._capture_request(executor.restore_points, target, approved),
                 {},
             )
             target.write_text("tampered", encoding="utf-8")
             restored = executor.execute(
                 "restore_integrity",
-                {"path": str(target), "baseline_sha256": approved},
+                self._restore_request(executor.restore_points, target, approved),
                 {},
             )
             transaction_id = restored["pre_state"]["transaction_id"]
@@ -877,7 +966,9 @@ class ActionTests(unittest.TestCase):
                 {},
             )
             self.assertFalse(result["success"])
-            self.assertIn("non-symlink", result["message"])
+            expected_reason = "reparse point" if os.name == "nt" else "non-symlink"
+            self.assertIn(expected_reason, result["message"])
+
     def test_containment_is_dry_run_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = ActionExecutor(directory)
