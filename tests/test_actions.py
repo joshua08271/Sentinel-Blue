@@ -758,10 +758,10 @@ class ActionTests(unittest.TestCase):
             original = executor.restore_points._replace_target
             calls = 0
 
-            def interrupt_once(path, data, metadata):
+            def interrupt_once(path, data, metadata, **kwargs):
                 nonlocal calls
                 calls += 1
-                original(path, data, metadata)
+                original(path, data, metadata, **kwargs)
                 if calls == 1:
                     raise OSError("synthetic power loss")
 
@@ -788,8 +788,8 @@ class ActionTests(unittest.TestCase):
             target.write_text("prechange", encoding="utf-8")
             original = executor.restore_points._replace_target
 
-            def simulated_process_death(path, data, metadata):
-                original(path, data, metadata)
+            def simulated_process_death(path, data, metadata, **kwargs):
+                original(path, data, metadata, **kwargs)
                 raise SystemExit("synthetic process death")
 
             with patch.object(
@@ -932,7 +932,8 @@ class ActionTests(unittest.TestCase):
                 {},
             )
             self.assertFalse(result["success"])
-            self.assertIn("non-symlink", result["message"])
+            expected_reason = "reparse point" if os.name == "nt" else "non-symlink"
+            self.assertIn(expected_reason, result["message"])
             self.assertEqual(target.read_text(encoding="utf-8"), "tampered")
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links unavailable")

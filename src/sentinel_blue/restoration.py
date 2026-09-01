@@ -900,6 +900,127 @@ def _windows_read_file_snapshot_if_present(
         raise
 
 
+def _windows_security_descriptor_semantics(
+    encoded_descriptor: str,
+) -> tuple[str, int]:
+    """Return the access-relevant SDDL and ACL-protection control bits."""
+    if os.name != "nt":
+        raise OSError("Windows security descriptor comparison is unavailable")
+    if (
+        not isinstance(encoded_descriptor, str)
+        or not encoded_descriptor
+        or len(encoded_descriptor) > MAX_WINDOWS_SECURITY_DESCRIPTOR_TEXT
+        or "\x00" in encoded_descriptor
+    ):
+        raise ValueError("Windows file security descriptor is invalid")
+    try:
+        raw_descriptor = base64.b64decode(
+            encoded_descriptor.encode("ascii"), validate=True
+        )
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("Windows file security descriptor is invalid") from exc
+    if not 1 <= len(raw_descriptor) <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES:
+        raise ValueError("Windows file security descriptor is outside its accepted size")
+
+    buffer = ctypes.create_string_buffer(raw_descriptor, len(raw_descriptor))
+    descriptor = ctypes.cast(buffer, ctypes.c_void_p)
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    is_valid = advapi32.IsValidSecurityDescriptor
+    is_valid.argtypes = [ctypes.c_void_p]
+    is_valid.restype = wintypes.BOOL
+    get_length = advapi32.GetSecurityDescriptorLength
+    get_length.argtypes = [ctypes.c_void_p]
+    get_length.restype = wintypes.DWORD
+    if not is_valid(descriptor) or int(get_length(descriptor)) != len(raw_descriptor):
+        raise ValueError("Windows file security descriptor is malformed")
+
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    get_control = advapi32.GetSecurityDescriptorControl
+    get_control.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_control.restype = wintypes.BOOL
+    if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+        raise OSError(
+            ctypes.get_last_error(), "Windows security descriptor control is invalid"
+        )
+
+    converted = wintypes.LPWSTR()
+    converted_length = wintypes.DWORD()
+    convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    convert.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    convert.restype = wintypes.BOOL
+    if not convert(
+        descriptor,
+        1,
+        WINDOWS_CORE_SECURITY_INFORMATION,
+        ctypes.byref(converted),
+        ctypes.byref(converted_length),
+    ):
+        raise OSError(
+            ctypes.get_last_error(), "Windows security descriptor could not be canonicalized"
+        )
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+    try:
+        length = int(converted_length.value)
+        if (
+            not converted
+            or not 1 <= length <= MAX_WINDOWS_SECURITY_DESCRIPTOR_TEXT * 4
+        ):
+            raise ValueError(
+                "Windows security descriptor canonical form is outside its accepted size"
+            )
+        canonical = converted.value
+        if not isinstance(canonical, str) or not canonical or "\x00" in canonical:
+            raise ValueError("Windows security descriptor canonical form is invalid")
+        protection = int(control.value) & (
+            WINDOWS_SE_DACL_PROTECTED | WINDOWS_SE_SACL_PROTECTED
+        )
+        return canonical, protection
+    finally:
+        if converted:
+            local_free(ctypes.cast(converted, ctypes.c_void_p))
+
+
+def _windows_security_descriptors_equivalent(
+    expected_descriptor: object,
+    observed_descriptor: object,
+) -> bool:
+    """Compare access semantics while rejecting absent, malformed, or changed ACLs."""
+    if (
+        not isinstance(expected_descriptor, str)
+        or not expected_descriptor
+        or not isinstance(observed_descriptor, str)
+        or not observed_descriptor
+    ):
+        return False
+    if expected_descriptor == observed_descriptor:
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        return _windows_security_descriptor_semantics(
+            expected_descriptor
+        ) == _windows_security_descriptor_semantics(observed_descriptor)
+    except Exception:
+        # Conditional mutation and post-apply verification must fail closed.
+        return False
+
+
 def _windows_expected_snapshot_matches(
     expected_data: bytes,
     expected_metadata: dict[str, Any],
@@ -922,9 +1043,10 @@ def _windows_expected_snapshot_matches(
     if (
         observed_data != expected_data
         or expected_mode != observed_mode
-        or not isinstance(expected_descriptor, str)
-        or not expected_descriptor
-        or observed.get("windows_security_descriptor") != expected_descriptor
+        or not _windows_security_descriptors_equivalent(
+            expected_descriptor,
+            observed.get("windows_security_descriptor"),
+        )
     ):
         return False
     exact_fields = {
@@ -1100,7 +1222,9 @@ def _windows_atomic_write(
                         destination,
                         native_handle=handle,
                     )
-                    if observed != encoded_descriptor:
+                    if not _windows_security_descriptors_equivalent(
+                        encoded_descriptor, observed
+                    ):
                         raise OSError(
                             "post-restoration Windows security descriptor did not match"
                         )
@@ -1937,7 +2061,7 @@ def _windows_restoration_security_information(
         )
     # Set only components that are actually present. An absent SACL is tracked
     # independently and intentionally left absent; same-handle recapture verifies
-    # that the final descriptor still matches the approved binary descriptor.
+    # the approved owner, group, DACL, SACL, and ACL-protection semantics.
     security_information = (
         WINDOWS_OWNER_SECURITY_INFORMATION
         | WINDOWS_GROUP_SECURITY_INFORMATION
@@ -3142,8 +3266,10 @@ class RestorePointStore:
                 and observed.get("windows_security_descriptor_version")
                 == WINDOWS_SECURITY_DESCRIPTOR_VERSION
                 and int(expected.get("mode", 0)) == int(observed.get("mode", -1))
-                and expected_descriptor
-                == observed.get("windows_security_descriptor")
+                and _windows_security_descriptors_equivalent(
+                    expected_descriptor,
+                    observed.get("windows_security_descriptor"),
+                )
             )
         return cls._metadata_snapshot(expected) == cls._metadata_snapshot(observed)
 

@@ -403,6 +403,75 @@ class WindowsRestorationTests(unittest.TestCase):
             restoration._windows_atomic_write(target, expected, 0o600, None)
             self.assertEqual(target.read_bytes(), expected)
 
+    def test_descriptor_equivalence_uses_acl_semantics_and_fails_closed(self):
+        semantic_keys = {
+            "first-encoding": ("O:S-1-5-18G:S-1-5-18D:(A;;FA;;;SY)", 0),
+            "second-encoding": ("O:S-1-5-18G:S-1-5-18D:(A;;FA;;;SY)", 0),
+            "different-acl": ("O:S-1-5-18G:S-1-5-18D:(D;;FA;;;SY)", 0),
+        }
+        with (
+            patch.object(restoration.os, "name", "nt"),
+            patch.object(
+                restoration,
+                "_windows_security_descriptor_semantics",
+                side_effect=lambda value: semantic_keys[value],
+            ),
+        ):
+            self.assertTrue(
+                restoration._windows_security_descriptors_equivalent(
+                    "first-encoding", "second-encoding"
+                )
+            )
+            self.assertFalse(
+                restoration._windows_security_descriptors_equivalent(
+                    "first-encoding", "different-acl"
+                )
+            )
+            self.assertFalse(
+                restoration._windows_security_descriptors_equivalent(
+                    "first-encoding", "malformed"
+                )
+            )
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                "same-encoding", "same-encoding"
+            )
+        )
+        self.assertFalse(
+            restoration._windows_security_descriptors_equivalent("", "")
+        )
+
+    @unittest.skipUnless(os.name == "nt", "native Windows file APIs unavailable")
+    def test_native_acl_round_trip_preserves_security_semantics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "native-acl-round-trip.bin"
+            original = b"approved-state"
+            replacement_bytes = b"restored-state\x00binary"
+            target.write_bytes(original)
+            before_data, before_snapshot = restoration._windows_read_file_snapshot(
+                target, restoration.MAX_FILE_BYTES
+            )
+            before_metadata = restoration._windows_metadata_from_native_snapshot(
+                before_snapshot
+            )
+            restoration._windows_atomic_write(
+                target,
+                replacement_bytes,
+                int(before_metadata["mode"]),
+                before_metadata,
+                expected_current=(before_data, before_metadata),
+            )
+            after_data, after_snapshot = restoration._windows_read_file_snapshot(
+                target, restoration.MAX_FILE_BYTES
+            )
+            self.assertEqual(after_data, replacement_bytes)
+            self.assertTrue(
+                restoration._windows_security_descriptors_equivalent(
+                    before_metadata["windows_security_descriptor"],
+                    after_snapshot["windows_security_descriptor"],
+                )
+            )
+
     def test_private_file_verifies_links_after_delete_pending_is_cleared(self):
         class DeletePendingLinkCount(_FakeWindowsFileOps):
             def __init__(self):
