@@ -69,7 +69,6 @@ WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
-WINDOWS_FILE_ADD_FILE = 0x00000002
 WINDOWS_FILE_TRAVERSE = 0x00000020
 WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
 WINDOWS_DELETE = 0x00010000
@@ -91,6 +90,11 @@ WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 WINDOWS_FILE_BASIC_INFO_CLASS = 0
 WINDOWS_FILE_RENAME_INFO_CLASS = 3
 WINDOWS_FILE_DISPOSITION_INFO_CLASS = 4
+# FILE_INFO_BY_HANDLE_CLASS is a zero-based Win32 enum. FileRenameInfoEx
+# follows FileDispositionInfoEx (21) in minwinbase.h.
+WINDOWS_FILE_RENAME_INFO_EX_CLASS = 22
+WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
+WINDOWS_FILE_RENAME_POSIX_SEMANTICS = 0x00000002
 WINDOWS_VOLUME_NAME_GUID = 0x00000001
 WINDOWS_ERROR_FILE_NOT_FOUND = 2
 WINDOWS_ERROR_PATH_NOT_FOUND = 3
@@ -155,31 +159,46 @@ class _WindowsFileRenameInformationHeader(ctypes.Structure):
 
 
 def _windows_file_rename_information(
-    parent_handle,
     target_name: str,
     *,
     replace_if_exists: bool = True,
+    rename_flags: int | None = None,
 ):
-    """Build an ABI-correct variable-length FILE_RENAME_INFO value."""
-    root_value = int(getattr(parent_handle, "value", parent_handle) or 0)
+    """Build a same-directory, ABI-correct FILE_RENAME_INFO value."""
     if not isinstance(target_name, str) or not target_name or "\x00" in target_name:
         raise ValueError("Windows restoration target has an unsafe file name")
-    if root_value:
-        if (
-            target_name in {".", ".."}
-            or any(character in target_name for character in "\\/:")
-        ):
-            raise ValueError("Windows restoration target has an unsafe file name")
-    elif (
-        len(target_name) > 32767
-        or not re.match(
-            r"^\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\[^\x00]+$",
-            target_name,
+    try:
+        encoded = target_name.encode("utf-16-le")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "Windows restoration target has an unsafe file name"
+        ) from exc
+    forbidden = set('<>:"|?*\\/')
+    reserved = re.compile(
+        r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(?:\..*)?$",
+        re.I,
+    )
+    if (
+        target_name in {".", ".."}
+        or len(encoded) > 510
+        or target_name[-1] in {" ", "."}
+        or any(
+            ord(character) < 32 or character in forbidden
+            for character in target_name
         )
+        or reserved.fullmatch(target_name)
     ):
-        raise ValueError("Windows restoration target is not a canonical volume path")
-    encoded = target_name.encode("utf-16-le")
-
+        raise ValueError("Windows restoration target has an unsafe file name")
+    safe_extended_flags = (
+        WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
+        | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
+    )
+    if rename_flags is not None and (
+        isinstance(rename_flags, bool)
+        or not isinstance(rename_flags, int)
+        or rename_flags != safe_extended_flags
+    ):
+        raise ValueError("Windows restoration rename flags are invalid")
     # SetFileInformationByHandle requires sizeof(FILE_RENAME_INFO) plus
     # FileNameLength. Allocate enough storage for that documented footprint,
     # including the structure's inline FileName[1] and native tail padding.
@@ -199,8 +218,11 @@ def _windows_file_rename_information(
         ]
 
     information = FileRenameInformation()
-    information.ReplaceIfExists = 1 if replace_if_exists else 0
-    information.RootDirectory = root_value
+    if rename_flags is None:
+        information.ReplaceIfExists = 1 if replace_if_exists else 0
+    else:
+        information.Flags = rename_flags
+    information.RootDirectory = None
     information.FileNameLength = len(encoded)
     ctypes.memmove(
         ctypes.addressof(information) + FileRenameInformation.FileName.offset,
@@ -677,19 +699,30 @@ class _WindowsNativeFileOps:
     def rename_file(
         self,
         handle,
-        parent_handle,
         leaf: str,
         *,
         replace_if_exists: bool = True,
     ) -> None:
-        information = _windows_file_rename_information(
-            parent_handle,
-            leaf,
-            replace_if_exists=replace_if_exists,
-        )
+        if replace_if_exists:
+            # POSIX replacement is the documented Windows form that permits
+            # the verified destination handles to remain open across publish.
+            information_class = WINDOWS_FILE_RENAME_INFO_EX_CLASS
+            information = _windows_file_rename_information(
+                leaf,
+                rename_flags=(
+                    WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
+                    | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
+                ),
+            )
+        else:
+            information_class = WINDOWS_FILE_RENAME_INFO_CLASS
+            information = _windows_file_rename_information(
+                leaf,
+                replace_if_exists=False,
+            )
         self._set_file_information(
             handle,
-            WINDOWS_FILE_RENAME_INFO_CLASS,
+            information_class,
             information,
             buffer_size=_windows_file_rename_information_size(information),
         )
@@ -707,15 +740,13 @@ def _windows_child_path(parent_path: str, leaf: str) -> str:
 def _windows_pinned_parent(
     path: Path,
     native: _WindowsNativeFileOps,
-    *,
-    require_add_file: bool = False,
 ):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
     handles: list[Any] = []
     try:
         candidate = root
-        for index, component in enumerate([None, *components]):
+        for component in [None, *components]:
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
             desired_access = (
@@ -724,10 +755,6 @@ def _windows_pinned_parent(
                 | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE
             )
-            if require_add_file and index == len(components):
-                # RootDirectory resolves the final rename without reopening any
-                # path component. Request add-file only on that pinned directory.
-                desired_access |= WINDOWS_FILE_ADD_FILE
             share_mode = WINDOWS_FILE_SHARE_READ
             handle = native.open_file(
                 candidate,
@@ -1272,9 +1299,8 @@ def _windows_atomic_write(
         with _windows_pinned_parent(
             destination,
             native,
-            require_add_file=True,
         ) as (
-            parent_handle,
+            _parent_handle,
             parent_path,
             leaf,
         ):
@@ -1477,7 +1503,6 @@ def _windows_atomic_write(
                     )
                 native.rename_file(
                     handle,
-                    parent_handle,
                     leaf,
                     replace_if_exists=replace_if_exists,
                 )
