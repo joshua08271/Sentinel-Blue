@@ -159,36 +159,48 @@ class _WindowsFileRenameInformationHeader(ctypes.Structure):
 
 
 def _windows_file_rename_information(
-    target_name: str,
+    target_path: str,
     *,
     replace_if_exists: bool = True,
     rename_flags: int | None = None,
 ):
-    """Build a same-directory, ABI-correct FILE_RENAME_INFO value."""
-    if not isinstance(target_name, str) or not target_name or "\x00" in target_name:
-        raise ValueError("Windows restoration target has an unsafe file name")
+    """Build an ABI-correct FILE_RENAME_INFO for one canonical volume path."""
+    if not isinstance(target_path, str) or not target_path or "\x00" in target_path:
+        raise ValueError("Windows restoration target path is unsafe")
     try:
-        encoded = target_name.encode("utf-16-le")
+        encoded = target_path.encode("utf-16-le")
     except UnicodeEncodeError as exc:
-        raise ValueError(
-            "Windows restoration target has an unsafe file name"
-        ) from exc
-    forbidden = set('<>:"|?*\\/')
+        raise ValueError("Windows restoration target path is unsafe") from exc
+    match = re.fullmatch(
+        r"\\\\\?\\Volume\{"
+        r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+        r"\}\\(.+)",
+        target_path,
+    )
+    forbidden = set('<>:"|?*/')
     reserved = re.compile(
         r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(?:\..*)?$",
         re.I,
     )
+    components = match.group(1).split("\\") if match is not None else []
     if (
-        target_name in {".", ".."}
-        or len(encoded) > 510
-        or target_name[-1] in {" ", "."}
+        match is None
+        or len(encoded) > 65534
         or any(
-            ord(character) < 32 or character in forbidden
-            for character in target_name
+            not component
+            or component in {".", ".."}
+            or len(component.encode("utf-16-le")) > 510
+            or component[-1] in {" ", "."}
+            or any(
+                ord(character) < 32 or character in forbidden
+                for character in component
+            )
+            or reserved.fullmatch(component)
+            for component in components
         )
-        or reserved.fullmatch(target_name)
     ):
-        raise ValueError("Windows restoration target has an unsafe file name")
+        raise ValueError("Windows restoration target path is unsafe")
     safe_extended_flags = (
         WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
         | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
@@ -199,6 +211,7 @@ def _windows_file_rename_information(
         or rename_flags != safe_extended_flags
     ):
         raise ValueError("Windows restoration rename flags are invalid")
+
     # SetFileInformationByHandle requires sizeof(FILE_RENAME_INFO) plus
     # FileNameLength. Allocate enough storage for that documented footprint,
     # including the structure's inline FileName[1] and native tail padding.
@@ -699,7 +712,7 @@ class _WindowsNativeFileOps:
     def rename_file(
         self,
         handle,
-        leaf: str,
+        target_path: str,
         *,
         replace_if_exists: bool = True,
     ) -> None:
@@ -708,7 +721,7 @@ class _WindowsNativeFileOps:
             # the verified destination handles to remain open across publish.
             information_class = WINDOWS_FILE_RENAME_INFO_EX_CLASS
             information = _windows_file_rename_information(
-                leaf,
+                target_path,
                 rename_flags=(
                     WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
                     | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
@@ -717,7 +730,7 @@ class _WindowsNativeFileOps:
         else:
             information_class = WINDOWS_FILE_RENAME_INFO_CLASS
             information = _windows_file_rename_information(
-                leaf,
+                target_path,
                 replace_if_exists=False,
             )
         self._set_file_information(
@@ -1503,7 +1516,7 @@ def _windows_atomic_write(
                     )
                 native.rename_file(
                     handle,
-                    leaf,
+                    _windows_child_path(parent_path, leaf),
                     replace_if_exists=replace_if_exists,
                 )
                 published = True
