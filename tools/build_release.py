@@ -17,9 +17,9 @@ VERSION = str(tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"
 FIXED_ZIP_TIME = (2026, 1, 1, 0, 0, 0)
 
 try:
-    from tools.check_release_consistency import check_source
+    from tools.check_release_consistency import check_bundle, check_source
 except ModuleNotFoundError:  # Direct execution places tools/ first on sys.path.
-    from check_release_consistency import check_source
+    from check_release_consistency import check_bundle, check_source
 
 
 def digest(path: Path) -> str:
@@ -145,6 +145,7 @@ def build(output: Path) -> list[Path]:
         bundle_path,
         [(path.name, path.read_bytes()) for path in [*primary_artifacts, checksum_path]],
     )
+    check_bundle(bundle_path, VERSION)
     return [*primary_artifacts, checksum_path, bundle_path]
 
 

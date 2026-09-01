@@ -1,12 +1,19 @@
 import hashlib
 import io
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.build_release import ROOT, VERSION, _entries, build
-from tools.check_release_consistency import _safe_archive, check_bundle, check_source
+from tools.check_release_consistency import (
+    _expected_release,
+    _safe_archive,
+    check_bundle,
+    check_source,
+)
 
 
 def _zip_bytes(entries: list[tuple[str, bytes]]) -> bytes:
@@ -106,11 +113,36 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertIn('pip install "pip==26.2.1"', workflow)
             self.assertNotIn("pip install --upgrade pip", workflow)
         self.assertIn(
+            "python tools/check_release_consistency.py",
+            (ROOT / ".github" / "workflows" / "build-release.yml").read_text(
+                encoding="utf-8"
+            ),
+        )
+        self.assertIn(
             'pip install . "pyinstaller==6.22.2"',
             (ROOT / ".github" / "workflows" / "continuous-validation.yml").read_text(
                 encoding="utf-8"
             ),
         )
+
+
+    def test_github_tag_release_is_bound_to_source_version(self):
+        matching = {
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REF_TYPE": "tag",
+            "GITHUB_REF_NAME": f"v{VERSION}",
+        }
+        with patch.dict(os.environ, matching, clear=True):
+            self.assertEqual(_expected_release(None), f"v{VERSION}")
+            self.assertEqual(check_source(_expected_release(None)), VERSION)
+        mismatched = {**matching, "GITHUB_REF_NAME": "v0.0.0"}
+        with patch.dict(os.environ, mismatched, clear=True):
+            with self.assertRaisesRegex(ValueError, "does not match expected"):
+                check_source(_expected_release(None))
+        missing = {"GITHUB_ACTIONS": "true", "GITHUB_REF_TYPE": "tag"}
+        with patch.dict(os.environ, missing, clear=True):
+            with self.assertRaisesRegex(ValueError, "missing GITHUB_REF_NAME"):
+                _expected_release(None)
 
     def test_builds_core_runtime_source_and_complete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
