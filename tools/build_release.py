@@ -35,6 +35,12 @@ def _entries(paths: Iterable[Path]) -> list[tuple[str, bytes]]:
     names: set[str] = set()
     folded_names: set[str] = set()
     for base in paths:
+        if base.is_symlink():
+            raise ValueError(f"release input must not be a symbolic link: {base}")
+        if not base.exists():
+            raise ValueError(f"release input does not exist: {base}")
+        if not base.is_file() and not base.is_dir():
+            raise ValueError(f"release input is not a regular file or directory: {base}")
         candidates = [base] if base.is_file() else sorted(base.rglob("*"))
         for item in candidates:
             if item.is_symlink():
@@ -97,7 +103,6 @@ def build(output: Path) -> list[Path]:
         ROOT / "examples",
         ROOT / "models",
         ROOT / "docs",
-        ROOT / "reports",
         ROOT / "packaging",
         ROOT / "tools",
         ROOT / ".github",

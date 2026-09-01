@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+env:
+  PIP_CONSTRAINT: packaging/build-constraints.txt
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  PIP_ONLY_BINARY: ":all:"
+
 concurrency:
   group: sentinel-blue-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -30,7 +36,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: python -m pip install --upgrade pip
+      - run: python -m pip install "pip==26.2.1"
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
       - run: python -m sentinel_blue self-test --scenarios 500 --fuzz-iterations 5000 --load-events 1000 --json
@@ -50,8 +56,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install . pyinstaller
+      - run: python -m pip install "pip==26.2.1"
+      - run: python -m pip install . "pyinstaller==6.22.2"
       - run: python tools/check_release_consistency.py --expected 1.9.13
       - run: python tools/build_release.py --output release
       - run: python tools/check_release_consistency.py --expected 1.9.13 --bundle release/sentinel-blue-complete-lab-1.9.13.zip

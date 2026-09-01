@@ -128,10 +128,10 @@ def check_source(expected: str | None = None) -> str:
         raise ValueError("portal extension does not derive its release version from the manifest")
     required_labels = {
         "portal-extension/README.md": f"Sentinel Blue {portal_version} is the",
-    }
-    optional_labels = {
         "README.md": f"# Sentinel Blue {version}",
         "SECURITY.md": f"Sentinel Blue {version} is defensive software",
+    }
+    optional_labels = {
         "docs/ARCHITECTURE.md": f"# Sentinel Blue {version} architecture",
         "docs/MONITORED_RESTORATION.md": f"Sentinel Blue {version} implements",
         "docs/COMPETITION_REQUIREMENTS.md": f"to Sentinel Blue {version}.",
@@ -191,6 +191,8 @@ def check_bundle(bundle: Path, version: str) -> None:
         source_entries = _safe_archive(source, source_name)
         source_members = {name: source.read(name) for name in source_entries}
         for required in (
+            "README.md",
+            "SECURITY.md",
             "pyproject.toml",
             "src/sentinel_blue/__init__.py",
         ):
