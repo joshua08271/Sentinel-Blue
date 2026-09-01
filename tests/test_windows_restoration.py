@@ -518,7 +518,9 @@ class WindowsRestorationTests(unittest.TestCase):
     def test_parent_walk_holds_no_reparse_handles_and_closes_in_reverse(self):
         native = _FakeWindowsFileOps()
         with restoration._windows_pinned_parent(
-            Path(r"C:\safe\target.conf"), native
+            Path(r"C:\safe\target.conf"),
+            native,
+            allow_final_write_share=True,
         ) as (parent_handle, parent_path, leaf):
             self.assertEqual(parent_handle, 11)
             self.assertTrue(parent_path.casefold().endswith("}\\safe"))
@@ -530,10 +532,30 @@ class WindowsRestorationTests(unittest.TestCase):
             self.assertTrue(
                 event[6] & restoration.WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
             )
-            self.assertEqual(event[4], restoration.WINDOWS_FILE_SHARE_READ)
-            self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_WRITE)
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_DELETE)
+        self.assertEqual(opens[0][4], restoration.WINDOWS_FILE_SHARE_READ)
+        self.assertEqual(
+            opens[-1][4],
+            restoration.WINDOWS_FILE_SHARE_READ
+            | restoration.WINDOWS_FILE_SHARE_WRITE,
+        )
         self.assertEqual(native.events[-2:], [("close", 11), ("close", 10)])
+
+        default_native = _FakeWindowsFileOps()
+        with restoration._windows_pinned_parent(
+            Path(r"C:\safe\target.conf"), default_native
+        ):
+            pass
+        default_opens = [
+            event for event in default_native.events if event[0] == "open"
+        ]
+        self.assertTrue(
+            all(
+                event[4] == restoration.WINDOWS_FILE_SHARE_READ
+                for event in default_opens
+            )
+        )
+
 
     def test_parent_walk_rejects_reparse_and_closes_every_open_handle(self):
         native = _FakeWindowsFileOps(reparse_handle=11)

@@ -700,13 +700,15 @@ def _windows_child_path(parent_path: str, leaf: str) -> str:
 def _windows_pinned_parent(
     path: Path,
     native: _WindowsNativeFileOps,
+    *,
+    allow_final_write_share: bool = False,
 ):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
     handles: list[Any] = []
     try:
         candidate = root
-        for component in [None, *components]:
+        for index, component in enumerate([None, *components]):
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
             desired_access = (
@@ -715,13 +717,17 @@ def _windows_pinned_parent(
                 | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE
             )
+            share_mode = WINDOWS_FILE_SHARE_READ
+            if allow_final_write_share and index == len(components):
+                # An absolute FILE_RENAME_INFO publication opens the target
+                # directory for write. Permit that compatible open only on the
+                # final parent; every ancestor still denies write sharing and
+                # every held directory continues to deny delete sharing.
+                share_mode |= WINDOWS_FILE_SHARE_WRITE
             handle = native.open_file(
                 candidate,
                 desired_access,
-                # Withhold FILE_SHARE_WRITE and FILE_SHARE_DELETE. Child-file
-                # creation does not need either share on the directory object;
-                # excluding them pins the name and blocks reparse mutation.
-                WINDOWS_FILE_SHARE_READ,
+                share_mode,
                 WINDOWS_OPEN_EXISTING,
                 WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
                 | WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
@@ -973,7 +979,11 @@ def _windows_atomic_write(
         else nullcontext()
     )
     with privilege_scope:
-        with _windows_pinned_parent(destination, native) as (
+        with _windows_pinned_parent(
+            destination,
+            native,
+            allow_final_write_share=True,
+        ) as (
             parent_handle,
             parent_path,
             leaf,
