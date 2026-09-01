@@ -966,7 +966,9 @@ class ActionTests(unittest.TestCase):
                 {},
             )
             self.assertFalse(result["success"])
-            self.assertIn("non-symlink", result["message"])
+            expected_reason = "reparse point" if os.name == "nt" else "non-symlink"
+            self.assertIn(expected_reason, result["message"])
+
     def test_containment_is_dry_run_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = ActionExecutor(directory)
