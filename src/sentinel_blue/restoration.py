@@ -69,6 +69,7 @@ WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
+WINDOWS_FILE_ADD_FILE = 0x00000002
 WINDOWS_FILE_TRAVERSE = 0x00000020
 WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
 WINDOWS_DELETE = 0x00010000
@@ -676,14 +677,14 @@ class _WindowsNativeFileOps:
     def rename_file(
         self,
         handle,
-        parent_path: str,
+        parent_handle,
         leaf: str,
         *,
         replace_if_exists: bool = True,
     ) -> None:
         information = _windows_file_rename_information(
-            None,
-            _windows_child_path(parent_path, leaf),
+            parent_handle,
+            leaf,
             replace_if_exists=replace_if_exists,
         )
         self._set_file_information(
@@ -707,7 +708,7 @@ def _windows_pinned_parent(
     path: Path,
     native: _WindowsNativeFileOps,
     *,
-    allow_final_write_share: bool = False,
+    require_add_file: bool = False,
 ):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
@@ -723,13 +724,11 @@ def _windows_pinned_parent(
                 | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE
             )
+            if require_add_file and index == len(components):
+                # RootDirectory resolves the final rename without reopening any
+                # path component. Request add-file only on that pinned directory.
+                desired_access |= WINDOWS_FILE_ADD_FILE
             share_mode = WINDOWS_FILE_SHARE_READ
-            if allow_final_write_share and index == len(components):
-                # An absolute FILE_RENAME_INFO publication opens the target
-                # directory for write. Permit that compatible open only on the
-                # final parent; every ancestor still denies write sharing and
-                # every held directory continues to deny delete sharing.
-                share_mode |= WINDOWS_FILE_SHARE_WRITE
             handle = native.open_file(
                 candidate,
                 desired_access,
@@ -1273,13 +1272,12 @@ def _windows_atomic_write(
         with _windows_pinned_parent(
             destination,
             native,
-            allow_final_write_share=True,
+            require_add_file=True,
         ) as (
             parent_handle,
             parent_path,
             leaf,
         ):
-            del parent_handle
             handle = None
             expected_handle = None
             verification_handle = None
@@ -1479,7 +1477,7 @@ def _windows_atomic_write(
                     )
                 native.rename_file(
                     handle,
-                    parent_path,
+                    parent_handle,
                     leaf,
                     replace_if_exists=replace_if_exists,
                 )
