@@ -57,25 +57,13 @@ WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
 WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
 WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
-WINDOWS_SE_DACL_UNTRUSTED = 0x0040
-WINDOWS_SE_SERVER_SECURITY = 0x0080
-WINDOWS_SE_DACL_AUTO_INHERIT_REQ = 0x0100
-WINDOWS_SE_SACL_AUTO_INHERIT_REQ = 0x0200
-WINDOWS_SE_DACL_AUTO_INHERITED = 0x0400
-WINDOWS_SE_SACL_AUTO_INHERITED = 0x0800
 WINDOWS_SE_DACL_PROTECTED = 0x1000
 WINDOWS_SE_SACL_PROTECTED = 0x2000
 WINDOWS_SE_RM_CONTROL_VALID = 0x4000
+# Target objects are regular files, so ACL auto-inheritance bookkeeping cannot
+# govern children. ACE inheritance flags are still compared byte-for-byte.
 WINDOWS_SEMANTIC_CONTROL_MASK = (
-    WINDOWS_SE_DACL_UNTRUSTED
-    | WINDOWS_SE_SERVER_SECURITY
-    | WINDOWS_SE_DACL_AUTO_INHERIT_REQ
-    | WINDOWS_SE_SACL_AUTO_INHERIT_REQ
-    | WINDOWS_SE_DACL_AUTO_INHERITED
-    | WINDOWS_SE_SACL_AUTO_INHERITED
-    | WINDOWS_SE_DACL_PROTECTED
-    | WINDOWS_SE_SACL_PROTECTED
-    | WINDOWS_SE_RM_CONTROL_VALID
+    WINDOWS_SE_DACL_PROTECTED | WINDOWS_SE_SACL_PROTECTED
 )
 WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
@@ -1127,29 +1115,115 @@ def _windows_security_descriptor_semantics(
     )
 
 
-def _windows_security_descriptors_equivalent(
+def _windows_security_descriptor_mismatch(
     expected_descriptor: object,
     observed_descriptor: object,
-) -> bool:
-    """Compare access semantics while rejecting absent, malformed, or changed ACLs."""
+) -> str | None:
+    """Return a bounded semantic mismatch category, or None for equivalence."""
     if (
         not isinstance(expected_descriptor, str)
         or not expected_descriptor
         or not isinstance(observed_descriptor, str)
         or not observed_descriptor
     ):
-        return False
+        return "missing"
     if expected_descriptor == observed_descriptor:
-        return True
+        return None
     if os.name != "nt":
-        return False
+        return "platform"
     try:
-        return _windows_security_descriptor_semantics(
-            expected_descriptor
-        ) == _windows_security_descriptor_semantics(observed_descriptor)
-    except Exception:
-        # Conditional mutation and post-apply verification must fail closed.
-        return False
+        expected = _windows_security_descriptor_semantics(expected_descriptor)
+        observed = _windows_security_descriptor_semantics(observed_descriptor)
+    except Exception as exc:
+        code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+        suffix = str(code) if isinstance(code, int) else "unknown"
+        return f"parse-{type(exc).__name__}-{suffix}"
+    names = ("revision", "control", "rm-control", "owner", "group", "DACL", "SACL")
+    for name, expected_value, observed_value in zip(
+        names, expected, observed, strict=True
+    ):
+        if expected_value != observed_value:
+            return name
+    return None
+
+
+def _windows_security_descriptors_equivalent(
+    expected_descriptor: object,
+    observed_descriptor: object,
+) -> bool:
+    """Compare access semantics while rejecting absent, malformed, or changed ACLs."""
+    return (
+        _windows_security_descriptor_mismatch(
+            expected_descriptor, observed_descriptor
+        )
+        is None
+    )
+
+
+def _windows_expected_snapshot_mismatch(
+    expected_data: bytes,
+    expected_metadata: dict[str, Any],
+    observed_data: bytes,
+    observed: dict[str, Any],
+) -> str | None:
+    """Return a bounded mismatch category for a conditional native mutation."""
+    if (
+        not isinstance(expected_data, bytes)
+        or not isinstance(expected_metadata, dict)
+        or not isinstance(observed_data, bytes)
+        or not isinstance(observed, dict)
+    ):
+        return "invalid-state"
+    if observed_data != expected_data:
+        return "bytes"
+    try:
+        expected_mode = int(expected_metadata.get("mode", 0))
+        observed_mode = (
+            0o444
+            if int(observed["attributes"]) & WINDOWS_FILE_ATTRIBUTE_READONLY
+            else 0o666
+        )
+    except (KeyError, TypeError, ValueError):
+        return "mode-invalid"
+    if expected_mode != observed_mode:
+        return "mode"
+    if not _windows_security_descriptors_equivalent(
+        expected_metadata.get("windows_security_descriptor"),
+        observed.get("windows_security_descriptor"),
+    ):
+        return "security-descriptor"
+    exact_fields = {
+        "windows_file_identity": "identity",
+        "windows_creation_ticks": "creation-ticks",
+        "windows_modified_ticks": "modified-ticks",
+        "windows_file_size": "size",
+        "windows_hard_links": "links",
+        "windows_file_attributes": "attributes",
+    }
+    snapshot_names = {
+        "windows_file_identity": "identity",
+        "windows_creation_ticks": "creation_ticks",
+        "windows_modified_ticks": "modified_ticks",
+        "windows_file_size": "size",
+        "windows_hard_links": "links",
+        "windows_file_attributes": "attributes",
+    }
+    for metadata_name, mismatch_name in exact_fields.items():
+        if metadata_name not in expected_metadata:
+            continue
+        expected_value = expected_metadata[metadata_name]
+        observed_value = observed.get(snapshot_names[metadata_name])
+        if metadata_name == "windows_file_identity":
+            try:
+                expected_value = tuple(int(value) for value in expected_value)
+                observed_value = tuple(int(value) for value in observed_value)
+            except (TypeError, ValueError):
+                return "identity-invalid"
+        elif isinstance(expected_value, bool) or not isinstance(expected_value, int):
+            return f"{mismatch_name}-invalid"
+        if expected_value != observed_value:
+            return mismatch_name
+    return None
 
 
 def _windows_expected_snapshot_matches(
@@ -1159,51 +1233,15 @@ def _windows_expected_snapshot_matches(
     observed: dict[str, Any],
 ) -> bool:
     """Bind a conditional mutation to the bytes, ACL, and native file identity read earlier."""
-    if not isinstance(expected_data, bytes) or not isinstance(expected_metadata, dict):
-        return False
-    expected_descriptor = expected_metadata.get("windows_security_descriptor")
-    try:
-        expected_mode = int(expected_metadata.get("mode", 0))
-    except (TypeError, ValueError):
-        return False
-    observed_mode = (
-        0o444
-        if int(observed["attributes"]) & WINDOWS_FILE_ATTRIBUTE_READONLY
-        else 0o666
-    )
-    if (
-        observed_data != expected_data
-        or expected_mode != observed_mode
-        or not _windows_security_descriptors_equivalent(
-            expected_descriptor,
-            observed.get("windows_security_descriptor"),
+    return (
+        _windows_expected_snapshot_mismatch(
+            expected_data,
+            expected_metadata,
+            observed_data,
+            observed,
         )
-    ):
-        return False
-    exact_fields = {
-        "windows_file_identity": "identity",
-        "windows_creation_ticks": "creation_ticks",
-        "windows_modified_ticks": "modified_ticks",
-        "windows_file_size": "size",
-        "windows_hard_links": "links",
-        "windows_file_attributes": "attributes",
-    }
-    for metadata_name, snapshot_name in exact_fields.items():
-        if metadata_name not in expected_metadata:
-            continue
-        expected_value = expected_metadata[metadata_name]
-        observed_value = observed.get(snapshot_name)
-        if metadata_name == "windows_file_identity":
-            try:
-                expected_value = tuple(int(value) for value in expected_value)
-                observed_value = tuple(int(value) for value in observed_value)
-            except (TypeError, ValueError):
-                return False
-        elif isinstance(expected_value, bool) or not isinstance(expected_value, int):
-            return False
-        if expected_value != observed_value:
-            return False
-    return True
+        is None
+    )
 
 
 def _windows_atomic_write(
@@ -1284,15 +1322,16 @@ def _windows_atomic_write(
                             allow_security_failure=False,
                             native=native,
                         )
-                        if not _windows_expected_snapshot_matches(
+                        mismatch = _windows_expected_snapshot_mismatch(
                             expected_data,
                             expected_metadata,
                             observed_data,
                             observed_snapshot,
-                        ):
+                        )
+                        if mismatch is not None:
                             raise ValueError(
                                 "Windows restoration target changed before publish; "
-                                "refusing to overwrite newer data"
+                                f"refusing to overwrite newer data ({mismatch})"
                             )
                     else:
                         # FILE_RENAME_INFO with ReplaceIfExists=false is the
@@ -1353,11 +1392,13 @@ def _windows_atomic_write(
                         destination,
                         native_handle=handle,
                     )
-                    if not _windows_security_descriptors_equivalent(
+                    descriptor_mismatch = _windows_security_descriptor_mismatch(
                         encoded_descriptor, observed
-                    ):
+                    )
+                    if descriptor_mismatch is not None:
                         raise OSError(
-                            "post-restoration Windows security descriptor did not match"
+                            "post-restoration Windows security descriptor did not "
+                            f"match ({descriptor_mismatch})"
                         )
                 if temp_registry is not None:
                     ownership_record = temp_registry.register(
@@ -1398,15 +1439,16 @@ def _windows_atomic_write(
                     )
                     assert expected_data is not None
                     assert expected_metadata is not None
-                    if not _windows_expected_snapshot_matches(
+                    mismatch = _windows_expected_snapshot_mismatch(
                         expected_data,
                         expected_metadata,
                         verification_data,
                         verification_snapshot,
-                    ):
+                    )
+                    if mismatch is not None:
                         raise ValueError(
                             "Windows restoration target name changed before publish; "
-                            "refusing to overwrite newer data"
+                            f"refusing to overwrite newer data ({mismatch})"
                         )
                 # Clearing delete-on-close and publishing cannot be one Win32 call. A
                 # durable authenticated ownership record is established first, so a
@@ -1555,15 +1597,16 @@ def _windows_unlink(
                         allow_security_failure=False,
                         native=native,
                     )
-                    if not _windows_expected_snapshot_matches(
+                    mismatch = _windows_expected_snapshot_mismatch(
                         expected_data,
                         expected_metadata,
                         observed_data,
                         observed_snapshot,
-                    ):
+                    )
+                    if mismatch is not None:
                         raise ValueError(
                             "Windows restoration target changed before removal; "
-                            "refusing to delete newer data"
+                            f"refusing to delete newer data ({mismatch})"
                         )
                 native.set_delete_disposition(handle, True)
             finally:
