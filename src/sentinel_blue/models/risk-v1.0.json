@@ -1,0 +1,25 @@
+{
+  "bias": -1.1,
+  "weights": {
+    "agent_heartbeat_missing": 1.5,
+    "collector_failure": 0.3,
+    "critical_service_stopped": 1.7,
+    "default_route_change": 1.8,
+    "external_source": 0.8,
+    "firewall_disabled": 2.3,
+    "firewall_rule_change": 1.5,
+    "integrity_change": 1.9,
+    "interactive_privileged_session": 1.0,
+    "new_listener": 0.7,
+    "new_privileged_account": 1.2,
+    "persistence_change": 1.3,
+    "privilege_membership_change": 2.2,
+    "privileged_persistence": 1.0,
+    "probe_failure": 1.8,
+    "protected_identity": -3.0,
+    "protected_identity_loss": 2.4,
+    "service_configuration_change": 1.5,
+    "suspicious_process_path": 1.8,
+    "unknown_privileged_account": 1.4
+  }
+}

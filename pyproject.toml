@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-blue"
+version = "1.9.11"
+description = "Competition-safe defensive monitoring and response orchestrator"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Sentinel Blue contributors"}]
+dependencies = []
+
+[project.scripts]
+sentinel-blue = "sentinel_blue.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sentinel_blue = ["web/*.html", "models/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

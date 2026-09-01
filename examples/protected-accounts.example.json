@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "agent_id": "*",
+      "name": "protected-admin-example",
+      "role": "official-administration",
+      "source": "event-manifest"
+    },
+    {
+      "agent_id": "linux-web-agent-id",
+      "name": "service-monitor-example",
+      "role": "scoring-service",
+      "source": "event-manifest"
+    }
+  ]
+}

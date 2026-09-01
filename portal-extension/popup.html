@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body{font:13px system-ui,sans-serif;width:360px;margin:0;padding:14px;background:#0b1620;color:#e8f1f7}
+    h1{font-size:15px;margin:0 0 12px}label{display:block;margin:8px 0 3px;color:#9fb4c3}
+    input,textarea,select{width:100%;box-sizing:border-box;background:#122432;color:#e8f1f7;border:1px solid #355064;border-radius:6px;padding:7px}
+    textarea{min-height:60px;resize:vertical}button{margin-top:10px;padding:8px 10px;border:1px solid #3b657f;border-radius:6px;background:#17364a;color:#fff;cursor:pointer}
+    button.primary{background:#164a3a;border-color:#2c8062}.row{display:flex;gap:7px}.row button{flex:1}
+    #status{white-space:pre-wrap;color:#a9c1d0;margin-top:10px;max-height:100px;overflow:auto}.warning{color:#ffc66d;font-size:12px}
+  </style>
+</head>
+<body>
+  <h1>Sentinel Blue portal bootstrap</h1>
+  <p class="warning">Use only on the competition portal and systems assigned to your team.</p>
+  <label>Allowed portal origin</label><input id="portalOrigin" placeholder="https://competition.example">
+  <label>Additional console-frame origins (one per line)</label><textarea id="frameOrigins"></textarea>
+  <label>Approved public package URL</label><input id="packageUrl" placeholder="https://github.com/.../sentinel-blue.pyz">
+  <label>SHA-256</label><input id="checksum" maxlength="64">
+  <label>Controller address visible to assigned devices</label><input id="controllerHost" placeholder="192.0.2.2">
+  <label>Operator principal ID</label><input id="operatorPrincipal" placeholder="blue-team-lead">
+  <label>Operator credential epoch</label><input id="operatorEpoch" value="2" inputmode="numeric">
+  <label>Pre-provisioned controller certificate path</label><input id="tlsCertPath" placeholder="/etc/sentinel-blue/controller.crt">
+  <label>Pre-provisioned controller private-key path</label><input id="tlsKeyPath" placeholder="/etc/sentinel-blue/controller.key">
+  <label>Pre-provisioned pinned CA path</label><input id="tlsCaPath" placeholder="/etc/sentinel-blue/controller-ca.crt">
+  <label>Authorized networks (one CIDR per line)</label><textarea id="networks"></textarea>
+  <label>Approved inventory + event profile JSON</label><textarea id="inventory" placeholder='{"authorized_networks":["192.0.2.0/24"],"hosts":[],"event_profile":{"profile_version":1}}'></textarea>
+  <label>Device-card selector</label><input id="deviceSelector" placeholder=".assigned-device">
+  <label>Console-input selector</label><input id="consoleSelector" placeholder="textarea.terminal-input">
+  <label>Default relay OS</label><select id="operatingSystem"><option value="linux">Linux</option><option value="windows">Windows</option></select>
+  <div class="row"><button id="save">Save profile</button><button id="discover">Discover</button></div>
+  <button id="current" class="primary">Bootstrap this relay console</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

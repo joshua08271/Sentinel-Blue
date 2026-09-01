@@ -1,0 +1,219 @@
+name: azure-lab-oidc
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Safe operation to perform in the fixed private lab
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - inventory
+          - deallocate
+      confirmation:
+        description: For deallocate only, enter DEALLOCATE sentinel-blue-range-wus2
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sentinel-blue-azure-lab
+  cancel-in-progress: false
+
+jobs:
+  private-lab:
+    name: Private Azure lab guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: azure-lab
+    env:
+      EXPECTED_REPOSITORY: joshua08271/Sentinel-Blue
+      EXPECTED_REF: refs/heads/main
+      EXPECTED_RESOURCE_GROUP: sentinel-blue-range-wus2
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      REQUESTED_OPERATION: ${{ inputs.operation }}
+      DEALLOCATE_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Validate fixed workflow context
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REPOSITORY}" == "${EXPECTED_REPOSITORY}" ]] || {
+            echo "Refusing unexpected repository: ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          }
+          [[ "${GITHUB_REF}" == "${EXPECTED_REF}" ]] || {
+            echo "Refusing unexpected ref: ${GITHUB_REF}" >&2
+            exit 1
+          }
+          for variable in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP; do
+            [[ -n "${!variable}" ]] || {
+              echo "Missing azure-lab environment variable: ${variable}" >&2
+              exit 1
+            }
+          done
+          [[ "${AZURE_RESOURCE_GROUP}" == "${EXPECTED_RESOURCE_GROUP}" ]] || {
+            echo "Refusing unexpected resource-group configuration." >&2
+            exit 1
+          }
+          case "${REQUESTED_OPERATION}" in
+            verify|inventory) ;;
+            deallocate)
+              [[ "${DEALLOCATE_CONFIRMATION}" == "DEALLOCATE sentinel-blue-range-wus2" ]] || {
+                echo "Deallocation confirmation did not match the fixed resource group." >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "Refusing unsupported operation: ${REQUESTED_OPERATION}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Obtain short-lived Azure token
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate identity, resource group, and private VM allowlist
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_vms=(sb-controller sb-linux-target sb-redsim sb-windows-target)
+
+          actual_subscription="$(az account show --query id --output tsv)"
+          [[ "${actual_subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" ]] || {
+            echo "Azure selected an unexpected subscription." >&2
+            exit 1
+          }
+
+          group_id="$(az group show \
+            --name "${AZURE_RESOURCE_GROUP}" \
+            --query id \
+            --output tsv)"
+          expected_group_id="/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}"
+          [[ "${group_id,,}" == "${expected_group_id,,}" ]] || {
+            echo "Azure returned an unexpected resource-group scope." >&2
+            exit 1
+          }
+
+          mapfile -t actual_vms < <(
+            az vm list \
+              --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --query "[].name" \
+              --output tsv | LC_ALL=C sort
+          )
+          [[ "${actual_vms[*]}" == "${expected_vms[*]}" ]] || {
+            echo "VM inventory differs from the four-host private lab allowlist." >&2
+            printf 'Expected: %s\n' "${expected_vms[*]}" >&2
+            printf 'Actual:   %s\n' "${actual_vms[*]}" >&2
+            exit 1
+          }
+
+          for vm in "${expected_vms[@]}"; do
+            mapfile -t nic_ids < <(
+              az vm show \
+                --resource-group "${AZURE_RESOURCE_GROUP}" \
+                --name "${vm}" \
+                --query "networkProfile.networkInterfaces[].id" \
+                --output tsv
+            )
+            [[ "${#nic_ids[@]}" -gt 0 ]] || {
+              echo "${vm} has no readable network interface." >&2
+              exit 1
+            }
+            for nic_id in "${nic_ids[@]}"; do
+              public_id="$(az network nic show \
+                --ids "${nic_id}" \
+                --query "ipConfigurations[?publicIPAddress != null].publicIPAddress.id | [0]" \
+                --output tsv)"
+              [[ -z "${public_id}" ]] || {
+                echo "${vm} has a public-IP attachment; refusing all operations." >&2
+                exit 1
+              }
+            done
+          done
+
+          {
+            echo "### Sentinel Blue Azure OIDC guard"
+            echo
+            echo "- Repository and branch: validated"
+            echo "- Subscription and resource group: validated"
+            echo "- Exact four-VM allowlist: validated"
+            echo "- Public-IP attachments: none"
+            echo "- Requested operation: ${REQUESTED_OPERATION}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Read private VM power state
+        if: inputs.operation == 'inventory'
+        shell: bash
+        run: |
+          set -euo pipefail
+          vms=(sb-controller sb-linux-target sb-redsim sb-windows-target)
+          {
+            echo
+            echo "| VM | Power state |"
+            echo "|---|---|"
+            for vm in "${vms[@]}"; do
+              state="$(az vm get-instance-view \
+                --resource-group "${AZURE_RESOURCE_GROUP}" \
+                --name "${vm}" \
+                --query "instanceView.statuses[?starts_with(code, 'PowerState/')].displayStatus | [0]" \
+                --output tsv)"
+              printf '| `%s` | %s |\n' "${vm}" "${state:-Unknown}"
+            done
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Deallocate the exact private VM allowlist
+        if: inputs.operation == 'deallocate'
+        shell: bash
+        run: |
+          set -euo pipefail
+          vms=(sb-controller sb-linux-target sb-redsim sb-windows-target)
+          for vm in "${vms[@]}"; do
+            az vm deallocate \
+              --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --name "${vm}" \
+              --no-wait
+          done
+
+          completed=false
+          for _attempt in $(seq 1 90); do
+            pending=0
+            for vm in "${vms[@]}"; do
+              state="$(az vm get-instance-view \
+                --resource-group "${AZURE_RESOURCE_GROUP}" \
+                --name "${vm}" \
+                --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" \
+                --output tsv)"
+              [[ "${state}" == "PowerState/deallocated" ]] || pending=$((pending + 1))
+            done
+            if [[ "${pending}" -eq 0 ]]; then
+              completed=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "${completed}" == true ]] || {
+            echo "Timed out waiting for the four VMs to deallocate." >&2
+            exit 1
+          }
+          echo "All four fixed lab VMs are deallocated." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Clear Azure session
+        if: always()
+        shell: bash
+        run: az logout || true

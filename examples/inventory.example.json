@@ -1,0 +1,214 @@
+{
+  "authorized_networks": [
+    "192.0.2.0/24"
+  ],
+  "event_profile": {
+    "profile_version": 1,
+    "profile_id": "replace-with-event-profile-id",
+    "competition": "ccdc-strict",
+    "environment": "live-competition",
+    "autonomy_mode": "approval-based",
+    "architecture": {
+      "single_live_scored_network": true,
+      "blue_staging_non_authoritative": true
+    },
+    "scope": {
+      "authorized_networks": [
+        "192.0.2.0/24"
+      ],
+      "authorized_hosts": [
+        "192.0.2.1",
+        "192.0.2.10",
+        "192.0.2.20"
+      ],
+      "controller_ingress_hosts": [
+        "192.0.2.10",
+        "192.0.2.20"
+      ],
+      "excluded_hosts": [],
+      "approved_deployment_paths": [
+        "/opt/sentinel-blue",
+        "C:\\ProgramData\\SentinelBlue"
+      ]
+    },
+    "deployment": {
+      "approved_routes": [
+        "ssh",
+        "winrm",
+        "agentless"
+      ]
+    },
+    "capabilities": {
+      "in_place_repair": true,
+      "structured_rollback": true,
+      "configuration_backups": true,
+      "network_monitoring": true,
+      "external_controller": true,
+      "second_vm_staging": false,
+      "password_rotation": false,
+      "account_disabling": false,
+      "file_restoration": true,
+      "host_snapshots": false,
+      "full_vm_duplication": false,
+      "scored_service_migration": false,
+      "automatic_vm_replacement": false,
+      "external_cloud_processing": false,
+      "external_telemetry_export": false,
+      "guarded_autonomy": false,
+      "honeypots": false,
+      "sandbox_analysis": false,
+      "cyber_physical_changes": false,
+      "broad_firewall_changes": false,
+      "domain_credential_rotation": false,
+      "database_restoration": false,
+      "network_forks": false,
+      "session_containment": false
+    },
+    "organizer_exceptions": [],
+    "allowed_automatic_actions": [],
+    "official_identities": [
+      {
+        "agent_id": "linux-web-agent",
+        "name": "linux-web-agent",
+        "class": "service",
+        "source": "approved-private-inventory"
+      },
+      {
+        "agent_id": "windows-directory-agent",
+        "name": "windows-directory-agent",
+        "class": "service",
+        "source": "approved-private-inventory"
+      },
+      {
+        "agent_id": "*",
+        "name": "replace-with-scoring-identity",
+        "class": "scoring",
+        "source": "event-material"
+      },
+      {
+        "agent_id": "*",
+        "name": "replace-with-required-red-identity",
+        "class": "red-team-required",
+        "source": "event-material"
+      }
+    ],
+    "services": [
+      {
+        "service_id": "scored-web-example",
+        "host": "192.0.2.10",
+        "protocol": "http",
+        "port": 80,
+        "implementation": "replace-with-assigned-implementation",
+        "dependencies": [],
+        "required_accounts": [
+          "replace-with-service-account"
+        ],
+        "required_files": [
+          "/opt/example-service/service.conf"
+        ],
+        "required_data": [
+          "replace-with-required-business-data"
+        ],
+        "credential_source": "event-issued secret store",
+        "expected_transactions": [
+          {
+            "kind": "http",
+            "target": "http://192.0.2.10/health",
+            "expected_status": [
+              200
+            ]
+          }
+        ],
+        "local_checks": [
+          "service state and configuration validation"
+        ],
+        "allowed_automatic_actions": [
+          "validate_service"
+        ],
+        "approval_actions": [
+          "restart_service",
+          "rollback_service",
+          "restore_integrity"
+        ],
+        "backup_method": "versioned configuration backup",
+        "recovery_method": "least-disruptive in-place repair on the assigned host",
+        "rollback_method": "restore exact pre-state and repeat local and external validation"
+      }
+    ],
+    "services_confirmed": true,
+    "recovery": {
+      "baseline_promotion_delay_seconds": 60
+    },
+    "approval": {
+      "status": "draft",
+      "approved_by": ""
+    },
+    "release": {
+      "version": "1.9.11",
+      "approved": false,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "controller_ca_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "public_url": "https://replace-with-public-equal-access-release.example/sentinel-blue-1.9.11.pyz",
+      "frozen": false,
+      "submitted_to_officials": false,
+      "submission_approved": false,
+      "public_and_equal_access": false,
+      "cloud_processing": false,
+      "external_telemetry_export": false,
+      "public_days_before_event": 0,
+      "submitted_days_before_event": 0
+    }
+  },
+  "auto_discover": false,
+  "protected_paths": [
+    "/opt/example-service/service.conf"
+  ],
+  "probes": [
+    {
+      "name": "scored-web",
+      "kind": "http",
+      "target": "http://192.0.2.10/health",
+      "expected_status": [200],
+      "expected_body": "healthy",
+      "restore_paths": [
+        "/etc/nginx/**",
+        "/etc/apache2/**"
+      ]
+    },
+    {
+      "name": "directory-tls",
+      "kind": "tls",
+      "target": "192.0.2.20",
+      "port": 636,
+      "server_name": "directory.internal",
+      "restore_paths": [
+        "C:/ProgramData/ssh/**"
+      ]
+    }
+  ],
+  "hosts": [
+    {
+      "name": "linux-web",
+      "agent_id": "linux-web-agent",
+      "address": "192.0.2.10",
+      "platform": "linux",
+      "transport": "ssh",
+      "allow_restoration": true
+    },
+    {
+      "name": "windows-directory",
+      "agent_id": "windows-directory-agent",
+      "address": "192.0.2.20",
+      "platform": "windows",
+      "transport": "winrm",
+      "allow_restoration": true
+    },
+    {
+      "name": "edge-firewall",
+      "agent_id": "edge-firewall-connector",
+      "address": "192.0.2.1",
+      "platform": "appliance",
+      "transport": "agentless"
+    }
+  ]
+}

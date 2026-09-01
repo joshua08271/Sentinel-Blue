@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sentinel Blue</title>
+  <style>
+    :root{color-scheme:dark;--bg:#050d14;--panel:#0d1a25;--panel2:#112433;--line:#233b4d;--text:#e9f4fa;--muted:#8ca5b7;--blue:#42b7ff;--red:#ff6476;--amber:#ffc55c;--green:#4ed69a}
+    *{box-sizing:border-box} body{margin:0;font:14px/1.45 Inter,system-ui,sans-serif;background:radial-gradient(circle at 80% 0,#102a3b 0,transparent 35%),var(--bg);color:var(--text)}
+    header{padding:18px 26px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:5;background:#050d14ed;backdrop-filter:blur(12px)}
+    h1{font-size:19px;margin:0;letter-spacing:.08em}h2{font-size:15px;margin:0 0 12px}h3{font-size:14px;margin:0 0 6px}.status{color:var(--green)}.muted{color:var(--muted)}
+    main{padding:22px 26px 50px;max-width:1500px;margin:auto}.metrics{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;margin-bottom:16px}.metric,.panel,.alert,.incident{background:linear-gradient(145deg,var(--panel),#0b1721);border:1px solid var(--line);border-radius:11px}.metric{padding:13px}.metric b{display:block;font-size:23px;color:var(--blue)}.metric span{color:var(--muted);font-size:12px}
+    .layout{display:grid;grid-template-columns:1.25fr .75fr;gap:15px}.panel{padding:15px;margin-bottom:15px}.alert,.incident{padding:13px;margin-bottom:9px;border-left:4px solid var(--blue)}.critical{border-left-color:var(--red)}.high{border-left-color:var(--amber)}.medium{border-left-color:var(--blue)}
+    .badge{display:inline-block;padding:2px 7px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:11px;margin:0 4px 2px 0}.badge.online{color:var(--green)}.badge.stale,.badge.failed{color:var(--red)}
+    button{margin:7px 4px 0 0;padding:7px 10px;color:var(--text);background:#142a3a;border:1px solid #31566f;border-radius:7px;cursor:pointer}button:hover{filter:brightness(1.15)}button.danger{background:#46212a;border-color:#81404b}button.safe{background:#143a2c;border-color:#2a6c50}
+    table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}pre{white-space:pre-wrap;color:#b7cbd7;font-size:11px;max-height:260px;overflow:auto}textarea,input{width:100%;background:#07131d;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:9px}textarea{min-height:95px}
+    #login{position:fixed;inset:0;background:#03080ddd;z-index:20;display:grid;place-items:center}.login-card{width:min(460px,90vw);padding:24px;background:var(--panel);border:1px solid var(--line);border-radius:13px}.hidden{display:none!important}.row{display:flex;align-items:center;justify-content:space-between;gap:8px}.small{font-size:12px}.scroll{max-height:440px;overflow:auto}
+    @media(max-width:1050px){.metrics{grid-template-columns:repeat(3,1fr)}.layout{grid-template-columns:1fr}}@media(max-width:600px){.metrics{grid-template-columns:repeat(2,1fr)}main{padding:14px}header{position:static}}
+  </style>
+</head>
+<body>
+<div id="login">
+  <div class="login-card">
+    <h2>Operator authentication</h2>
+    <p class="muted">Enter the operator signing key. It remains only in this page's memory and must be entered again after reload or lock.</p>
+    <input id="tokenInput" type="password" autocomplete="off" placeholder="Operator signing key">
+    <button class="safe" id="loginButton">Open dashboard</button>
+    <p id="loginError" class="small" style="color:var(--red)"></p>
+  </div>
+</div>
+<header><h1>SENTINEL BLUE <span class="badge">LAB</span></h1><div><button id="notifyButton">Enable alerts</button> <button id="logoutButton">Lock</button> <span id="connection" class="status">Connecting…</span></div></header>
+<main>
+  <section class="metrics">
+    <div class="metric"><b id="onlineCount">0</b><span>Online systems</span></div>
+    <div class="metric"><b id="staleCount">0</b><span>Stale systems</span></div>
+    <div class="metric"><b id="criticalCount">0</b><span>Critical decisions</span></div>
+    <div class="metric"><b id="openCount">0</b><span>Open decisions</span></div>
+    <div class="metric"><b id="actionCount">0</b><span>Active actions</span></div>
+    <div class="metric"><b id="nodeCount">0</b><span>Topology nodes</span></div>
+  </section>
+  <section class="layout">
+    <div>
+      <section class="panel"><div class="row"><h2>Condensed incidents</h2><span class="muted small">Related alerts grouped per host</span></div><div id="incidents"></div></section>
+      <section class="panel"><h2>Decision queue</h2><div id="alerts" class="scroll"></div></section>
+      <section class="panel"><h2>Systems</h2><div class="scroll"><table><thead><tr><th>Host</th><th>OS</th><th>Health</th><th>Last seen</th><th></th></tr></thead><tbody id="agents"></tbody></table></div></section>
+    </div>
+    <div>
+      <section class="panel"><h2>Controller and governance</h2><div id="controller"></div><label class="muted small" for="modeSelect">Autonomy mode</label><select id="modeSelect"><option>observe</option><option>interactive</option><option>approval-based</option><option>guarded-autonomous</option></select><button onclick="setMode()">Apply mode</button><button class="danger" onclick="emergencyStop()">Emergency stop</button><button class="safe" onclick="resumeChanges()">Resume approved changes</button></section>
+      <section class="panel"><h2>Passive topology</h2><div id="topology"></div></section>
+      <section class="panel"><h2>Recent actions</h2><div id="actions"></div></section>
+      <section class="panel"><h2>Agentless events</h2><div id="events"></div></section>
+      <section class="panel"><h2>Protected account manifest</h2><textarea id="manifest" placeholder='{"accounts":[{"agent_id":"*","name":"protected-admin-example","role":"black-team"}]}'></textarea><button onclick="importManifest()">Import manifest</button></section>
+      <section class="panel"><h2>Audit trail</h2><div id="audit"></div></section>
+    </div>
+  </section>
+</main>
+<script>
+// BEGIN OPERATOR AUTH V1
+const OPERATOR_AUTH_VERSION='1';
+const OPERATOR_AUTH_DOMAIN='sentinel-blue-operator-request-v1';
+const OPERATOR_SIGNING_HEADER_NAMES=['X-SB-Operator-Version','X-SB-Operator-Principal','X-SB-Operator-Epoch','X-SB-Operator-Timestamp','X-SB-Operator-Request-ID','X-SB-Operator-Signature'];
+const operatorEncoder=new TextEncoder();
+const operatorHex=bytes=>Array.from(new Uint8Array(bytes),value=>value.toString(16).padStart(2,'0')).join('');
+async function operatorSha256Hex(bytes){return operatorHex(await globalThis.crypto.subtle.digest('SHA-256',bytes));}
+function operatorRequestId(){const bytes=new Uint8Array(16);globalThis.crypto.getRandomValues(bytes);return operatorHex(bytes);}
+async function operatorCanonicalBytes(metadata,timestamp,requestId,method,target,bodyBytes){
+  const bodySha256=await operatorSha256Hex(bodyBytes);
+  return operatorEncoder.encode([OPERATOR_AUTH_DOMAIN,metadata.principal_id,String(metadata.credential_epoch),timestamp,requestId,method,target,bodySha256].join('\u0000'));
+}
+async function importOperatorKey(secret){return globalThis.crypto.subtle.importKey('raw',operatorEncoder.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);}
+async function operatorRequestSignature(key,metadata,timestamp,requestId,method,target,bodyBytes){const canonical=await operatorCanonicalBytes(metadata,timestamp,requestId,method,target,bodyBytes);return operatorHex(await globalThis.crypto.subtle.sign('HMAC',key,canonical));}
+// END OPERATOR AUTH V1
+let operatorKey=null;
+let operatorMetadata=null;
+const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function age(ts){const s=Math.max(0,Date.now()/1000-Number(ts||0));return s<60?`${Math.round(s)}s`:s<3600?`${Math.round(s/60)}m`:`${Math.round(s/3600)}h`;}
+function validateOperatorMetadata(payload){if(!payload||payload.version!==OPERATOR_AUTH_VERSION||typeof payload.principal_id!=='string'||!/^[A-Za-z0-9_.:@-]{1,128}$/.test(payload.principal_id)||!Number.isSafeInteger(payload.credential_epoch)||payload.credential_epoch<1||!Number.isSafeInteger(payload.request_not_before)||payload.request_not_before<0)throw new Error('Controller operator authentication metadata is invalid');return Object.freeze({version:payload.version,principal_id:payload.principal_id,credential_epoch:payload.credential_epoch,request_not_before:payload.request_not_before});}
+async function loadOperatorMetadata(){const response=await fetch('/api/v1/operator/auth-info',{cache:'no-store',credentials:'same-origin',redirect:'error'});if(!response.ok)throw new Error('Controller operator authentication metadata is unavailable');return validateOperatorMetadata(await response.json());}
+async function request(path,options={}){
+  if(!operatorKey||!operatorMetadata)throw new Error('Operator authentication required');
+  const url=new URL(path,window.location.href);if(url.origin!==window.location.origin||url.hash)throw new Error('Operator request target is invalid');
+  const target=url.pathname+url.search;const method=String(options.method||'GET').toUpperCase();if(!/^[A-Z]{1,16}$/.test(method))throw new Error('Operator request method is invalid');
+  const body=options.body===undefined?'':options.body;if(typeof body!=='string'||(method==='GET'&&body))throw new Error('Operator request body must be exact text bytes');
+  const bodyBytes=operatorEncoder.encode(body);const timestamp=String(Math.max(Math.floor(Date.now()/1000),operatorMetadata.request_not_before));const requestId=operatorRequestId();
+  const signature=await operatorRequestSignature(operatorKey,operatorMetadata,timestamp,requestId,method,target,bodyBytes);const headers=new Headers(options.headers||{});
+  for(const name of ['X-SB-Operator',...OPERATOR_SIGNING_HEADER_NAMES])if(headers.has(name))throw new Error('Caller supplied reserved operator authentication headers');
+  headers.set('X-SB-Operator-Version',OPERATOR_AUTH_VERSION);headers.set('X-SB-Operator-Principal',operatorMetadata.principal_id);headers.set('X-SB-Operator-Epoch',String(operatorMetadata.credential_epoch));headers.set('X-SB-Operator-Timestamp',timestamp);headers.set('X-SB-Operator-Request-ID',requestId);headers.set('X-SB-Operator-Signature',signature);
+  const response=await fetch(target,{...options,method,body:method==='GET'?undefined:body,headers,cache:'no-store',credentials:'same-origin',redirect:'error'});
+  if(response.status===401){operatorKey=null;$('login').classList.remove('hidden');throw new Error('Operator authentication required');}
+  if(!response.ok){let message=response.status===409?'Operator request was already admitted; refresh state before retrying':`HTTP ${response.status}`;try{message=(await response.json()).error||message}catch(_error){}throw new Error(message)}return response.json();
+}
+async function apiPost(path,payload={}){return request(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});}
+const highActions=new Set(['restore_integrity','rollback_integrity','quarantine_session','restart_service','rollback_service']);
+async function oneUseAuthorization(agentId,actionType,subject){if(!highActions.has(actionType))return '';const issued=await apiPost('/api/v1/authorizations',{agent_id:agentId,action_type:actionType,subject,ttl_seconds:120});return issued.authorization_code;}
+async function decide(id,decision,agentId='',actionType=''){const authorization_code=decision==='approve'?await oneUseAuthorization(agentId,actionType,id):'';await apiPost(`/api/v1/alerts/${id}/decision`,{decision,authorization_code});await refresh();}async function approveBaseline(id){await apiPost(`/api/v1/agents/${id}/baseline/approve`);await refresh();}async function releaseAction(id){await apiPost(`/api/v1/actions/${id}/release`);await refresh();}async function rollbackAction(id,agentId,originalType){const actionType=originalType==='restart_service'?'rollback_service':'rollback_integrity';const authorization_code=await oneUseAuthorization(agentId,actionType,id);await apiPost(`/api/v1/actions/${id}/rollback`,{authorization_code});await refresh();}async function reconcileAction(id,resolution){if(!confirm(`Confirm this action ${resolution==='executed'?'executed':'did not execute'}?`))return;await apiPost(`/api/v1/actions/${id}/reconcile`,{resolution});await refresh();}async function agentState(id,enabled){await apiPost(`/api/v1/agents/${id}/${enabled?'enable':'revoke'}`);await refresh();}
+async function setMode(){await apiPost('/api/v1/governance/mode',{mode:$('modeSelect').value});await refresh();}async function emergencyStop(){if(confirm('Stop all new changing actions while telemetry continues?')){await apiPost('/api/v1/governance/emergency-stop');await refresh();}}async function resumeChanges(){if(confirm('Resume only the actions allowed by the approved event profile and selected mode?')){await apiPost('/api/v1/governance/resume');await refresh();}}
+async function authorizeChange(id){const path=prompt('Exact absolute path for the next planned change');if(!path)return;await apiPost('/api/v1/change-grants',{agent_id:id,path,ttl_seconds:300});await refresh();}
+async function importManifest(){try{await apiPost('/api/v1/protected-accounts/import',JSON.parse($('manifest').value));$('manifest').value='';await refresh()}catch(error){alert(error.message)}}
+const notified=new Set(JSON.parse(localStorage.getItem('sentinelNotified')||'[]'));$('notifyButton').onclick=async()=>{if('Notification'in window)await Notification.requestPermission()};function notifyCritical(items){if(!('Notification'in window)||Notification.permission!=='granted')return;for(const item of items){if(item.severity!=='critical'||notified.has(item.alert_id))continue;new Notification(item.title,{body:item.summary,tag:item.alert_id,requireInteraction:true});notified.add(item.alert_id)}localStorage.setItem('sentinelNotified',JSON.stringify([...notified].slice(-300)))}
+function render(d){
+  const open=d.alerts.filter(a=>a.status==='open');$('onlineCount').textContent=d.metrics.online_agents;$('staleCount').textContent=d.metrics.stale_agents;$('criticalCount').textContent=d.metrics.critical_alerts;$('openCount').textContent=open.length;$('actionCount').textContent=d.actions.filter(a=>['queued','dispatched'].includes(a.status)).length;$('nodeCount').textContent=d.topology?.nodes?.length||0;
+  $('incidents').innerHTML=(d.incidents||[]).map(i=>`<article class="incident ${esc(i.severity)}"><div class="row"><h3>${esc(i.summary)}</h3><b>${esc(i.risk_score)}/100</b></div><span class="badge">${esc(i.agent_id)}</span><span class="badge">${esc(i.severity)}</span><span class="muted small">${i.alert_count} finding(s)</span></article>`).join('')||'<p class="muted">No active incidents.</p>';
+  $('alerts').innerHTML=open.map(a=>`<article class="alert ${esc(a.severity)}"><div class="row"><h3>${esc(a.title)}</h3><span><span class="badge">${esc(a.severity)}</span><span class="badge">${Math.round(Number(a.confidence)*100)}%</span><span class="badge">seen ${esc(a.occurrence_count||1)}×</span></span></div><p>${esc(a.summary)}</p><p class="muted">${esc(a.recommendation)}</p><details><summary>Evidence</summary><pre>${esc(JSON.stringify(a.evidence,null,2))}</pre></details><button class="danger" onclick="decide('${a.alert_id}','approve','${a.agent_id}','${a.recommended_action}')">Approve ${esc(a.recommended_action)}</button>${a.kind==='critical_file_changed'&&a.evidence?.current?`<button class="safe" onclick="decide('${a.alert_id}','accept_change')">Accept as planned change</button>`:''}<button onclick="decide('${a.alert_id}','observe')">Observe</button><button class="safe" onclick="decide('${a.alert_id}','mark_protected')">Protect identity</button><button onclick="decide('${a.alert_id}','reject')">Reject</button></article>`).join('')||'<p class="muted">No open decisions.</p>';notifyCritical(open);
+  $('agents').innerHTML=d.agents.map(a=>`<tr><td>${esc(a.hostname)}<br><span class="badge">baseline ${esc(a.baseline_status)}</span> <span class="badge" title="${esc([...(a.baseline_readiness?.blockers||[]),...(a.baseline_readiness?.warnings||[])].join('; '))}">readiness ${esc(a.baseline_readiness?.score??0)}%</span></td><td>${esc(a.platform)}</td><td><span class="badge ${esc(a.health)}">${esc(a.health)}</span></td><td>${age(a.last_seen)} ago</td><td>${a.baseline_status==='pending'?`<button onclick="approveBaseline('${a.agent_id}')">Approve baseline</button>`:''}<button onclick="authorizeChange('${a.agent_id}')">Authorize 5m change</button><button class="${a.enabled?'danger':'safe'}" onclick="agentState('${a.agent_id}',${!a.enabled})">${a.enabled?'Revoke':'Authorize re-enroll'}</button></td></tr>`).join('')||'<tr><td colspan="5" class="muted">No enrolled agents.</td></tr>';
+  const governance=d.controller.governance||{};const restoreState=d.controller.automatic_restoration_ready?'armed':d.controller.automatic_restoration?'blocked—approve exact baselines':'monitor only';const restoreBlocked=(d.controller.restoration_blocked_agents||[]).join(', ');$('modeSelect').value=governance.autonomy_mode||'observe';$('controller').innerHTML=`<p><span class="badge">v${esc(d.controller.version)}</span><span class="badge">DB ${esc(d.controller.database_integrity)}</span><span class="badge">${esc(governance.competition)}</span><span class="badge">${esc(governance.profile_id)}</span><span class="badge">${esc(governance.autonomy_mode)}</span><span class="badge ${governance.emergency_stopped?'failed':'online'}">${governance.emergency_stopped?'EMERGENCY STOP':'changes governed'}</span><span class="badge" title="${esc(restoreBlocked)}">auto-restore ${esc(restoreState)}</span><span class="badge">${esc(d.controller.restore_confirmations)} confirmation(s)</span><span class="badge">${d.controller.allow_unprobed_restoration?'unprobed writes allowed':'mapped probe required'}</span></p><p class="muted">Profile ${esc((governance.profile_fingerprint||'').slice(0,16))}… · One live scored network · staging non-authoritative · Uptime ${age(Date.now()/1000-d.controller.uptime_seconds)} · Enrollment ${d.controller.enrollment_open?'open':'closed'}</p>`;
+  $('topology').innerHTML=(d.topology?.nodes||[]).slice(0,40).map(n=>`<p><span class="badge">${esc(n.kind)}</span>${esc(n.label)}</p>`).join('')||'<p class="muted">No observations.</p>';
+  $('actions').innerHTML=d.actions.slice(0,15).map(a=>`<p><span class="badge ${esc(a.status)}">${esc(a.status)}</span>${a.automated?'<span class="badge">automatic</span>':''} ${esc(a.action_type)} <span class="muted">${esc(a.agent_id)}</span>${a.status==='outcome_unknown'?` <button class="danger" onclick="reconcileAction('${a.action_id}','executed')">Confirm executed</button> <button class="safe" onclick="reconcileAction('${a.action_id}','not_executed')">Confirm not executed</button>`:''}${a.action_type==='quarantine_session'&&a.status==='completed'&&a.result?.success?` <button onclick="releaseAction('${a.action_id}')">Release</button>`:''}${['restart_service','restore_integrity'].includes(a.action_type)&&a.status==='completed'&&a.result?.success&&a.result?.pre_state?` <button onclick="rollbackAction('${a.action_id}','${a.agent_id}','${a.action_type}')">Undo</button>`:''}${a.result?.rolled_back?' <span class="badge">rolled back</span>':''}</p>`).join('')||'<p class="muted">No actions.</p>';
+  $('events').innerHTML=(d.events||[]).slice(0,10).map(e=>`<p><span class="badge">${esc(e.severity)}</span>${esc(e.source)}: ${esc(e.message)}</p>`).join('')||'<p class="muted">No agentless events.</p>';
+  $('audit').innerHTML=(d.audit||[]).slice(0,12).map(a=>`<p><span class="badge">${esc(a.operation)}</span>${esc(a.subject)} <span class="muted small">${age(a.created_at)} ago</span></p>`).join('')||'<p class="muted">No audit records.</p>';
+}
+async function refresh(){if(!operatorKey)return;try{render(await request('/api/v1/dashboard'));$('connection').textContent='Controller online';$('connection').style.color='var(--green)';$('login').classList.add('hidden')}catch(error){$('connection').textContent=error.message;$('connection').style.color='var(--red)'}}
+async function authenticate(){if(!window.isSecureContext||!globalThis.crypto?.subtle)throw new Error('Operator signing requires a secure browser context');if(!operatorMetadata)operatorMetadata=await loadOperatorMetadata();let secret=$('tokenInput').value.trim();$('tokenInput').value='';if(!/^[A-Za-z0-9_-]{32,256}$/.test(secret))throw new Error('Enter a valid operator signing key');try{operatorKey=await importOperatorKey(secret)}finally{secret=''}await refresh()}
+$('loginButton').onclick=async()=>{try{$('loginError').textContent='';await authenticate()}catch(error){operatorKey=null;$('loginError').textContent=error.message}};$('logoutButton').onclick=()=>{operatorKey=null;$('tokenInput').value='';$('login').classList.remove('hidden')};
+(async()=>{try{operatorMetadata=await loadOperatorMetadata();$('connection').textContent='Operator key required';$('connection').style.color='var(--amber)'}catch(error){$('loginError').textContent=error.message;$('connection').textContent='Authentication metadata unavailable';$('connection').style.color='var(--red)'}setInterval(refresh,4000)})();
+</script>
+</body>
+</html>
