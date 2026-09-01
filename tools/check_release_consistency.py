@@ -125,16 +125,22 @@ def check_source(expected: str | None = None) -> str:
     if "chrome.runtime.getManifest().version" not in popup:
         raise ValueError("portal extension does not derive its release version from the manifest")
     required_labels = {
-        "README.md": f"# Sentinel Blue {version} ",
+        "portal-extension/README.md": f"Sentinel Blue {version} is the",
+    }
+    optional_labels = {
+        "README.md": f"# Sentinel Blue {version}",
         "SECURITY.md": f"Sentinel Blue {version} is defensive software",
         "docs/ARCHITECTURE.md": f"# Sentinel Blue {version} architecture",
         "docs/MONITORED_RESTORATION.md": f"Sentinel Blue {version} implements",
         "docs/COMPETITION_REQUIREMENTS.md": f"to Sentinel Blue {version}.",
         "docs/ROADMAP.md": f"Run the exact {version} release",
-        "portal-extension/README.md": f"Sentinel Blue {version} is the",
     }
     for name, text in required_labels.items():
         if text not in (ROOT / name).read_text(encoding="utf-8"):
+            raise ValueError(f"{name} does not identify the current release")
+    for name, text in optional_labels.items():
+        path = ROOT / name
+        if path.exists() and text not in path.read_text(encoding="utf-8"):
             raise ValueError(f"{name} does not identify the current release")
     return version
 

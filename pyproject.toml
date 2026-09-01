@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "sentinel-blue"
 version = "1.9.11"
 description = "Competition-safe defensive monitoring and response orchestrator"
-readme = "README.md"
+readme = {text = "Sentinel Blue competition-safe defensive software.", content-type = "text/plain"}
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Sentinel Blue contributors"}]

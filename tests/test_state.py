@@ -247,11 +247,13 @@ class StateTests(unittest.TestCase):
     def test_windows_atomic_replace_retries_only_sharing_violations(self):
         sharing_error = OSError("synthetic sharing violation")
         sharing_error.winerror = 32
-        with patch.object(state.os, "name", "nt"), patch.object(
-            state.os, "replace", side_effect=[sharing_error, None]
-        ) as replace, patch.object(state.time, "sleep") as sleep:
+        with patch.object(state, "os", wraps=state.os) as windows_os, patch.object(
+            state.time, "sleep"
+        ) as sleep:
+            windows_os.name = "nt"
+            windows_os.replace.side_effect = [sharing_error, None]
             state._replace_with_retry(Path("source"), Path("destination"))
-        self.assertEqual(replace.call_count, 2)
+        self.assertEqual(windows_os.replace.call_count, 2)
         sleep.assert_called_once()
 
     def test_agent_process_lock_refuses_a_second_owner(self):
