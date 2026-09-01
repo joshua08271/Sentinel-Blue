@@ -68,7 +68,6 @@ WINDOWS_SEMANTIC_CONTROL_MASK = (
 WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
-WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
 WINDOWS_FILE_TRAVERSE = 0x00000020
 WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
 WINDOWS_DELETE = 0x00010000
@@ -88,11 +87,9 @@ WINDOWS_FILE_FLAG_WRITE_THROUGH = 0x80000000
 WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 WINDOWS_FILE_BASIC_INFO_CLASS = 0
-WINDOWS_FILE_RENAME_INFO_CLASS = 3
 WINDOWS_FILE_DISPOSITION_INFO_CLASS = 4
-# FILE_INFO_BY_HANDLE_CLASS is a zero-based Win32 enum. FileRenameInfoEx
-# follows FileDispositionInfoEx (21) in minwinbase.h.
-WINDOWS_FILE_RENAME_INFO_EX_CLASS = 22
+WINDOWS_NATIVE_FILE_RENAME_INFO_CLASS = 10
+WINDOWS_NATIVE_FILE_RENAME_INFO_EX_CLASS = 65
 WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
 WINDOWS_FILE_RENAME_POSIX_SEMANTICS = 0x00000002
 WINDOWS_VOLUME_NAME_GUID = 0x00000001
@@ -147,7 +144,7 @@ class _WindowsFileDispositionInformation(ctypes.Structure):
 
 
 class _WindowsFileRenameInformationHeader(ctypes.Structure):
-    """Fixed Win32 FILE_RENAME_INFO footprint, including FileName[1]."""
+    """Fixed FILE_RENAME_INFORMATION footprint, including FileName[1]."""
 
     _anonymous_ = ("choice",)
     _fields_ = [
@@ -158,49 +155,53 @@ class _WindowsFileRenameInformationHeader(ctypes.Structure):
     ]
 
 
+class _WindowsIoStatusBlockChoice(ctypes.Union):
+    _fields_ = [("Status", ctypes.c_int32), ("Pointer", ctypes.c_void_p)]
+
+
+class _WindowsIoStatusBlock(ctypes.Structure):
+    _anonymous_ = ("choice",)
+    _fields_ = [
+        ("choice", _WindowsIoStatusBlockChoice),
+        ("Information", ctypes.c_size_t),
+    ]
+
+
 def _windows_file_rename_information(
-    target_path: str,
+    parent_handle,
+    target_name: str,
     *,
     replace_if_exists: bool = True,
     rename_flags: int | None = None,
 ):
-    """Build an ABI-correct FILE_RENAME_INFO for one canonical volume path."""
-    if not isinstance(target_path, str) or not target_path or "\x00" in target_path:
-        raise ValueError("Windows restoration target path is unsafe")
+    """Build an ABI-correct relative FILE_RENAME_INFORMATION value."""
+    root_value = int(getattr(parent_handle, "value", parent_handle) or 0)
+    if root_value == 0:
+        raise ValueError("Windows restoration rename root handle is invalid")
+    if not isinstance(target_name, str) or not target_name or "\x00" in target_name:
+        raise ValueError("Windows restoration target has an unsafe file name")
     try:
-        encoded = target_path.encode("utf-16-le")
+        encoded = target_name.encode("utf-16-le")
     except UnicodeEncodeError as exc:
-        raise ValueError("Windows restoration target path is unsafe") from exc
-    match = re.fullmatch(
-        r"\\\\\?\\Volume\{"
-        r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
-        r"\}\\(.+)",
-        target_path,
-    )
-    forbidden = set('<>:"|?*/')
+        raise ValueError(
+            "Windows restoration target has an unsafe file name"
+        ) from exc
+    forbidden = set('<>:"|?*\\/')
     reserved = re.compile(
         r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(?:\..*)?$",
         re.I,
     )
-    components = match.group(1).split("\\") if match is not None else []
     if (
-        match is None
-        or len(encoded) > 65534
+        target_name in {".", ".."}
+        or len(encoded) > 510
+        or target_name[-1] in {" ", "."}
         or any(
-            not component
-            or component in {".", ".."}
-            or len(component.encode("utf-16-le")) > 510
-            or component[-1] in {" ", "."}
-            or any(
-                ord(character) < 32 or character in forbidden
-                for character in component
-            )
-            or reserved.fullmatch(component)
-            for component in components
+            ord(character) < 32 or character in forbidden
+            for character in target_name
         )
+        or reserved.fullmatch(target_name)
     ):
-        raise ValueError("Windows restoration target path is unsafe")
+        raise ValueError("Windows restoration target has an unsafe file name")
     safe_extended_flags = (
         WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
         | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
@@ -212,9 +213,9 @@ def _windows_file_rename_information(
     ):
         raise ValueError("Windows restoration rename flags are invalid")
 
-    # SetFileInformationByHandle requires sizeof(FILE_RENAME_INFO) plus
-    # FileNameLength. Allocate enough storage for that documented footprint,
-    # including the structure's inline FileName[1] and native tail padding.
+    # The native API requires sizeof(FILE_RENAME_INFORMATION) plus
+    # FileNameLength. Allocate the documented footprint, including the
+    # structure's inline FileName[1] and native tail padding.
     required_size = ctypes.sizeof(_WindowsFileRenameInformationHeader) + len(encoded)
     tail_bytes = required_size - _WindowsFileRenameInformationHeader.FileName.offset
     units = (tail_bytes + ctypes.sizeof(ctypes.c_uint16) - 1) // ctypes.sizeof(
@@ -235,7 +236,7 @@ def _windows_file_rename_information(
         information.ReplaceIfExists = 1 if replace_if_exists else 0
     else:
         information.Flags = rename_flags
-    information.RootDirectory = None
+    information.RootDirectory = root_value
     information.FileNameLength = len(encoded)
     ctypes.memmove(
         ctypes.addressof(information) + FileRenameInformation.FileName.offset,
@@ -246,7 +247,7 @@ def _windows_file_rename_information(
 
 
 def _windows_file_rename_information_size(information) -> int:
-    """Return the documented minimum Win32 FILE_RENAME_INFO buffer size."""
+    """Return the documented native FILE_RENAME_INFORMATION buffer size."""
     file_name_length = int(information.FileNameLength)
     size = ctypes.sizeof(_WindowsFileRenameInformationHeader) + file_name_length
     if size > ctypes.sizeof(information):
@@ -472,6 +473,7 @@ class _WindowsNativeFileOps:
 
     def __init__(self):
         kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+        ntdll = ctypes.WinDLL("Ntdll.dll", use_last_error=True)
         self._create_file = kernel32.CreateFileW
         self._create_file.argtypes = [
             ctypes.c_wchar_p,
@@ -534,6 +536,18 @@ class _WindowsNativeFileOps:
             ctypes.c_uint32,
         ]
         self._set_information.restype = ctypes.c_int32
+        self._nt_set_information = ntdll.NtSetInformationFile
+        self._nt_set_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsIoStatusBlock),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        ]
+        self._nt_set_information.restype = ctypes.c_int32
+        self._rtl_nt_status_to_dos_error = ntdll.RtlNtStatusToDosError
+        self._rtl_nt_status_to_dos_error.argtypes = [ctypes.c_int32]
+        self._rtl_nt_status_to_dos_error.restype = ctypes.c_uint32
         self._close_handle = kernel32.CloseHandle
         self._close_handle.argtypes = [ctypes.c_void_p]
         self._close_handle.restype = ctypes.c_int32
@@ -685,6 +699,36 @@ class _WindowsNativeFileOps:
         ):
             self._raise("Windows restoration file information could not be changed")
 
+    def _set_native_file_information(
+        self,
+        handle,
+        information_class: int,
+        information,
+        *,
+        buffer_size: int | None = None,
+    ) -> None:
+        size = ctypes.sizeof(information) if buffer_size is None else int(buffer_size)
+        if not 1 <= size <= ctypes.sizeof(information):
+            raise ValueError("Windows restoration native information size is invalid")
+        io_status = _WindowsIoStatusBlock()
+        status = int(
+            self._nt_set_information(
+                handle,
+                ctypes.byref(io_status),
+                ctypes.byref(information),
+                size,
+                information_class,
+            )
+        )
+        completion_status = int(io_status.Status)
+        if status != 0 or completion_status != 0:
+            failed_status = status if status != 0 else completion_status
+            error = int(self._rtl_nt_status_to_dos_error(failed_status))
+            raise OSError(
+                error,
+                "Windows restoration native file information could not be changed",
+            )
+
     def apply_mode(self, handle, mode: int) -> None:
         information = _WindowsFileBasicInformation()
         if not self._get_information_ex(
@@ -712,28 +756,31 @@ class _WindowsNativeFileOps:
     def rename_file(
         self,
         handle,
-        target_path: str,
+        parent_handle,
+        leaf: str,
         *,
         replace_if_exists: bool = True,
     ) -> None:
         if replace_if_exists:
-            # POSIX replacement is the documented Windows form that permits
-            # the verified destination handles to remain open across publish.
-            information_class = WINDOWS_FILE_RENAME_INFO_EX_CLASS
+            # The standard native class preserves access checks; POSIX
+            # replacement keeps verified target handles valid across publish.
+            information_class = WINDOWS_NATIVE_FILE_RENAME_INFO_EX_CLASS
             information = _windows_file_rename_information(
-                target_path,
+                parent_handle,
+                leaf,
                 rename_flags=(
                     WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
                     | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
                 ),
             )
         else:
-            information_class = WINDOWS_FILE_RENAME_INFO_CLASS
+            information_class = WINDOWS_NATIVE_FILE_RENAME_INFO_CLASS
             information = _windows_file_rename_information(
-                target_path,
+                parent_handle,
+                leaf,
                 replace_if_exists=False,
             )
-        self._set_file_information(
+        self._set_native_file_information(
             handle,
             information_class,
             information,
@@ -763,9 +810,7 @@ def _windows_pinned_parent(
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
             desired_access = (
-                WINDOWS_FILE_LIST_DIRECTORY
-                | WINDOWS_FILE_TRAVERSE
-                | WINDOWS_FILE_READ_ATTRIBUTES
+                WINDOWS_FILE_TRAVERSE | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE
             )
             share_mode = WINDOWS_FILE_SHARE_READ
@@ -1318,7 +1363,7 @@ def _windows_atomic_write(
             destination,
             native,
         ) as (
-            _parent_handle,
+            parent_handle,
             parent_path,
             leaf,
         ):
@@ -1521,7 +1566,8 @@ def _windows_atomic_write(
                     )
                 native.rename_file(
                     handle,
-                    _windows_child_path(parent_path, leaf),
+                    parent_handle,
+                    leaf,
                     replace_if_exists=replace_if_exists,
                 )
                 published = True

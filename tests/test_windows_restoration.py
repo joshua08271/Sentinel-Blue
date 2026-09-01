@@ -12,12 +12,6 @@ from unittest.mock import patch
 from sentinel_blue import restoration
 
 
-_CANONICAL_TARGET = (
-    r"\\?\Volume{00000000-0000-0000-0000-000000000001}"
-    r"\safe\target.conf"
-)
-
-
 class _NativeFunction:
     def __init__(self, callback):
         self.callback = callback
@@ -201,8 +195,10 @@ class _FakeWindowsFileOps:
         else:
             self.delete_pending_handles.discard(handle)
 
-    def rename_file(self, handle, target_path, *, replace_if_exists=True):
-        self.events.append(("rename", handle, target_path, replace_if_exists))
+    def rename_file(self, handle, parent_handle, leaf, *, replace_if_exists=True):
+        self.events.append(
+            ("rename", handle, parent_handle, leaf, replace_if_exists)
+        )
         if self.fail_rename:
             raise OSError("synthetic rename failure")
 
@@ -302,17 +298,21 @@ class WindowsRestorationTests(unittest.TestCase):
         self.assertEqual(api.revert_calls, 0)
         self.assertEqual(api.closed_handles, [22, 11])
 
-    def test_file_information_structures_match_the_win32_abi(self):
+    def test_file_information_structures_match_the_native_abi(self):
         self.assertEqual(ctypes.sizeof(restoration._WindowsRenameChoice), 4)
         self.assertEqual(
             ctypes.sizeof(restoration._WindowsFileDispositionInformation), 1
         )
+        self.assertEqual(
+            restoration._WindowsIoStatusBlock.Information.offset,
+            ctypes.sizeof(ctypes.c_void_p),
+        )
         disposition = restoration._WindowsFileDispositionInformation(1)
         self.assertEqual(ctypes.string_at(ctypes.byref(disposition), 1), b"\x01")
 
-        target_path = _CANONICAL_TARGET
-        encoded = target_path.encode("utf-16-le")
-        information = restoration._windows_file_rename_information(target_path)
+        leaf = "target.conf"
+        encoded = leaf.encode("utf-16-le")
+        information = restoration._windows_file_rename_information(77, leaf)
         kind = type(information)
         self.assertEqual(kind.choice.offset, 0)
         self.assertEqual(
@@ -320,7 +320,7 @@ class WindowsRestorationTests(unittest.TestCase):
             0,
         )
         self.assertEqual(information.ReplaceIfExists, 1)
-        self.assertFalse(information.RootDirectory)
+        self.assertEqual(information.RootDirectory, 77)
         self.assertEqual(information.FileNameLength, len(encoded))
         self.assertEqual(
             ctypes.string_at(
@@ -338,29 +338,21 @@ class WindowsRestorationTests(unittest.TestCase):
             + len(encoded),
         )
         non_replacing = restoration._windows_file_rename_information(
-            target_path,
+            77,
+            leaf,
             replace_if_exists=False,
         )
         self.assertEqual(non_replacing.ReplaceIfExists, 0)
-        unsafe_paths = (
-            "target.conf",
-            r"C:\safe\target.conf",
-            (
-                r"\\?\Volume{00000000-0000-0000-0000-000000000001}"
-                r"\safe\..\escape"
-            ),
-            (
-                r"\\?\Volume{00000000-0000-0000-0000-000000000001}"
-                r"\safe\CON"
-            ),
-        )
-        for unsafe_path in unsafe_paths:
-            with self.subTest(unsafe_path=unsafe_path):
-                with self.assertRaisesRegex(ValueError, "target path is unsafe"):
-                    restoration._windows_file_rename_information(unsafe_path)
+        for unsafe_leaf in ("..\\escape", "CON", "trailing.", "wild*"):
+            with self.subTest(unsafe_leaf=unsafe_leaf):
+                with self.assertRaisesRegex(ValueError, "unsafe file name"):
+                    restoration._windows_file_rename_information(77, unsafe_leaf)
+        with self.assertRaisesRegex(ValueError, "root handle is invalid"):
+            restoration._windows_file_rename_information(None, leaf)
         with self.assertRaisesRegex(ValueError, "rename flags are invalid"):
             restoration._windows_file_rename_information(
-                target_path,
+                77,
+                leaf,
                 rename_flags=restoration.WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS,
             )
 
@@ -386,30 +378,31 @@ class WindowsRestorationTests(unittest.TestCase):
             [(41, restoration.WINDOWS_FILE_DISPOSITION_INFO_CLASS, 1, b"\x01")],
         )
 
-    def test_rename_uses_extended_posix_semantics_for_replacement(self):
+    def test_rename_uses_native_relative_posix_replacement(self):
         observed = []
         native = object.__new__(restoration._WindowsNativeFileOps)
-        target_path = _CANONICAL_TARGET
 
-        def set_information(handle, information_class, pointer, size):
+        def set_information(handle, io_status, pointer, size, information_class):
             observed.append(
                 (
                     handle,
                     information_class,
                     size,
                     ctypes.string_at(pointer, size),
+                    io_status,
                 )
             )
-            return 1
+            return 0
 
-        native._set_information = set_information
-        native.rename_file(41, target_path)
+        native._nt_set_information = set_information
+        native.rename_file(41, 77, "target.conf")
         self.assertEqual(
             observed[0][0:2],
-            (41, restoration.WINDOWS_FILE_RENAME_INFO_EX_CLASS),
+            (41, restoration.WINDOWS_NATIVE_FILE_RENAME_INFO_EX_CLASS),
         )
         expected = restoration._windows_file_rename_information(
-            target_path,
+            77,
+            "target.conf",
             rename_flags=(
                 restoration.WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
                 | restoration.WINDOWS_FILE_RENAME_POSIX_SEMANTICS
@@ -429,7 +422,7 @@ class WindowsRestorationTests(unittest.TestCase):
                 ],
                 "little",
             ),
-            0,
+            77,
         )
         self.assertEqual(
             int.from_bytes(
@@ -439,36 +432,37 @@ class WindowsRestorationTests(unittest.TestCase):
             restoration.WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
             | restoration.WINDOWS_FILE_RENAME_POSIX_SEMANTICS,
         )
-        encoded = target_path.encode("utf-16-le")
+        encoded = "target.conf".encode("utf-16-le")
         self.assertEqual(
             serialized[kind.FileName.offset : kind.FileName.offset + len(encoded)],
             encoded,
         )
         self.assertEqual(serialized[-2:], b"\x00\x00")
 
-    def test_non_replacing_rename_uses_regular_information_class(self):
+    def test_non_replacing_rename_uses_regular_native_information_class(self):
         observed = []
         native = object.__new__(restoration._WindowsNativeFileOps)
-        target_path = _CANONICAL_TARGET
 
-        def set_information(handle, information_class, pointer, size):
+        def set_information(handle, io_status, pointer, size, information_class):
             observed.append(
                 (
                     handle,
                     information_class,
                     ctypes.string_at(pointer, size),
+                    io_status,
                 )
             )
-            return 1
+            return 0
 
-        native._set_information = set_information
-        native.rename_file(41, target_path, replace_if_exists=False)
+        native._nt_set_information = set_information
+        native.rename_file(41, 77, "target.conf", replace_if_exists=False)
         self.assertEqual(
             observed[0][0:2],
-            (41, restoration.WINDOWS_FILE_RENAME_INFO_CLASS),
+            (41, restoration.WINDOWS_NATIVE_FILE_RENAME_INFO_CLASS),
         )
         expected = restoration._windows_file_rename_information(
-            target_path,
+            77,
+            "target.conf",
             replace_if_exists=False,
         )
         kind = type(expected)
@@ -478,8 +472,16 @@ class WindowsRestorationTests(unittest.TestCase):
         root_end = root_start + ctypes.sizeof(ctypes.c_void_p)
         self.assertEqual(
             int.from_bytes(serialized[root_start:root_end], "little"),
-            0,
+            77,
         )
+
+    def test_native_information_failure_maps_status_without_fallback(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        native._nt_set_information = lambda *_args: -1073741790
+        native._rtl_nt_status_to_dos_error = lambda _status: 5
+        with self.assertRaises(OSError) as raised:
+            native.rename_file(41, 77, "target.conf")
+        self.assertEqual(raised.exception.errno, 5)
 
     @unittest.skipUnless(os.name == "nt", "native Windows file APIs unavailable")
     def test_native_atomic_write_publishes_exact_bytes(self):
@@ -700,6 +702,12 @@ class WindowsRestorationTests(unittest.TestCase):
                 event[6] & restoration.WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
             )
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_DELETE)
+        expected_access = (
+            restoration.WINDOWS_FILE_TRAVERSE
+            | restoration.WINDOWS_FILE_READ_ATTRIBUTES
+            | restoration.WINDOWS_SYNCHRONIZE
+        )
+        self.assertTrue(all(event[3] == expected_access for event in opens))
         self.assertEqual(opens[0][4], restoration.WINDOWS_FILE_SHARE_READ)
         self.assertEqual(
             opens[-1][4],
@@ -959,7 +967,7 @@ class WindowsRestorationTests(unittest.TestCase):
         self.assertEqual(native.events[positions[5]], ("delete", 90, False))
         self.assertEqual(
             native.events[positions[6]],
-            ("rename", 90, _CANONICAL_TARGET, True),
+            ("rename", 90, 11, "target.conf", True),
         )
         self.assertEqual(
             native.events[-3:],
@@ -1020,12 +1028,13 @@ class WindowsRestorationTests(unittest.TestCase):
             def rename_file(
                 self,
                 handle,
-                target_path,
+                parent_handle,
+                leaf,
                 *,
                 replace_if_exists=True,
             ):
                 self.events.append(
-                    ("rename", handle, target_path, replace_if_exists)
+                    ("rename", handle, parent_handle, leaf, replace_if_exists)
                 )
                 # Model an asynchronous Python exception delivered after the
                 # native rename completed but before the caller can record it.
@@ -1096,7 +1105,7 @@ class WindowsRestorationTests(unittest.TestCase):
         self.assertLess(rename_index, target_close_index)
         self.assertEqual(
             native.events[rename_index],
-            ("rename", 90, _CANONICAL_TARGET, True),
+            ("rename", 90, 11, "target.conf", True),
         )
 
     def test_conditional_publish_rejects_stale_native_identity_before_staging(self):
@@ -1175,7 +1184,7 @@ class WindowsRestorationTests(unittest.TestCase):
         rename = next(event for event in native.events if event[0] == "rename")
         self.assertEqual(
             rename,
-            ("rename", 90, _CANONICAL_TARGET, False),
+            ("rename", 90, 11, "target.conf", False),
         )
         self.assertNotIn(
             91,
@@ -1324,12 +1333,13 @@ class WindowsRestorationTests(unittest.TestCase):
             def rename_file(
                 self,
                 handle,
-                target_path,
+                parent_handle,
+                leaf,
                 *,
                 replace_if_exists=True,
             ):
                 self.events.append(
-                    ("rename", handle, target_path, replace_if_exists)
+                    ("rename", handle, parent_handle, leaf, replace_if_exists)
                 )
                 raise KeyboardInterrupt("synthetic publish interruption")
 
