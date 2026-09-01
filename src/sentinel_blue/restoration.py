@@ -1383,11 +1383,6 @@ def _windows_atomic_write(
                 native.flush_file(handle)
                 native.apply_mode(handle, mode & 0o7777 or 0o600)
                 if encoded_descriptor:
-                    _restore_windows_security_descriptor(
-                        destination,
-                        encoded_descriptor,
-                        native_handle=handle,
-                    )
                     observed = _capture_windows_security_descriptor(
                         destination,
                         native_handle=handle,
@@ -1395,6 +1390,19 @@ def _windows_atomic_write(
                     descriptor_mismatch = _windows_security_descriptor_mismatch(
                         encoded_descriptor, observed
                     )
+                    if descriptor_mismatch is not None:
+                        _restore_windows_security_descriptor(
+                            destination,
+                            encoded_descriptor,
+                            native_handle=handle,
+                        )
+                        observed = _capture_windows_security_descriptor(
+                            destination,
+                            native_handle=handle,
+                        )
+                        descriptor_mismatch = _windows_security_descriptor_mismatch(
+                            encoded_descriptor, observed
+                        )
                     if descriptor_mismatch is not None:
                         raise OSError(
                             "post-restoration Windows security descriptor did not "
@@ -2671,13 +2679,13 @@ class RestorePointStore:
                 ),
             )
             restored_bytes, restored_meta = self._read_target(path)
+            restored_expected = (restored_bytes, restored_meta)
             if _digest(restored_bytes) != expected or not self._metadata_matches(
                 transaction["restored_metadata"], restored_meta
             ):
                 raise OSError(
                     "post-restoration bytes or security metadata did not match the approved restore point"
                 )
-            restored_expected = (restored_bytes, restored_meta)
             validation = validate_restored_configuration(path)
             if (
                 validation["applicable"]
@@ -2741,13 +2749,27 @@ class RestorePointStore:
             }
         except Exception:
             try:
-                self._restore_before_verified(
-                    path,
-                    existed,
-                    before,
-                    before_meta,
-                    expected_current=restored_expected,
-                )
+                already_before = False
+                if os.name == "nt":
+                    current = self._read_target_if_present(path)
+                    if existed and current is not None:
+                        current_bytes, current_metadata = current
+                        already_before = (
+                            current_bytes == before
+                            and self._metadata_matches(
+                                before_meta, current_metadata
+                            )
+                        )
+                    elif not existed:
+                        already_before = current is None
+                if not already_before:
+                    self._restore_before_verified(
+                        path,
+                        existed,
+                        before,
+                        before_meta,
+                        expected_current=restored_expected,
+                    )
                 transaction["rolled_back"] = True
                 transaction["status"] = "rolled_back"
                 self._write_json(self.transactions / f"{transaction_id}.json", transaction)

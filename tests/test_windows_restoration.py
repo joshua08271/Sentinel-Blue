@@ -404,10 +404,23 @@ class WindowsRestorationTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), expected)
 
     def test_descriptor_equivalence_uses_acl_semantics_and_fails_closed(self):
+        shared = (
+            1,
+            0,
+            0,
+            b"owner",
+            b"group",
+            ("present", 2, (b"\x00\x00\x04\x00",)),
+            ("absent",),
+        )
         semantic_keys = {
-            "first-encoding": ("O:S-1-5-18G:S-1-5-18D:(A;;FA;;;SY)", 0),
-            "second-encoding": ("O:S-1-5-18G:S-1-5-18D:(A;;FA;;;SY)", 0),
-            "different-acl": ("O:S-1-5-18G:S-1-5-18D:(D;;FA;;;SY)", 0),
+            "first-encoding": shared,
+            "second-encoding": shared,
+            "different-acl": (
+                *shared[:5],
+                ("present", 2, (b"\x01\x00\x04\x00",)),
+                shared[6],
+            ),
         }
         with (
             patch.object(restoration.os, "name", "nt"),
@@ -823,9 +836,13 @@ class WindowsRestorationTests(unittest.TestCase):
         def apply(_path, encoded, *, native_handle):
             native.events.append(("apply_descriptor", native_handle, encoded))
 
+        captures = 0
+
         def capture(_path, *, native_handle):
+            nonlocal captures
+            captures += 1
             native.events.append(("capture_descriptor", native_handle))
-            return descriptor
+            return "temporary-descriptor" if captures == 1 else descriptor
 
         with (
             patch.object(
@@ -872,6 +889,33 @@ class WindowsRestorationTests(unittest.TestCase):
             ("rename", 90, r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe", "target.conf", True),
         )
         self.assertEqual(native.events[-3:], [("close", 90), ("close", 11), ("close", 10)])
+
+    def test_atomic_write_keeps_an_equivalent_inherited_descriptor(self):
+        native = _FakeWindowsFileOps()
+        descriptor = "approved-descriptor"
+        with (
+            patch.object(
+                restoration,
+                "_restore_windows_security_descriptor",
+            ) as apply_descriptor,
+            patch.object(
+                restoration,
+                "_capture_windows_security_descriptor",
+                return_value=descriptor,
+            ) as capture_descriptor,
+        ):
+            restoration._windows_atomic_write(
+                Path(r"C:\safe\target.conf"),
+                b"trusted bytes",
+                0o600,
+                {"windows_security_descriptor": descriptor},
+                native=native,
+            )
+        apply_descriptor.assert_not_called()
+        capture_descriptor.assert_called_once_with(
+            Path(r"C:\safe\target.conf"), native_handle=90
+        )
+        self.assertIn("rename", [event[0] for event in native.events])
 
     def test_atomic_write_rearms_delete_disposition_if_publish_fails(self):
         native = _FakeWindowsFileOps(fail_rename=True)
