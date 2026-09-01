@@ -57,8 +57,26 @@ WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
 WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
 WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
+WINDOWS_SE_DACL_UNTRUSTED = 0x0040
+WINDOWS_SE_SERVER_SECURITY = 0x0080
+WINDOWS_SE_DACL_AUTO_INHERIT_REQ = 0x0100
+WINDOWS_SE_SACL_AUTO_INHERIT_REQ = 0x0200
+WINDOWS_SE_DACL_AUTO_INHERITED = 0x0400
+WINDOWS_SE_SACL_AUTO_INHERITED = 0x0800
 WINDOWS_SE_DACL_PROTECTED = 0x1000
 WINDOWS_SE_SACL_PROTECTED = 0x2000
+WINDOWS_SE_RM_CONTROL_VALID = 0x4000
+WINDOWS_SEMANTIC_CONTROL_MASK = (
+    WINDOWS_SE_DACL_UNTRUSTED
+    | WINDOWS_SE_SERVER_SECURITY
+    | WINDOWS_SE_DACL_AUTO_INHERIT_REQ
+    | WINDOWS_SE_SACL_AUTO_INHERIT_REQ
+    | WINDOWS_SE_DACL_AUTO_INHERITED
+    | WINDOWS_SE_SACL_AUTO_INHERITED
+    | WINDOWS_SE_DACL_PROTECTED
+    | WINDOWS_SE_SACL_PROTECTED
+    | WINDOWS_SE_RM_CONTROL_VALID
+)
 WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
@@ -902,8 +920,8 @@ def _windows_read_file_snapshot_if_present(
 
 def _windows_security_descriptor_semantics(
     encoded_descriptor: str,
-) -> tuple[str, int]:
-    """Return the access-relevant SDDL and ACL-protection control bits."""
+) -> tuple[Any, ...]:
+    """Return owner, group, ordered ACL entries, and operational control flags."""
     if os.name != "nt":
         raise OSError("Windows security descriptor comparison is unavailable")
     if (
@@ -926,16 +944,152 @@ def _windows_security_descriptor_semantics(
     descriptor = ctypes.cast(buffer, ctypes.c_void_p)
     from ctypes import wintypes
 
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
     advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
-    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
-    is_valid = advapi32.IsValidSecurityDescriptor
-    is_valid.argtypes = [ctypes.c_void_p]
-    is_valid.restype = wintypes.BOOL
-    get_length = advapi32.GetSecurityDescriptorLength
-    get_length.argtypes = [ctypes.c_void_p]
-    get_length.restype = wintypes.DWORD
-    if not is_valid(descriptor) or int(get_length(descriptor)) != len(raw_descriptor):
+    is_valid_descriptor = advapi32.IsValidSecurityDescriptor
+    is_valid_descriptor.argtypes = [ctypes.c_void_p]
+    is_valid_descriptor.restype = wintypes.BOOL
+    get_descriptor_length = advapi32.GetSecurityDescriptorLength
+    get_descriptor_length.argtypes = [ctypes.c_void_p]
+    get_descriptor_length.restype = wintypes.DWORD
+    if (
+        not is_valid_descriptor(descriptor)
+        or int(get_descriptor_length(descriptor)) != len(raw_descriptor)
+    ):
         raise ValueError("Windows file security descriptor is malformed")
+
+    def sid_semantics(getter, label: str) -> bytes:
+        sid = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not getter(descriptor, ctypes.byref(sid), ctypes.byref(defaulted)):
+            raise OSError(
+                ctypes.get_last_error(),
+                f"Windows security descriptor {label} SID is invalid",
+            )
+        if not sid.value:
+            raise ValueError(f"Windows security descriptor {label} SID is absent")
+        is_valid_sid = advapi32.IsValidSid
+        is_valid_sid.argtypes = [ctypes.c_void_p]
+        is_valid_sid.restype = wintypes.BOOL
+        if not is_valid_sid(sid):
+            raise ValueError(f"Windows security descriptor {label} SID is malformed")
+        get_sid_length = advapi32.GetLengthSid
+        get_sid_length.argtypes = [ctypes.c_void_p]
+        get_sid_length.restype = wintypes.DWORD
+        length = int(get_sid_length(sid))
+        if not 1 <= length <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES:
+            raise ValueError(f"Windows security descriptor {label} SID is malformed")
+        return ctypes.string_at(sid, length)
+
+    def acl_semantics(getter, label: str) -> tuple[Any, ...]:
+        present = wintypes.BOOL()
+        acl = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not getter(
+            descriptor,
+            ctypes.byref(present),
+            ctypes.byref(acl),
+            ctypes.byref(defaulted),
+        ):
+            raise OSError(
+                ctypes.get_last_error(),
+                f"Windows security descriptor {label} is invalid",
+            )
+        if not present.value:
+            return ("absent",)
+        if not acl.value:
+            return ("null",)
+
+        is_valid_acl = advapi32.IsValidAcl
+        is_valid_acl.argtypes = [ctypes.c_void_p]
+        is_valid_acl.restype = wintypes.BOOL
+        information = AclSizeInformation()
+        get_acl_information = advapi32.GetAclInformation
+        get_acl_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        get_acl_information.restype = wintypes.BOOL
+        if not is_valid_acl(acl) or not get_acl_information(
+            acl,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            2,
+        ):
+            raise OSError(
+                ctypes.get_last_error(),
+                f"Windows security descriptor {label} is malformed",
+            )
+        bytes_in_use = int(information.AclBytesInUse)
+        ace_count = int(information.AceCount)
+        if (
+            not 8 <= bytes_in_use <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES
+            or ace_count > 4096
+        ):
+            raise ValueError(
+                f"Windows security descriptor {label} is outside its accepted size"
+            )
+
+        get_ace = advapi32.GetAce
+        get_ace.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        get_ace.restype = wintypes.BOOL
+        entries: list[bytes] = []
+        total = 8
+        for index in range(ace_count):
+            ace = ctypes.c_void_p()
+            if not get_ace(acl, index, ctypes.byref(ace)) or not ace.value:
+                raise OSError(
+                    ctypes.get_last_error(),
+                    f"Windows security descriptor {label} entry is invalid",
+                )
+            header = ctypes.string_at(ace, 4)
+            ace_size = int.from_bytes(header[2:4], "little")
+            total += ace_size
+            if ace_size < 4 or total > bytes_in_use:
+                raise ValueError(
+                    f"Windows security descriptor {label} entry is malformed"
+                )
+            entries.append(ctypes.string_at(ace, ace_size))
+        if total != bytes_in_use:
+            raise ValueError(
+                f"Windows security descriptor {label} has unbound trailing data"
+            )
+        revision = int(ctypes.string_at(acl, 1)[0])
+        return ("present", revision, tuple(entries))
+
+    get_owner = advapi32.GetSecurityDescriptorOwner
+    get_owner.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_owner.restype = wintypes.BOOL
+    get_group = advapi32.GetSecurityDescriptorGroup
+    get_group.argtypes = get_owner.argtypes
+    get_group.restype = wintypes.BOOL
+    get_dacl = advapi32.GetSecurityDescriptorDacl
+    get_dacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_dacl.restype = wintypes.BOOL
+    get_sacl = advapi32.GetSecurityDescriptorSacl
+    get_sacl.argtypes = get_dacl.argtypes
+    get_sacl.restype = wintypes.BOOL
 
     control = wintypes.WORD()
     revision = wintypes.DWORD()
@@ -950,50 +1104,27 @@ def _windows_security_descriptor_semantics(
         raise OSError(
             ctypes.get_last_error(), "Windows security descriptor control is invalid"
         )
-
-    converted = wintypes.LPWSTR()
-    converted_length = wintypes.DWORD()
-    convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
-    convert.argtypes = [
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.LPWSTR),
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    convert.restype = wintypes.BOOL
-    if not convert(
-        descriptor,
-        1,
-        WINDOWS_CORE_SECURITY_INFORMATION,
-        ctypes.byref(converted),
-        ctypes.byref(converted_length),
-    ):
-        raise OSError(
-            ctypes.get_last_error(), "Windows security descriptor could not be canonicalized"
-        )
-    local_free = kernel32.LocalFree
-    local_free.argtypes = [ctypes.c_void_p]
-    local_free.restype = ctypes.c_void_p
-    try:
-        length = int(converted_length.value)
-        if (
-            not converted
-            or not 1 <= length <= MAX_WINDOWS_SECURITY_DESCRIPTOR_TEXT * 4
-        ):
-            raise ValueError(
-                "Windows security descriptor canonical form is outside its accepted size"
+    rm_control_value = 0
+    if int(control.value) & WINDOWS_SE_RM_CONTROL_VALID:
+        rm_control = ctypes.c_ubyte()
+        get_rm_control = advapi32.GetSecurityDescriptorRMControl
+        get_rm_control.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte)]
+        get_rm_control.restype = wintypes.BOOL
+        if not get_rm_control(descriptor, ctypes.byref(rm_control)):
+            raise OSError(
+                ctypes.get_last_error(),
+                "Windows security descriptor resource-manager control is invalid",
             )
-        canonical = converted.value
-        if not isinstance(canonical, str) or not canonical or "\x00" in canonical:
-            raise ValueError("Windows security descriptor canonical form is invalid")
-        protection = int(control.value) & (
-            WINDOWS_SE_DACL_PROTECTED | WINDOWS_SE_SACL_PROTECTED
-        )
-        return canonical, protection
-    finally:
-        if converted:
-            local_free(ctypes.cast(converted, ctypes.c_void_p))
+        rm_control_value = int(rm_control.value)
+    return (
+        int(revision.value),
+        int(control.value) & WINDOWS_SEMANTIC_CONTROL_MASK,
+        rm_control_value,
+        sid_semantics(get_owner, "owner"),
+        sid_semantics(get_group, "group"),
+        acl_semantics(get_dacl, "DACL"),
+        acl_semantics(get_sacl, "SACL"),
+    )
 
 
 def _windows_security_descriptors_equivalent(
