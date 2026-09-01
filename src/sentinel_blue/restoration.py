@@ -759,7 +759,7 @@ def _windows_pinned_parent(
     handles: list[Any] = []
     try:
         candidate = root
-        for component in [None, *components]:
+        for index, component in enumerate([None, *components]):
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
             desired_access = (
@@ -769,6 +769,11 @@ def _windows_pinned_parent(
                 | WINDOWS_SYNCHRONIZE
             )
             share_mode = WINDOWS_FILE_SHARE_READ
+            if index == len(components):
+                # Absolute Win32 rename opens the destination directory for
+                # entry creation. Sharing that access grants no permission,
+                # while continuing to deny delete sharing pins its identity.
+                share_mode |= WINDOWS_FILE_SHARE_WRITE
             handle = native.open_file(
                 candidate,
                 desired_access,

@@ -699,9 +699,13 @@ class WindowsRestorationTests(unittest.TestCase):
             self.assertTrue(
                 event[6] & restoration.WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
             )
-            self.assertEqual(event[4], restoration.WINDOWS_FILE_SHARE_READ)
-            self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_WRITE)
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_DELETE)
+        self.assertEqual(opens[0][4], restoration.WINDOWS_FILE_SHARE_READ)
+        self.assertEqual(
+            opens[-1][4],
+            restoration.WINDOWS_FILE_SHARE_READ
+            | restoration.WINDOWS_FILE_SHARE_WRITE,
+        )
         self.assertEqual(native.events[-2:], [("close", 11), ("close", 10)])
 
 
