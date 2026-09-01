@@ -23,13 +23,18 @@ from sentinel_blue.validation import telemetry_observation_sha256
 class ActionTests(unittest.TestCase):
     @staticmethod
     def _metadata(mode=0o600):
+        descriptor = "test-windows-security-descriptor" if os.name == "nt" else None
         return {
             "mode": mode,
             "uid": -1,
             "gid": -1,
             "xattrs": {},
-            "windows_security_descriptor": None,
-            "windows_security_descriptor_version": None,
+            "windows_security_descriptor": descriptor,
+            "windows_security_descriptor_version": (
+                restoration.WINDOWS_SECURITY_DESCRIPTOR_VERSION
+                if descriptor
+                else None
+            ),
         }
 
     @staticmethod
@@ -138,14 +143,17 @@ class ActionTests(unittest.TestCase):
                 patch.object(Path, "is_file", side_effect=AssertionError),
                 patch.object(Path, "is_symlink", side_effect=AssertionError),
             ):
-                result = store.restore(
-                    {
-                        "path": str(target),
-                        "baseline_sha256": expected,
-                        "observed_sha256": hashlib.sha256(before).hexdigest(),
-                    },
-                    allowed=True,
-                )
+                parameters = {
+                    "path": str(target),
+                    "baseline_sha256": expected,
+                    "observed_sha256": hashlib.sha256(before).hexdigest(),
+                }
+                if os.name == "nt":
+                    descriptor = str(record["windows_security_descriptor"])
+                    parameters["baseline_security_descriptor_sha256"] = (
+                        hashlib.sha256(descriptor.encode("ascii")).hexdigest()
+                    )
+                result = store.restore(parameters, allowed=True)
         self.assertTrue(result["success"])
         self.assertTrue(result["evidence_preserved"])
         optional_read.assert_called_once_with(target)

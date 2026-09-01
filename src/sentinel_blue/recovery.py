@@ -431,7 +431,14 @@ def _open_regular_file(
     if type(maximum) is not int or maximum < 1:
         raise ValueError("maximum file size must be a positive integer")
     _reject_symlink_components(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Windows ``os.read`` operates through the CRT.  Without O_BINARY, byte
+    # values such as 0x1a and CRLF sequences can be translated before the
+    # length/hash gates below see them, making a stable file look changed.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except (FileNotFoundError, IsADirectoryError, OSError) as exc:
@@ -561,7 +568,13 @@ def _immutable_sqlite_source(
             temporary_root.chmod(0o700)
         _require_private_directory(temporary_root)
         snapshot = temporary_root / DATABASE_FILENAME
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
         output = os.open(snapshot, flags, 0o600)
         copied_hash = hashlib.sha256()
         copied_size = 0

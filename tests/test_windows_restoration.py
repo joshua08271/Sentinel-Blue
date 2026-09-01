@@ -1,6 +1,8 @@
 import ctypes
 import hashlib
 import json
+import os
+import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -323,6 +325,11 @@ class WindowsRestorationTests(unittest.TestCase):
         self.assertGreaterEqual(
             ctypes.sizeof(information), kind.FileName.offset + len(encoded) + 2
         )
+        self.assertEqual(
+            restoration._windows_file_rename_information_size(information),
+            ctypes.sizeof(restoration._WindowsFileRenameInformationHeader)
+            + len(encoded),
+        )
         non_replacing = restoration._windows_file_rename_information(
             77,
             leaf,
@@ -353,6 +360,31 @@ class WindowsRestorationTests(unittest.TestCase):
             observed,
             [(41, restoration.WINDOWS_FILE_DISPOSITION_INFO_CLASS, 1, b"\x01")],
         )
+
+    def test_rename_uses_the_variable_win32_buffer_length(self):
+        observed = []
+        native = object.__new__(restoration._WindowsNativeFileOps)
+
+        def set_information(handle, information_class, pointer, size):
+            observed.append((handle, information_class, size, ctypes.string_at(pointer, size)))
+            return 1
+
+        native._set_information = set_information
+        native.rename_file(41, 77, "target.conf")
+        self.assertEqual(observed[0][0:2], (41, restoration.WINDOWS_FILE_RENAME_INFO_CLASS))
+        expected = restoration._windows_file_rename_information(77, "target.conf")
+        self.assertEqual(
+            observed[0][2],
+            restoration._windows_file_rename_information_size(expected),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "native Windows file APIs unavailable")
+    def test_native_atomic_write_publishes_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "native-atomic-write.bin"
+            expected = b"sentinel\x1a\r\nblue\x00binary"
+            restoration._windows_atomic_write(target, expected, 0o600, None)
+            self.assertEqual(target.read_bytes(), expected)
 
     def test_private_file_verifies_links_after_delete_pending_is_cleared(self):
         class DeletePendingLinkCount(_FakeWindowsFileOps):
@@ -469,7 +501,7 @@ class WindowsRestorationTests(unittest.TestCase):
     def test_parent_walk_holds_no_reparse_handles_and_closes_in_reverse(self):
         native = _FakeWindowsFileOps()
         with restoration._windows_pinned_parent(
-            Path(r"C:\safe\target.conf"), native
+            Path(r"C:\safe\target.conf"), native, require_add_file=True
         ) as (parent_handle, parent_path, leaf):
             self.assertEqual(parent_handle, 11)
             self.assertTrue(parent_path.casefold().endswith("}\\safe"))
@@ -484,6 +516,8 @@ class WindowsRestorationTests(unittest.TestCase):
             self.assertEqual(event[4], restoration.WINDOWS_FILE_SHARE_READ)
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_WRITE)
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_DELETE)
+        self.assertFalse(opens[0][3] & restoration.WINDOWS_FILE_ADD_FILE)
+        self.assertTrue(opens[-1][3] & restoration.WINDOWS_FILE_ADD_FILE)
         self.assertEqual(native.events[-2:], [("close", 11), ("close", 10)])
 
     def test_parent_walk_rejects_reparse_and_closes_every_open_handle(self):

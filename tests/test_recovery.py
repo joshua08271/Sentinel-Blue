@@ -232,6 +232,52 @@ class SignedRecoveryDocumentTests(RecoveryFixture):
             with self.assertRaisesRegex(RecoveryPathError, "symbolic link"):
                 load_recovery_key(link)
 
+    def test_raw_recovery_descriptors_request_binary_mode(self):
+        payload = b"sentinel\x1a\r\nblue\x00binary"
+        source = self.root / "binary-source.db"
+        source.write_bytes(payload)
+        if os.name == "posix":
+            source.chmod(0o600)
+        original_open = os.open
+        observed_flags = []
+
+        def recording_open(path, flags, *args, **kwargs):
+            observed_flags.append((Path(path), int(flags)))
+            return original_open(path, flags, *args, **kwargs)
+
+        binary_flag = 0x8000
+        with (
+            mock.patch.object(recovery.os, "O_BINARY", binary_flag, create=True),
+            mock.patch.object(recovery.os, "open", side_effect=recording_open),
+            mock.patch.object(recovery, "_same_file", return_value=False),
+        ):
+            descriptor, _ = recovery._open_regular_file(
+                source,
+                maximum=len(payload),
+                private=True,
+            )
+            try:
+                digest = hashlib.sha256(payload).hexdigest()
+                with recovery._immutable_sqlite_source(
+                    descriptor,
+                    source,
+                    expected_sha256=digest,
+                    expected_size=len(payload),
+                ):
+                    pass
+            finally:
+                os.close(descriptor)
+
+        read_flags = [flags for path, flags in observed_flags if path == source]
+        write_flags = [
+            flags
+            for path, flags in observed_flags
+            if path.name == recovery.DATABASE_FILENAME and path != source
+        ]
+        self.assertTrue(read_flags)
+        self.assertTrue(write_flags)
+        self.assertTrue(all(flags & binary_flag for flags in read_flags + write_flags))
+
     @unittest.skipUnless(hasattr(os, "link"), "hard links unavailable")
     def test_private_key_loader_rejects_hard_links(self):
         key_path = self.root / "recovery.key"

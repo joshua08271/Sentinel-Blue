@@ -63,6 +63,7 @@ WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
+WINDOWS_FILE_ADD_FILE = 0x00000002
 WINDOWS_FILE_TRAVERSE = 0x00000020
 WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
 WINDOWS_DELETE = 0x00010000
@@ -135,6 +136,18 @@ class _WindowsFileDispositionInformation(ctypes.Structure):
     _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
 
+class _WindowsFileRenameInformationHeader(ctypes.Structure):
+    """Fixed Win32 FILE_RENAME_INFO footprint, including FileName[1]."""
+
+    _anonymous_ = ("choice",)
+    _fields_ = [
+        ("choice", _WindowsRenameChoice),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
+    ]
+
+
 def _windows_file_rename_information(
     parent_handle,
     leaf: str,
@@ -171,6 +184,17 @@ def _windows_file_rename_information(
         len(encoded),
     )
     return information
+
+
+def _windows_file_rename_information_size(information) -> int:
+    """Return the Win32 variable-buffer size without ctypes tail padding."""
+    kind = type(information)
+    file_name_length = int(information.FileNameLength)
+    minimum = kind.FileName.offset + file_name_length + ctypes.sizeof(ctypes.c_uint16)
+    conventional = ctypes.sizeof(_WindowsFileRenameInformationHeader) + file_name_length
+    if minimum > ctypes.sizeof(information) or conventional > ctypes.sizeof(information):
+        raise ValueError("Windows restoration rename information is truncated")
+    return conventional
 
 
 def _windows_path_components(path: Path) -> tuple[str, list[str], str]:
@@ -585,12 +609,22 @@ class _WindowsNativeFileOps:
         if not self._flush_file(handle):
             self._raise("Windows restoration temporary file could not be flushed")
 
-    def _set_file_information(self, handle, information_class: int, information) -> None:
+    def _set_file_information(
+        self,
+        handle,
+        information_class: int,
+        information,
+        *,
+        buffer_size: int | None = None,
+    ) -> None:
+        size = ctypes.sizeof(information) if buffer_size is None else int(buffer_size)
+        if not 1 <= size <= ctypes.sizeof(information):
+            raise ValueError("Windows restoration file information size is invalid")
         if not self._set_information(
             handle,
             information_class,
             ctypes.byref(information),
-            ctypes.sizeof(information),
+            size,
         ):
             self._raise("Windows restoration file information could not be changed")
 
@@ -626,14 +660,16 @@ class _WindowsNativeFileOps:
         *,
         replace_if_exists: bool = True,
     ) -> None:
+        information = _windows_file_rename_information(
+            parent_handle,
+            leaf,
+            replace_if_exists=replace_if_exists,
+        )
         self._set_file_information(
             handle,
             WINDOWS_FILE_RENAME_INFO_CLASS,
-            _windows_file_rename_information(
-                parent_handle,
-                leaf,
-                replace_if_exists=replace_if_exists,
-            ),
+            information,
+            buffer_size=_windows_file_rename_information_size(information),
         )
 
     def close(self, handle) -> None:
@@ -646,21 +682,34 @@ def _windows_child_path(parent_path: str, leaf: str) -> str:
 
 
 @contextmanager
-def _windows_pinned_parent(path: Path, native: _WindowsNativeFileOps):
+def _windows_pinned_parent(
+    path: Path,
+    native: _WindowsNativeFileOps,
+    *,
+    require_add_file: bool = False,
+):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
     handles: list[Any] = []
     try:
         candidate = root
-        for component in [None, *components]:
+        for index, component in enumerate([None, *components]):
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
-            handle = native.open_file(
-                candidate,
+            desired_access = (
                 WINDOWS_FILE_LIST_DIRECTORY
                 | WINDOWS_FILE_TRAVERSE
                 | WINDOWS_FILE_READ_ATTRIBUTES
-                | WINDOWS_SYNCHRONIZE,
+                | WINDOWS_SYNCHRONIZE
+            )
+            # FILE_RENAME_INFO resolves a handle-relative destination by adding
+            # a file to the final directory.  Request that narrowly scoped
+            # right only on the directory handle used as RootDirectory.
+            if require_add_file and index == len(components):
+                desired_access |= WINDOWS_FILE_ADD_FILE
+            handle = native.open_file(
+                candidate,
+                desired_access,
                 # Withhold FILE_SHARE_WRITE and FILE_SHARE_DELETE. Child-file
                 # creation does not need either share on the directory object;
                 # excluding them pins the name and blocks reparse mutation.
@@ -916,7 +965,11 @@ def _windows_atomic_write(
         else nullcontext()
     )
     with privilege_scope:
-        with _windows_pinned_parent(destination, native) as (
+        with _windows_pinned_parent(
+            destination,
+            native,
+            require_add_file=True,
+        ) as (
             parent_handle,
             parent_path,
             leaf,

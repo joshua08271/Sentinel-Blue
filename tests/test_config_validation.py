@@ -92,7 +92,7 @@ class ConfigValidationTests(unittest.TestCase):
             patch("sentinel_blue.config_validation.shutil.which", return_value="/usr/sbin/visudo"),
             patch("sentinel_blue.config_validation.subprocess.run", return_value=completed) as execute,
         ):
-            result = validate_restored_configuration(Path("/etc/sudoers"))
+            result = validate_restored_configuration("/etc/sudoers")
         self.assertFalse(result["healthy"])
         self.assertEqual(execute.call_args.args[0], ["/usr/sbin/visudo", "-c", "-f", "/etc/sudoers"])
         self.assertFalse(execute.call_args.kwargs.get("shell", False))
