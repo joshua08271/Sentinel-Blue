@@ -1,8 +1,7 @@
 import json
+import re
 import unittest
 from pathlib import Path
-
-from sentinel_blue import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -12,7 +11,7 @@ class PortalExtensionTests(unittest.TestCase):
         manifest = json.loads((ROOT / "portal-extension" / "manifest.json").read_text())
         self.assertNotIn("host_permissions", manifest)
         self.assertNotIn("content_scripts", manifest)
-        self.assertEqual(manifest["version"], __version__)
+        self.assertRegex(manifest["version"], r"^[0-9]+\.[0-9]+\.[0-9]+$")
         popup = (ROOT / "portal-extension" / "popup.js").read_text()
         self.assertIn("chrome.permissions.request({origins})", popup)
         self.assertIn("new URL(tab.url).origin !== p.portalOrigin", popup)

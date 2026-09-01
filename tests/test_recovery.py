@@ -5,8 +5,10 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+from sentinel_blue import recovery
 from sentinel_blue.json_codec import canonical_json_bytes, canonical_json_dumps
 from sentinel_blue.recovery import (
     ANCHOR_FORMAT,
@@ -149,6 +151,29 @@ class RecoveryFixture(unittest.TestCase):
 
 
 class SignedRecoveryDocumentTests(RecoveryFixture):
+    def test_windows_identity_ignores_deprecated_ctime_only(self):
+        values = {
+            "st_dev": 1,
+            "st_ino": 2,
+            "st_mode": 0o100600,
+            "st_nlink": 1,
+            "st_uid": 0,
+            "st_size": 32,
+            "st_mtime_ns": 100,
+            "st_ctime_ns": 200,
+        }
+        before = SimpleNamespace(**values)
+        ctime_only = SimpleNamespace(**{**values, "st_ctime_ns": 999})
+        modified = SimpleNamespace(**{**values, "st_mtime_ns": 101})
+        with mock.patch.object(recovery, "os", wraps=recovery.os) as windows_os:
+            windows_os.name = "nt"
+            self.assertEqual(
+                recovery._file_identity(before), recovery._file_identity(ctime_only)
+            )
+            self.assertNotEqual(
+                recovery._file_identity(before), recovery._file_identity(modified)
+            )
+
     def test_domain_separation_tamper_and_wrong_key_fail_authentication(self):
         payload = {"bounded": True, "counter": 1}
         record = sign_payload(payload, self.key, purpose="manifest")

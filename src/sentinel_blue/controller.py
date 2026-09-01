@@ -1581,7 +1581,10 @@ class ControllerApp:
         now = time.monotonic()
         with self._integrity_lock:
             if (
-                now - self._integrity_checked_at >= max(1.0, maximum_age)
+                (
+                    self._integrity_checked_at <= 0.0
+                    or now - self._integrity_checked_at >= max(1.0, maximum_age)
+                )
                 and not self._integrity_refreshing
             ):
                 self._integrity_value = self.store.integrity_check()

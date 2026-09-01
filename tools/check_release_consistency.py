@@ -107,13 +107,15 @@ def check_source(expected: str | None = None) -> str:
     manifest = json.loads(
         (ROOT / "portal-extension/manifest.json").read_text(encoding="utf-8")
     )
+    portal_version = str(manifest.get("version", ""))
+    if not VERSION.fullmatch(portal_version):
+        raise ValueError("portal extension has an invalid independent version")
     inventory = json.loads(
         (ROOT / "examples/inventory.example.json").read_text(encoding="utf-8")
     )
     release = inventory.get("event_profile", {}).get("release", {})
     identities = {
         "Python package": init_version,
-        "portal extension": str(manifest.get("version", "")),
         "example inventory": str(release.get("version", "")),
     }
     mismatched = [label for label, value in identities.items() if value != version]
@@ -125,7 +127,7 @@ def check_source(expected: str | None = None) -> str:
     if "chrome.runtime.getManifest().version" not in popup:
         raise ValueError("portal extension does not derive its release version from the manifest")
     required_labels = {
-        "portal-extension/README.md": f"Sentinel Blue {version} is the",
+        "portal-extension/README.md": f"Sentinel Blue {portal_version} is the",
     }
     optional_labels = {
         "README.md": f"# Sentinel Blue {version}",
@@ -148,7 +150,6 @@ def check_source(expected: str | None = None) -> str:
 def check_bundle(bundle: Path, version: str) -> None:
     expected_names = {
         f"sentinel-blue-{version}.pyz",
-        f"sentinel-blue-portal-extension-{version}.zip",
         f"sentinel-blue-source-{version}.zip",
         "SHA256SUMS",
     }
@@ -185,17 +186,6 @@ def check_bundle(bundle: Path, version: str) -> None:
         if runtime_version != version or "__main__.py" not in runtime_entries:
             raise ValueError("runtime identity does not match the complete bundle")
 
-    extension_name = f"sentinel-blue-portal-extension-{version}.zip"
-    with zipfile.ZipFile(_BytesPath(members[extension_name])) as extension:
-        extension_entries = _safe_archive(extension, extension_name)
-        extension_members = {name: extension.read(name) for name in extension_entries}
-        manifest_name = "portal-extension/manifest.json"
-        if manifest_name not in extension_entries:
-            raise ValueError("extension manifest is missing")
-        manifest = json.loads(extension_members[manifest_name])
-        if str(manifest.get("version")) != version:
-            raise ValueError("extension bundle version does not match")
-
     source_name = f"sentinel-blue-source-{version}.zip"
     with zipfile.ZipFile(_BytesPath(members[source_name])) as source:
         source_entries = _safe_archive(source, source_name)
@@ -203,7 +193,6 @@ def check_bundle(bundle: Path, version: str) -> None:
         for required in (
             "pyproject.toml",
             "src/sentinel_blue/__init__.py",
-            "portal-extension/manifest.json",
         ):
             if required not in source_entries:
                 raise ValueError(f"source bundle is missing {required}")
@@ -211,11 +200,9 @@ def check_bundle(bundle: Path, version: str) -> None:
         source_version = _python_version(
             source_members["src/sentinel_blue/__init__.py"].decode("utf-8"), source_name
         )
-        source_manifest = json.loads(source_members["portal-extension/manifest.json"])
         if {
             str(source_project["project"]["version"]),
             source_version,
-            str(source_manifest.get("version")),
         } != {version}:
             raise ValueError("source bundle identities do not match")
 
@@ -232,18 +219,6 @@ def check_bundle(bundle: Path, version: str) -> None:
             raise ValueError(f"runtime member {name} does not byte-match the source bundle")
     if runtime_members["__main__.py"] != GENERATED_RUNTIME_MAIN:
         raise ValueError("generated runtime __main__.py does not match the release entrypoint")
-
-    source_extension_members = {
-        name: content
-        for name, content in source_members.items()
-        if name.startswith("portal-extension/")
-    }
-    if set(extension_members) != set(source_extension_members):
-        raise ValueError("portal extension members do not match the source bundle exactly")
-    for name, source_content in source_extension_members.items():
-        if extension_members[name] != source_content:
-            raise ValueError(f"portal extension member {name} does not byte-match the source bundle")
-
 
 class _BytesPath:
     """Minimal seekable wrapper accepted by ZipFile without temporary artifacts."""

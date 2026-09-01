@@ -59,14 +59,14 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertEqual(len(names), 1)
             self.assertTrue(names[0].endswith("/probe/module.py"), names)
 
-    def test_builds_zipapp_extension_source_and_complete_bundle(self):
+    def test_builds_core_runtime_source_and_complete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = build(Path(directory))
             names = {path.name for path in artifacts}
             self.assertIn(f"sentinel-blue-{VERSION}.pyz", names)
-            self.assertIn(f"sentinel-blue-portal-extension-{VERSION}.zip", names)
             self.assertIn(f"sentinel-blue-source-{VERSION}.zip", names)
             self.assertIn(f"sentinel-blue-complete-lab-{VERSION}.zip", names)
+            self.assertFalse(any("portal-extension" in name for name in names))
             with zipfile.ZipFile(Path(directory) / f"sentinel-blue-{VERSION}.pyz") as archive:
                 self.assertIn("sentinel_blue/__main__.py", archive.namelist())
                 self.assertFalse(any(".egg-info/" in name for name in archive.namelist()))
@@ -77,7 +77,6 @@ class ReleaseBuilderTests(unittest.TestCase):
                 self.assertEqual(
                     {
                         f"sentinel-blue-{VERSION}.pyz",
-                        f"sentinel-blue-portal-extension-{VERSION}.zip",
                         f"sentinel-blue-source-{VERSION}.zip",
                         "SHA256SUMS",
                     },
@@ -151,10 +150,10 @@ class ReleaseBuilderTests(unittest.TestCase):
             artifacts = build(root)
             bundle = next(path for path in artifacts if "complete-lab" in path.name)
             runtime_name = f"sentinel-blue-{VERSION}.pyz"
-            extension_name = f"sentinel-blue-portal-extension-{VERSION}.zip"
+            source_name = f"sentinel-blue-source-{VERSION}.zip"
             with zipfile.ZipFile(bundle) as archive:
                 runtime = archive.read(runtime_name)
-                extension = archive.read(extension_name)
+                source = archive.read(source_name)
             mutations = (
                 (
                     runtime_name,
@@ -171,13 +170,13 @@ class ReleaseBuilderTests(unittest.TestCase):
                     "generated runtime __main__",
                 ),
                 (
-                    extension_name,
+                    source_name,
                     _replace_zip_member(
-                        extension,
-                        "portal-extension/content.js",
-                        b"// repacked extension drift\n",
+                        source,
+                        "src/sentinel_blue/auth.py",
+                        b"# repacked source drift\n",
                     ),
-                    "portal extension member",
+                    "runtime member",
                 ),
             )
             for index, (artifact_name, artifact_content, error) in enumerate(mutations):

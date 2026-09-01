@@ -504,7 +504,7 @@ def _hash_descriptor(descriptor: int, *, maximum: int) -> tuple[str, int]:
 
 def _file_identity(info: os.stat_result) -> tuple[int, ...]:
     """Return the metadata that must remain stable across offline inspection."""
-    return (
+    identity = (
         int(info.st_dev),
         int(info.st_ino),
         int(info.st_mode),
@@ -512,8 +512,15 @@ def _file_identity(info: os.stat_result) -> tuple[int, ...]:
         int(info.st_uid),
         int(info.st_size),
         int(info.st_mtime_ns),
-        int(info.st_ctime_ns),
     )
+    # Python 3.12 deprecated st_ctime_ns on Windows because it represents
+    # creation time there and can disagree between path and handle queries.
+    # Device/inode still bind the opened object; size, mode, link count, owner,
+    # and mtime retain the mutation gate. POSIX ctime remains a useful metadata
+    # change signal and is therefore preserved on those platforms.
+    if os.name != "nt":
+        identity += (int(info.st_ctime_ns),)
+    return identity
 
 
 def _same_file(left: os.stat_result, right: os.stat_result) -> bool:

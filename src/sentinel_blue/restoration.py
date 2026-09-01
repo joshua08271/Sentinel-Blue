@@ -1090,6 +1090,20 @@ def _windows_atomic_write(
                 # hard kill in this narrow boundary leaves a cleanup-verifiable temp.
                 native.set_delete_disposition(handle, False)
                 disposition_armed = False
+                published_snapshot = native.file_snapshot(handle)
+                if (
+                    int(published_snapshot["links"]) != 1
+                    or int(published_snapshot["size"]) != len(data)
+                    or int(published_snapshot["attributes"])
+                    & (
+                        WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+                        | WINDOWS_REPARSE_POINT_ATTRIBUTE
+                    )
+                ):
+                    raise OSError(
+                        "Windows restoration temporary file did not verify "
+                        "after publication"
+                    )
                 native.rename_file(
                     handle,
                     parent_handle,
@@ -1426,8 +1440,9 @@ class _WindowsTempOwnershipRegistry:
             destination,
             native_handle=temporary_handle,
         )
+        links = int(snapshot["links"])
         if (
-            int(snapshot["links"]) != 1
+            links not in {0, 1}
             or int(snapshot["size"]) != len(data)
             or int(snapshot["attributes"])
             & (WINDOWS_FILE_ATTRIBUTE_DIRECTORY | WINDOWS_REPARSE_POINT_ATTRIBUTE)
@@ -1448,7 +1463,10 @@ class _WindowsTempOwnershipRegistry:
             "modified_ticks": int(snapshot["modified_ticks"]),
             "size": int(snapshot["size"]),
             "attributes": int(snapshot["attributes"]),
-            "links": int(snapshot["links"]),
+            # A delete-pending NTFS handle can report zero links. The durable
+            # record describes the only safe post-disarm state; the caller
+            # verifies that exact one-link transition before rename.
+            "links": 1,
             "content_sha256": hashlib.sha256(data).hexdigest(),
             "security_descriptor_sha256": hashlib.sha256(
                 descriptor.encode("ascii")

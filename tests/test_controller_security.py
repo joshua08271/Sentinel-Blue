@@ -473,7 +473,9 @@ class ControllerSecurityTests(unittest.TestCase):
         self.assertEqual(self.store.get_action(action_id)["status"], "queued")
 
     def test_database_integrity_check_is_cached(self):
-        with patch.object(self.store, "integrity_check", return_value="ok") as check:
+        with patch(
+            "sentinel_blue.controller.time.monotonic", return_value=0.5
+        ), patch.object(self.store, "integrity_check", return_value="ok") as check:
             self.assertEqual(self.app.database_integrity(), "ok")
             self.assertEqual(self.app.database_integrity(), "ok")
         check.assert_called_once()

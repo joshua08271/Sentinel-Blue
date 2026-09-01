@@ -111,11 +111,15 @@ class _FakeWindowsFileOps:
         reparse_handle=None,
         fail_rename=False,
         read_data=b"approved bytes",
+        zero_links_while_delete_pending=False,
     ):
         self.events = []
         self.reparse_handle = reparse_handle
         self.fail_rename = fail_rename
         self.read_data = read_data
+        self.zero_links_while_delete_pending = zero_links_while_delete_pending
+        self.delete_pending_handles = set()
+        self.written = {}
         self._directory_handles = iter((10, 11))
 
     def open_file(self, path, desired_access, share_mode, creation, flags):
@@ -155,12 +159,17 @@ class _FakeWindowsFileOps:
         self.events.append(("snapshot", handle))
         return {
             "attributes": self.file_attributes(handle),
-            "size": len(self.read_data),
+            "size": len(self.written.get(handle, self.read_data)),
             "modified_at": 1234.5,
             "creation_ticks": 116444736000000000 + 12300000000,
             "modified_ticks": 116444736000000000 + 12345000000,
             "identity": (1, 2, handle),
-            "links": 1,
+            "links": (
+                0
+                if self.zero_links_while_delete_pending
+                and handle in self.delete_pending_handles
+                else 1
+            ),
         }
 
     def read_file(self, handle, maximum):
@@ -169,6 +178,7 @@ class _FakeWindowsFileOps:
 
     def write_file(self, handle, data):
         self.events.append(("write", handle, data))
+        self.written[handle] = bytes(data)
 
     def flush_file(self, handle):
         self.events.append(("flush", handle))
@@ -178,6 +188,10 @@ class _FakeWindowsFileOps:
 
     def set_delete_disposition(self, handle, delete):
         self.events.append(("delete", handle, delete))
+        if delete:
+            self.delete_pending_handles.add(handle)
+        else:
+            self.delete_pending_handles.discard(handle)
 
     def rename_file(self, handle, parent_handle, leaf, *, replace_if_exists=True):
         self.events.append(
@@ -944,12 +958,69 @@ class WindowsRestorationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "authentication failed"):
             registry._decode_record(registry._canonical(signed), "a" * 32)
 
+    def test_temp_registry_normalizes_delete_pending_zero_links(self):
+        registry = object.__new__(restoration._WindowsTempOwnershipRegistry)
+        registry.root = Path(r"C:\safe\records")
+        registry._key = b"k" * restoration.WINDOWS_TEMP_KEY_BYTES
+        native = _FakeWindowsFileOps(
+            read_data=b"temp bytes", zero_links_while_delete_pending=True
+        )
+        native.delete_pending_handles.add(90)
+        written = {}
+
+        def capture_record(path, data, **_kwargs):
+            written["path"] = path
+            written["data"] = data
+
+        def read_record(path, _maximum, **_kwargs):
+            self.assertEqual(path, written["path"])
+            return written["data"], {
+                "attributes": restoration.WINDOWS_FILE_ATTRIBUTE_NORMAL,
+                "size": len(written["data"]),
+                "modified_at": 1234.5,
+                "creation_ticks": 1,
+                "modified_ticks": 2,
+                "identity": (1, 2, 93),
+                "links": 1,
+                "windows_security_descriptor": "record-descriptor",
+            }
+
+        with patch.object(
+            restoration,
+            "_capture_windows_security_descriptor",
+            return_value="temp-descriptor",
+        ), patch.object(
+            restoration,
+            "_windows_write_new_private_file",
+            side_effect=capture_record,
+        ), patch.object(
+            restoration,
+            "_windows_read_file_snapshot",
+            side_effect=read_record,
+        ):
+            ownership = registry.register(
+                destination=Path(r"C:\safe\target.conf"),
+                parent_path=(
+                    r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+                ),
+                temporary_leaf=f".sentinel-{'b' * 32}.tmp",
+                temporary_handle=90,
+                data=b"temp bytes",
+                native=native,
+            )
+        record = json.loads(ownership["data"].decode("ascii"))
+        self.assertEqual(record["links"], 1)
+
     def test_temp_ownership_is_durable_before_delete_on_close_is_disarmed(self):
-        native = _FakeWindowsFileOps()
+        native = _FakeWindowsFileOps(zero_links_while_delete_pending=True)
+        registered_links = []
 
         class Registry:
-            def register(self, **_kwargs):
+            def register(self, **kwargs):
                 native.events.append(("ownership_register",))
+                registered_links.append(
+                    native.file_snapshot(kwargs["temporary_handle"])["links"]
+                )
                 return {"record": "owned"}
 
             def complete(self, _ownership):
@@ -975,6 +1046,7 @@ class WindowsRestorationTests(unittest.TestCase):
         self.assertLess(register, disarm)
         self.assertLess(disarm, rename)
         self.assertLess(close, complete)
+        self.assertEqual(registered_links, [0])
 
     def test_ambiguous_publish_interruption_retains_temp_ownership_record(self):
         class InterruptedAfterRename(_FakeWindowsFileOps):

@@ -1,4 +1,4 @@
-"""Build byte-reproducible runtime, extension, source, and complete bundles."""
+"""Build byte-reproducible defensive-core runtime, source, and complete bundles."""
 
 from __future__ import annotations
 
@@ -98,7 +98,6 @@ def build(output: Path) -> list[Path]:
         ROOT / "models",
         ROOT / "docs",
         ROOT / "reports",
-        ROOT / "portal-extension",
         ROOT / "packaging",
         ROOT / "tools",
         ROOT / ".github",
@@ -127,14 +126,9 @@ def build(output: Path) -> list[Path]:
     if os.name == "posix":
         zipapp_path.chmod(0o755)
 
-    extension_path = output / f"sentinel-blue-portal-extension-{VERSION}.zip"
-    _write_zip(
-        extension_path,
-        [entry for entry in source_entries if entry[0].startswith("portal-extension/")],
-    )
     source_path = output / f"sentinel-blue-source-{VERSION}.zip"
     _write_zip(source_path, source_entries)
-    primary_artifacts = [zipapp_path, extension_path, source_path]
+    primary_artifacts = [zipapp_path, source_path]
     checksum_path = output / "SHA256SUMS"
     checksum_path.write_bytes(
         "".join(
