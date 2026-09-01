@@ -1122,8 +1122,18 @@ class DatabaseSemanticInspectionTests(RecoveryFixture):
             "sentinel_blue.recovery.sqlite3.connect",
             side_effect=replace_then_connect,
         ):
-            with self.assertRaisesRegex(RecoveryPathError, "changed during"):
-                inspect_controller_database(database, require_recovery_state=True)
+            if os.name == "nt":
+                with self.assertRaisesRegex(
+                    RecoveryError, "could not be opened read-only"
+                ):
+                    inspect_controller_database(
+                        database, require_recovery_state=True
+                    )
+            else:
+                with self.assertRaisesRegex(RecoveryPathError, "changed during"):
+                    inspect_controller_database(
+                        database, require_recovery_state=True
+                    )
 
     def test_application_schema_and_table_expectations_are_exact(self):
         database = self.database(self.root / "expected.db")

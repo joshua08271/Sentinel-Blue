@@ -150,9 +150,11 @@ class ActionTests(unittest.TestCase):
                 }
                 if os.name == "nt":
                     descriptor = str(record["windows_security_descriptor"])
-                    parameters["baseline_security_descriptor_sha256"] = (
-                        hashlib.sha256(descriptor.encode("ascii")).hexdigest()
-                    )
+                    descriptor_sha256 = hashlib.sha256(
+                        descriptor.encode("ascii")
+                    ).hexdigest()
+                    parameters["baseline_security_descriptor_sha256"] = descriptor_sha256
+                    parameters["observed_security_descriptor_sha256"] = descriptor_sha256
                 result = store.restore(parameters, allowed=True)
         self.assertTrue(result["success"])
         self.assertTrue(result["evidence_preserved"])

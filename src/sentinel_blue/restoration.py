@@ -63,7 +63,6 @@ WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
 WINDOWS_FILE_LIST_DIRECTORY = 0x00000001
-WINDOWS_FILE_ADD_FILE = 0x00000002
 WINDOWS_FILE_TRAVERSE = 0x00000020
 WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
 WINDOWS_DELETE = 0x00010000
@@ -150,20 +149,38 @@ class _WindowsFileRenameInformationHeader(ctypes.Structure):
 
 def _windows_file_rename_information(
     parent_handle,
-    leaf: str,
+    target_name: str,
     *,
     replace_if_exists: bool = True,
 ):
     """Build an ABI-correct variable-length FILE_RENAME_INFO value."""
-    if (
-        not isinstance(leaf, str)
-        or not leaf
-        or leaf in {".", ".."}
-        or any(character in leaf for character in "\\/:\x00")
-    ):
+    root_value = int(getattr(parent_handle, "value", parent_handle) or 0)
+    if not isinstance(target_name, str) or not target_name or "\x00" in target_name:
         raise ValueError("Windows restoration target has an unsafe file name")
-    encoded = leaf.encode("utf-16-le")
-    units = len(encoded) // 2 + 1
+    if root_value:
+        if (
+            target_name in {".", ".."}
+            or any(character in target_name for character in "\\/:")
+        ):
+            raise ValueError("Windows restoration target has an unsafe file name")
+    elif (
+        len(target_name) > 32767
+        or not re.match(
+            r"^\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\[^\x00]+$",
+            target_name,
+        )
+    ):
+        raise ValueError("Windows restoration target is not a canonical volume path")
+    encoded = target_name.encode("utf-16-le")
+
+    # SetFileInformationByHandle requires sizeof(FILE_RENAME_INFO) plus
+    # FileNameLength. Allocate enough storage for that documented footprint,
+    # including the structure's inline FileName[1] and native tail padding.
+    required_size = ctypes.sizeof(_WindowsFileRenameInformationHeader) + len(encoded)
+    tail_bytes = required_size - _WindowsFileRenameInformationHeader.FileName.offset
+    units = (tail_bytes + ctypes.sizeof(ctypes.c_uint16) - 1) // ctypes.sizeof(
+        ctypes.c_uint16
+    )
 
     class FileRenameInformation(ctypes.Structure):
         _anonymous_ = ("choice",)
@@ -176,7 +193,7 @@ def _windows_file_rename_information(
 
     information = FileRenameInformation()
     information.ReplaceIfExists = 1 if replace_if_exists else 0
-    information.RootDirectory = int(getattr(parent_handle, "value", parent_handle) or 0)
+    information.RootDirectory = root_value
     information.FileNameLength = len(encoded)
     ctypes.memmove(
         ctypes.addressof(information) + FileRenameInformation.FileName.offset,
@@ -187,14 +204,12 @@ def _windows_file_rename_information(
 
 
 def _windows_file_rename_information_size(information) -> int:
-    """Return the Win32 variable-buffer size without ctypes tail padding."""
-    kind = type(information)
+    """Return the documented minimum Win32 FILE_RENAME_INFO buffer size."""
     file_name_length = int(information.FileNameLength)
-    minimum = kind.FileName.offset + file_name_length + ctypes.sizeof(ctypes.c_uint16)
-    conventional = ctypes.sizeof(_WindowsFileRenameInformationHeader) + file_name_length
-    if minimum > ctypes.sizeof(information) or conventional > ctypes.sizeof(information):
+    size = ctypes.sizeof(_WindowsFileRenameInformationHeader) + file_name_length
+    if size > ctypes.sizeof(information):
         raise ValueError("Windows restoration rename information is truncated")
-    return conventional
+    return size
 
 
 def _windows_path_components(path: Path) -> tuple[str, list[str], str]:
@@ -655,14 +670,14 @@ class _WindowsNativeFileOps:
     def rename_file(
         self,
         handle,
-        parent_handle,
+        parent_path: str,
         leaf: str,
         *,
         replace_if_exists: bool = True,
     ) -> None:
         information = _windows_file_rename_information(
-            parent_handle,
-            leaf,
+            None,
+            _windows_child_path(parent_path, leaf),
             replace_if_exists=replace_if_exists,
         )
         self._set_file_information(
@@ -685,15 +700,13 @@ def _windows_child_path(parent_path: str, leaf: str) -> str:
 def _windows_pinned_parent(
     path: Path,
     native: _WindowsNativeFileOps,
-    *,
-    require_add_file: bool = False,
 ):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
     handles: list[Any] = []
     try:
         candidate = root
-        for index, component in enumerate([None, *components]):
+        for component in [None, *components]:
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
             desired_access = (
@@ -702,11 +715,6 @@ def _windows_pinned_parent(
                 | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE
             )
-            # FILE_RENAME_INFO resolves a handle-relative destination by adding
-            # a file to the final directory.  Request that narrowly scoped
-            # right only on the directory handle used as RootDirectory.
-            if require_add_file and index == len(components):
-                desired_access |= WINDOWS_FILE_ADD_FILE
             handle = native.open_file(
                 candidate,
                 desired_access,
@@ -965,15 +973,12 @@ def _windows_atomic_write(
         else nullcontext()
     )
     with privilege_scope:
-        with _windows_pinned_parent(
-            destination,
-            native,
-            require_add_file=True,
-        ) as (
+        with _windows_pinned_parent(destination, native) as (
             parent_handle,
             parent_path,
             leaf,
         ):
+            del parent_handle
             handle = None
             expected_handle = None
             verification_handle = None
@@ -1159,7 +1164,7 @@ def _windows_atomic_write(
                     )
                 native.rename_file(
                     handle,
-                    parent_handle,
+                    parent_path,
                     leaf,
                     replace_if_exists=replace_if_exists,
                 )
