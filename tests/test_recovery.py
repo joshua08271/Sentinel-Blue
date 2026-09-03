@@ -232,6 +232,27 @@ class SignedRecoveryDocumentTests(RecoveryFixture):
             with self.assertRaisesRegex(RecoveryPathError, "symbolic link"):
                 load_recovery_key(link)
 
+    def test_private_key_loader_requests_binary_low_level_io(self):
+        key_path = self.root / "recovery.key"
+        key_path.write_bytes(self.key)
+        if os.name == "posix":
+            key_path.chmod(0o600)
+        binary_flag = 1 << 29
+        observed_flags = []
+        real_open = os.open
+
+        def recording_open(path, flags, *args, **kwargs):
+            observed_flags.append(flags)
+            return real_open(path, flags & ~binary_flag, *args, **kwargs)
+
+        with (
+            mock.patch.object(recovery.os, "O_BINARY", binary_flag, create=True),
+            mock.patch.object(recovery.os, "open", side_effect=recording_open),
+        ):
+            self.assertEqual(load_recovery_key(key_path), self.key)
+        self.assertTrue(observed_flags)
+        self.assertTrue(all(flags & binary_flag for flags in observed_flags))
+
     @unittest.skipUnless(hasattr(os, "link"), "hard links unavailable")
     def test_private_key_loader_rejects_hard_links(self):
         key_path = self.root / "recovery.key"

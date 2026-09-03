@@ -88,6 +88,7 @@ WINDOWS_VOLUME_NAME_GUID = 0x00000001
 WINDOWS_ERROR_FILE_NOT_FOUND = 2
 WINDOWS_ERROR_PATH_NOT_FOUND = 3
 WINDOWS_ERROR_FILE_EXISTS = 80
+WINDOWS_ERROR_INVALID_PARAMETER = 87
 WINDOWS_ERROR_ALREADY_EXISTS = 183
 WINDOWS_TEMP_RECORD_LIMIT = 256
 WINDOWS_TEMP_RECORD_BYTES = 4096
@@ -135,21 +136,18 @@ class _WindowsFileDispositionInformation(ctypes.Structure):
     _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
 
-def _windows_file_rename_information(
-    parent_handle,
-    leaf: str,
+def _windows_rename_information(
+    root_directory,
+    file_name: str,
     *,
     replace_if_exists: bool = True,
 ):
     """Build an ABI-correct variable-length FILE_RENAME_INFO value."""
-    if (
-        not isinstance(leaf, str)
-        or not leaf
-        or leaf in {".", ".."}
-        or any(character in leaf for character in "\\/:\x00")
-    ):
-        raise ValueError("Windows restoration target has an unsafe file name")
-    encoded = leaf.encode("utf-16-le")
+    if not isinstance(file_name, str) or not file_name or "\x00" in file_name:
+        raise ValueError("Windows restoration rename path is invalid")
+    encoded = file_name.encode("utf-16-le")
+    if len(encoded) > 0xFFFFFFFF:
+        raise ValueError("Windows restoration rename path is too long")
     units = len(encoded) // 2 + 1
 
     class FileRenameInformation(ctypes.Structure):
@@ -163,7 +161,9 @@ def _windows_file_rename_information(
 
     information = FileRenameInformation()
     information.ReplaceIfExists = 1 if replace_if_exists else 0
-    information.RootDirectory = int(getattr(parent_handle, "value", parent_handle) or 0)
+    information.RootDirectory = int(
+        getattr(root_directory, "value", root_directory) or 0
+    )
     information.FileNameLength = len(encoded)
     ctypes.memmove(
         ctypes.addressof(information) + FileRenameInformation.FileName.offset,
@@ -171,6 +171,58 @@ def _windows_file_rename_information(
         len(encoded),
     )
     return information
+
+
+def _windows_file_rename_information(
+    parent_handle,
+    leaf: str,
+    *,
+    replace_if_exists: bool = True,
+):
+    """Build relative FILE_RENAME_INFO bound to an already pinned directory."""
+    if (
+        not isinstance(leaf, str)
+        or not leaf
+        or leaf in {".", ".."}
+        or any(character in leaf for character in "\\/:\x00")
+    ):
+        raise ValueError("Windows restoration target has an unsafe file name")
+    return _windows_rename_information(
+        parent_handle,
+        leaf,
+        replace_if_exists=replace_if_exists,
+    )
+
+
+def _windows_absolute_file_rename_information(
+    parent_path: str,
+    leaf: str,
+    *,
+    replace_if_exists: bool = True,
+):
+    """Build the documented NULL-root absolute form for a pinned volume path."""
+    if (
+        not isinstance(parent_path, str)
+        or not re.fullmatch(
+            r"\\\\\?\\Volume\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"
+            r"(?:\\[^\\/:\x00]+)*\\?",
+            parent_path,
+        )
+        or any(component in {".", ".."} for component in parent_path.split("\\"))
+    ):
+        raise ValueError("Windows restoration directory is not a pinned volume path")
+    # Reuse the leaf validation before combining it with the kernel-resolved
+    # volume GUID path held open by _windows_pinned_parent().
+    _windows_file_rename_information(0, leaf)
+    absolute_path = _windows_child_path(parent_path, leaf)
+    if len(absolute_path) > 32767:
+        raise ValueError("Windows restoration rename path is too long")
+    return _windows_rename_information(
+        0,
+        absolute_path,
+        replace_if_exists=replace_if_exists,
+    )
 
 
 def _windows_path_components(path: Path) -> tuple[str, list[str], str]:
@@ -626,15 +678,38 @@ class _WindowsNativeFileOps:
         *,
         replace_if_exists: bool = True,
     ) -> None:
-        self._set_file_information(
-            handle,
-            WINDOWS_FILE_RENAME_INFO_CLASS,
-            _windows_file_rename_information(
-                parent_handle,
-                leaf,
-                replace_if_exists=replace_if_exists,
-            ),
-        )
+        try:
+            self._set_file_information(
+                handle,
+                WINDOWS_FILE_RENAME_INFO_CLASS,
+                _windows_file_rename_information(
+                    parent_handle,
+                    leaf,
+                    replace_if_exists=replace_if_exists,
+                ),
+            )
+        except OSError as exc:
+            error = getattr(exc, "winerror", None)
+            if error is None:
+                error = exc.errno
+            if error != WINDOWS_ERROR_INVALID_PARAMETER:
+                raise
+            # Some Windows filesystems reject the documented relative-root
+            # representation with ERROR_INVALID_PARAMETER.  Retry only that
+            # error with the other documented form: RootDirectory=NULL and an
+            # absolute name.  The name comes from the still-held volume GUID
+            # directory handle, so drive-letter and ancestor substitution stay
+            # outside the publish boundary.
+            parent_path = self.final_path(parent_handle)
+            self._set_file_information(
+                handle,
+                WINDOWS_FILE_RENAME_INFO_CLASS,
+                _windows_absolute_file_rename_information(
+                    parent_path,
+                    leaf,
+                    replace_if_exists=replace_if_exists,
+                ),
+            )
 
     def close(self, handle) -> None:
         if not self._close_handle(handle):
