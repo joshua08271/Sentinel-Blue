@@ -405,7 +405,20 @@ class NativeRunnerLab:
                 f"native collection reported {len(payload['collector_errors'])} error(s)"
             )
         if len(payload["services"]) != 1:
-            raise NativeRangeError("the exact lab service was not collected")
+            unit_state = self._command(
+                [
+                    "systemctl",
+                    "show",
+                    self.service_id,
+                    "--property=Id,LoadState,ActiveState,SubState",
+                    "--no-pager",
+                ],
+                check=False,
+            ).stdout.strip().replace("\n", ";")[:240]
+            raise NativeRangeError(
+                "the exact lab service was not collected: "
+                f"targeted_state={unit_state or 'unknown'}"
+            )
         if len(payload["integrity"]) != 1:
             raise NativeRangeError("the exact protected lab file was not collected")
         if len(payload.get("probes", [])) != 1:

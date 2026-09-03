@@ -210,8 +210,12 @@ class CollectorTests(unittest.TestCase):
             "Id=web.service\nActiveState=active\nSubState=running\nUnitFileState=enabled\nNRestarts=2\nResult=success\nExecMainStatus=0\n\n",
             "",
         )
-        with patch("sentinel_blue.collectors._run", side_effect=[units, files, details]):
+        with patch(
+            "sentinel_blue.collectors._run", side_effect=[units, files, details]
+        ) as runner:
             services = _linux_services([])
+        self.assertIn("--full", runner.call_args_list[0].args[0])
+        self.assertIn("--full", runner.call_args_list[1].args[0])
         self.assertEqual(services[0].state, "running")
         self.assertEqual(services[0].start_mode, "enabled")
         self.assertEqual(services[0].restart_count, 2)

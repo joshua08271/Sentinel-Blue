@@ -148,6 +148,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
             "--no-legend",
             "--no-pager",
             "--plain",
+            "--full",
         ],
         timeout=15,
     )
@@ -164,6 +165,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 "--no-legend",
                 "--no-pager",
                 "--plain",
+                "--full",
             ],
             timeout=15,
         )
