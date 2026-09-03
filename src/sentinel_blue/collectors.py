@@ -156,6 +156,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
         errors.append("systemctl service inventory unavailable")
         return []
     start_modes: dict[str, str] = {}
+    installed_names: list[str] = []
     try:
         unit_files = _run(
             [
@@ -174,6 +175,9 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 fields = line.split()
                 if len(fields) >= 2:
                     start_modes[fields[0]] = fields[1]
+                    installed_names.append(fields[0])
+        else:
+            errors.append("systemctl service startup inventory unavailable")
     except (OSError, subprocess.TimeoutExpired):
         errors.append("systemctl service startup inventory unavailable")
     parsed: list[tuple[str, str, str]] = []
@@ -182,6 +186,13 @@ def _linux_services(errors: list[str]) -> list[Service]:
         if len(parts) < 4:
             continue
         parsed.append((parts[0], parts[2], parts[3]))
+    # systemd may garbage-collect a stopped static unit from list-units even
+    # while its unit file remains installed.  Preserve those identities so a
+    # baseline service cannot disappear from telemetry at the moment it stops.
+    loaded_names = {name for name, _active, _substate in parsed}
+    for name in installed_names:
+        if name not in loaded_names and len(parsed) < 2000:
+            parsed.append((name, "inactive", "dead"))
     details: dict[str, dict[str, str]] = {}
     names = [name for name, _active, _substate in parsed[:512]]
     if names:

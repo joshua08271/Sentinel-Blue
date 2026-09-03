@@ -239,6 +239,28 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(service.substate, "dead")
         self.assertEqual(service.result, "success")
 
+    def test_linux_stopped_unloaded_unit_file_remains_in_inventory(self):
+        units = CompletedProcess([], 0, "", "")
+        files = CompletedProcess(
+            [], 0, "sentinel-example.service static -\n", ""
+        )
+        details = CompletedProcess(
+            [],
+            0,
+            "Id=sentinel-example.service\nActiveState=inactive\nSubState=dead\n"
+            "UnitFileState=static\nNRestarts=0\nResult=success\nExecMainStatus=0\n\n",
+            "",
+        )
+        with patch(
+            "sentinel_blue.collectors._run", side_effect=[units, files, details]
+        ):
+            services = _linux_services([])
+        self.assertEqual(len(services), 1)
+        self.assertEqual(services[0].name, "sentinel-example.service")
+        self.assertEqual(services[0].state, "inactive")
+        self.assertEqual(services[0].substate, "dead")
+        self.assertEqual(services[0].start_mode, "static")
+
     def test_firewall_packet_counters_do_not_change_rules_fingerprint(self):
         first = "ip saddr 198.51.100.1 counter packets 2 bytes 100 accept"
         second = "ip saddr 198.51.100.1 counter packets 900 bytes 99999 accept"
