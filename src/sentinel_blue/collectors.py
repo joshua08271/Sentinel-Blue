@@ -186,13 +186,6 @@ def _linux_services(errors: list[str]) -> list[Service]:
         if len(parts) < 4:
             continue
         parsed.append((parts[0], parts[2], parts[3]))
-    # systemd may garbage-collect a stopped static unit from list-units even
-    # while its unit file remains installed.  Preserve those identities so a
-    # baseline service cannot disappear from telemetry at the moment it stops.
-    loaded_names = {name for name, _active, _substate in parsed}
-    for name in installed_names:
-        if name not in loaded_names and len(parsed) < 2000:
-            parsed.append((name, "inactive", "dead"))
     details: dict[str, dict[str, str]] = {}
     names = [name for name, _active, _substate in parsed[:512]]
     if names:
@@ -221,6 +214,15 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 errors.append("systemctl service failure metadata unavailable")
         except (OSError, subprocess.TimeoutExpired):
             errors.append("systemctl service failure metadata unavailable")
+    # systemd may garbage-collect a stopped static unit from list-units even
+    # while its unit file remains installed.  Preserve those identities so a
+    # baseline service cannot disappear from telemetry at the moment it stops.
+    # Do not include unloaded names in the batched `systemctl show`: some valid
+    # alias and generated unit-file entries make that command return nonzero.
+    loaded_names = {name for name, _active, _substate in parsed}
+    for name in installed_names:
+        if name not in loaded_names and len(parsed) < 2000:
+            parsed.append((name, "inactive", "dead"))
     services: list[Service] = []
     for name, active, substate in parsed:
         detail = details.get(name, {})

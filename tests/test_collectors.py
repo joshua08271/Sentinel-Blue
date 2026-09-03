@@ -244,17 +244,11 @@ class CollectorTests(unittest.TestCase):
         files = CompletedProcess(
             [], 0, "sentinel-example.service static -\n", ""
         )
-        details = CompletedProcess(
-            [],
-            0,
-            "Id=sentinel-example.service\nActiveState=inactive\nSubState=dead\n"
-            "UnitFileState=static\nNRestarts=0\nResult=success\nExecMainStatus=0\n\n",
-            "",
-        )
         with patch(
-            "sentinel_blue.collectors._run", side_effect=[units, files, details]
-        ):
+            "sentinel_blue.collectors._run", side_effect=[units, files]
+        ) as runner:
             services = _linux_services([])
+        self.assertEqual(runner.call_count, 2)
         self.assertEqual(len(services), 1)
         self.assertEqual(services[0].name, "sentinel-example.service")
         self.assertEqual(services[0].state, "inactive")
