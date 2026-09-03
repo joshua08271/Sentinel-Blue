@@ -431,12 +431,14 @@ class NativeRunnerLab:
     def _alert_for(
         store: Store, alert_ids: list[str], expected_kind: str
     ) -> dict[str, Any]:
-        matches = [
-            row
-            for identifier in dict.fromkeys(alert_ids)
-            if (row := store.get_alert(identifier)) is not None
-            and row.get("kind") == expected_kind
-        ]
+        matches: list[dict[str, Any]] = []
+        for identifier in dict.fromkeys(alert_ids):
+            row = store.get_alert(identifier)
+            if row is None:
+                continue
+            record = dict(row)
+            if record.get("kind") == expected_kind:
+                matches.append(record)
         if len(matches) != 1:
             raise NativeRangeError(
                 f"expected exactly one {expected_kind!r} alert, observed {len(matches)}"
@@ -451,7 +453,7 @@ class NativeRunnerLab:
             if identifier == keep_id:
                 continue
             row = store.get_alert(identifier)
-            if row is not None and row.get("status") == "open":
+            if row is not None and dict(row).get("status") == "open":
                 app.decision(identifier, "observe")
 
     def _execute_decision(

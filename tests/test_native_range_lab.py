@@ -1,12 +1,15 @@
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from sentinel_blue.native_range_lab import (
     CONFIRMATION,
     NativeRangeError,
+    NativeRunnerLab,
     RunnerContext,
     _report_path,
     build_native_profile,
@@ -149,6 +152,29 @@ class NativeLoopbackFixtureTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
+
+
+class NativeStoredAlertTests(unittest.TestCase):
+    def test_sqlite_alert_rows_are_normalized_at_the_lab_boundary(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT 'alert-1' AS alert_id, 'expected-kind' AS kind, 'open' AS status"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        store = Mock()
+        store.get_alert.return_value = row
+        app = Mock()
+
+        selected = NativeRunnerLab._alert_for(store, ["alert-1"], "expected-kind")
+        NativeRunnerLab._observe_other_alerts(
+            app, store, ["alert-1"], keep_id="different-alert"
+        )
+
+        self.assertIsInstance(selected, dict)
+        self.assertEqual(selected["alert_id"], "alert-1")
+        app.decision.assert_called_once_with("alert-1", "observe")
 
 
 if __name__ == "__main__":
