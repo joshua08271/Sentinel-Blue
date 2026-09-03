@@ -23,13 +23,18 @@ from sentinel_blue.validation import telemetry_observation_sha256
 class ActionTests(unittest.TestCase):
     @staticmethod
     def _metadata(mode=0o600):
+        descriptor = "test-security-descriptor" if os.name == "nt" else None
         return {
             "mode": mode,
             "uid": -1,
             "gid": -1,
             "xattrs": {},
-            "windows_security_descriptor": None,
-            "windows_security_descriptor_version": None,
+            "windows_security_descriptor": descriptor,
+            "windows_security_descriptor_version": (
+                restoration.WINDOWS_SECURITY_DESCRIPTOR_VERSION
+                if descriptor
+                else None
+            ),
         }
 
     @staticmethod
@@ -110,6 +115,15 @@ class ActionTests(unittest.TestCase):
             before = b"pre-restoration"
             expected = hashlib.sha256(trusted).hexdigest()
             record = {"sha256": expected, **self._metadata()}
+            security_digest = store._metadata_security_descriptor_sha256(record)
+            parameters = {
+                "path": str(target),
+                "baseline_sha256": expected,
+                "observed_sha256": hashlib.sha256(before).hexdigest(),
+            }
+            if security_digest:
+                parameters["baseline_security_descriptor_sha256"] = security_digest
+                parameters["observed_security_descriptor_sha256"] = security_digest
             with (
                 patch.object(store, "_read_manifest", return_value={str(target): record}),
                 patch.object(store, "_read_private_file", return_value=trusted),
@@ -139,11 +153,7 @@ class ActionTests(unittest.TestCase):
                 patch.object(Path, "is_symlink", side_effect=AssertionError),
             ):
                 result = store.restore(
-                    {
-                        "path": str(target),
-                        "baseline_sha256": expected,
-                        "observed_sha256": hashlib.sha256(before).hexdigest(),
-                    },
+                    parameters,
                     allowed=True,
                 )
         self.assertTrue(result["success"])

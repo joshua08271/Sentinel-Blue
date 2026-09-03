@@ -237,13 +237,15 @@ class SignedRecoveryDocumentTests(RecoveryFixture):
         key_path.write_bytes(self.key)
         if os.name == "posix":
             key_path.chmod(0o600)
-        binary_flag = 1 << 29
+        native_binary_flag = getattr(os, "O_BINARY", 0)
+        binary_flag = native_binary_flag or 1 << 29
         observed_flags = []
         real_open = os.open
 
         def recording_open(path, flags, *args, **kwargs):
             observed_flags.append(flags)
-            return real_open(path, flags & ~binary_flag, *args, **kwargs)
+            real_flags = flags if native_binary_flag else flags & ~binary_flag
+            return real_open(path, real_flags, *args, **kwargs)
 
         with (
             mock.patch.object(recovery.os, "O_BINARY", binary_flag, create=True),
@@ -1097,8 +1099,14 @@ class DatabaseSemanticInspectionTests(RecoveryFixture):
             "sentinel_blue.recovery.sqlite3.connect",
             side_effect=replace_then_connect,
         ):
-            with self.assertRaisesRegex(RecoveryPathError, "changed during"):
+            with self.assertRaises(RecoveryError) as raised:
                 inspect_controller_database(database, require_recovery_state=True)
+        message = str(raised.exception)
+        self.assertTrue(
+            "changed during" in message
+            or (os.name == "nt" and "could not be opened read-only" in message),
+            message,
+        )
 
     def test_application_schema_and_table_expectations_are_exact(self):
         database = self.database(self.root / "expected.db")

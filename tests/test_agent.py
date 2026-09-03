@@ -440,6 +440,7 @@ class AgentTests(unittest.TestCase):
         notifier = MagicMock()
         with (
             patch.dict(os.environ, {"NOTIFY_SOCKET": "/run/systemd/notify"}),
+            patch("sentinel_blue.agent.os.name", "posix"),
             patch("sentinel_blue.agent.socket.socket", return_value=notifier),
         ):
             self.assertTrue(systemd_notify("READY=1\nWATCHDOG=1"))

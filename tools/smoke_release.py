@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import signal
 import socket
@@ -22,6 +23,21 @@ def _port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    """Stop a smoke-test child without relying on unsupported Windows SIGINT."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
 
 
 def _operator_headers(
@@ -136,7 +152,10 @@ def smoke(runtime: Path) -> dict[str, object]:
     runtime_version = version_result.stdout.strip().removeprefix(prefix)
     expected_runtime = hashlib.sha256(runtime.read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="sentinel-blue-release-smoke-") as directory:
-        root = Path(directory)
+        # GitHub's Windows runner exposes TEMP through an 8.3 alias. Resolve the
+        # already-created private fixture root before exercising the runtime's
+        # intentional anti-alias state-tree gate.
+        root = Path(directory).resolve(strict=True)
         token = secrets.token_urlsafe(48)
         controller_token = root / "controller-token.json"
         controller_token.write_text(json.dumps({"token": token}), encoding="utf-8")
@@ -428,8 +447,7 @@ def smoke(runtime: Path) -> dict[str, object]:
                     f"controller_reason={rejection}, stderr={agent.stderr[-4000:]}"
                 )
             telemetry = dashboard["agents"][0]
-            controller.send_signal(signal.SIGINT)
-            controller.wait(timeout=5)
+            _stop_process(controller)
             backup = subprocess.run(
                 [
                     sys.executable,
@@ -490,13 +508,7 @@ def smoke(runtime: Path) -> dict[str, object]:
                 "authenticated_recovery_verified": True,
             }
         finally:
-            if controller.poll() is None:
-                controller.send_signal(signal.SIGINT)
-                try:
-                    controller.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    controller.kill()
-                    controller.wait(timeout=3)
+            _stop_process(controller)
 
 
 def main() -> None:

@@ -332,7 +332,50 @@ class WindowsRestorationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe file name"):
             restoration._windows_file_rename_information(77, "..\\escape")
 
-    def test_invalid_relative_rename_retries_with_pinned_absolute_volume_path(self):
+    def test_native_rename_uses_same_directory_posix_replacement(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        observed = []
+        parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+
+        def set_information(handle, information_class, information):
+            observed.append((handle, information_class, information))
+
+        native._set_file_information = set_information
+        native.final_path = lambda handle: (
+            parent if handle == 77 else parent + r"\.sentinel-temporary.tmp"
+        )
+        native.rename_file(41, 77, "target.conf")
+
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            observed[0][1], restoration.WINDOWS_FILE_RENAME_INFO_EX_CLASS
+        )
+        information = observed[0][2]
+        self.assertFalse(information.RootDirectory)
+        self.assertEqual(
+            information.Flags,
+            restoration.WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
+            | restoration.WINDOWS_FILE_RENAME_POSIX_SEMANTICS,
+        )
+        kind = type(information)
+        encoded = ctypes.string_at(
+            ctypes.addressof(information) + kind.FileName.offset,
+            information.FileNameLength,
+        )
+        self.assertEqual(encoded.decode("utf-16-le"), "target.conf")
+
+    def test_native_rename_rejects_source_outside_pinned_directory(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        native._set_file_information = lambda *_args: self.fail("must not rename")
+        native.final_path = lambda handle: (
+            r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+            if handle == 77
+            else r"\\?\Volume{00000000-0000-0000-0000-000000000001}\other\temp"
+        )
+        with self.assertRaisesRegex(ValueError, "escaped"):
+            native.rename_file(41, 77, "target.conf")
+
+    def test_unsupported_extended_rename_falls_back_to_legacy_same_directory(self):
         native = object.__new__(restoration._WindowsNativeFileOps)
         observed = []
         parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
@@ -343,35 +386,19 @@ class WindowsRestorationTests(unittest.TestCase):
                 raise OSError(restoration.WINDOWS_ERROR_INVALID_PARAMETER, "invalid")
 
         native._set_file_information = set_information
-        native.final_path = lambda handle: parent if handle == 77 else ""
+        native.final_path = lambda handle: (
+            parent if handle == 77 else parent + r"\.sentinel-temporary.tmp"
+        )
         native.rename_file(41, 77, "target.conf")
-
-        self.assertEqual(len(observed), 2)
-        relative = observed[0][2]
-        absolute = observed[1][2]
-        self.assertEqual(relative.RootDirectory, 77)
-        self.assertFalse(absolute.RootDirectory)
-        kind = type(absolute)
-        encoded = ctypes.string_at(
-            ctypes.addressof(absolute) + kind.FileName.offset,
-            absolute.FileNameLength,
-        )
         self.assertEqual(
-            encoded.decode("utf-16-le"),
-            parent + r"\target.conf",
+            [item[1] for item in observed],
+            [
+                restoration.WINDOWS_FILE_RENAME_INFO_EX_CLASS,
+                restoration.WINDOWS_FILE_RENAME_INFO_CLASS,
+            ],
         )
-
-    def test_absolute_rename_rejects_unpinned_or_traversing_paths(self):
-        with self.assertRaisesRegex(ValueError, "pinned volume path"):
-            restoration._windows_absolute_file_rename_information(
-                r"C:\safe",
-                "target.conf",
-            )
-        with self.assertRaisesRegex(ValueError, "pinned volume path"):
-            restoration._windows_absolute_file_rename_information(
-                r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe\..",
-                "target.conf",
-            )
+        self.assertFalse(observed[1][2].RootDirectory)
+        self.assertEqual(observed[1][2].ReplaceIfExists, 1)
 
     def test_non_parameter_rename_error_is_not_retried(self):
         native = object.__new__(restoration._WindowsNativeFileOps)
@@ -382,7 +409,10 @@ class WindowsRestorationTests(unittest.TestCase):
             raise OSError(5, "denied")
 
         native._set_file_information = set_information
-        native.final_path = lambda _handle: self.fail("must not resolve parent path")
+        parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+        native.final_path = lambda handle: (
+            parent if handle == 77 else parent + r"\.sentinel-temporary.tmp"
+        )
         with self.assertRaisesRegex(OSError, "denied"):
             native.rename_file(41, 77, "target.conf")
         self.assertEqual(len(observed), 1)

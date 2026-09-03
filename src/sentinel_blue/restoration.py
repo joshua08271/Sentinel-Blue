@@ -84,9 +84,14 @@ WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 WINDOWS_FILE_BASIC_INFO_CLASS = 0
 WINDOWS_FILE_RENAME_INFO_CLASS = 3
 WINDOWS_FILE_DISPOSITION_INFO_CLASS = 4
+WINDOWS_FILE_RENAME_INFO_EX_CLASS = 22
+WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
+WINDOWS_FILE_RENAME_POSIX_SEMANTICS = 0x00000002
 WINDOWS_VOLUME_NAME_GUID = 0x00000001
 WINDOWS_ERROR_FILE_NOT_FOUND = 2
 WINDOWS_ERROR_PATH_NOT_FOUND = 3
+WINDOWS_ERROR_INVALID_FUNCTION = 1
+WINDOWS_ERROR_NOT_SUPPORTED = 50
 WINDOWS_ERROR_FILE_EXISTS = 80
 WINDOWS_ERROR_INVALID_PARAMETER = 87
 WINDOWS_ERROR_ALREADY_EXISTS = 183
@@ -194,35 +199,24 @@ def _windows_file_rename_information(
     )
 
 
-def _windows_absolute_file_rename_information(
-    parent_path: str,
+def _windows_file_rename_information_ex(
     leaf: str,
     *,
     replace_if_exists: bool = True,
 ):
-    """Build the documented NULL-root absolute form for a pinned volume path."""
-    if (
-        not isinstance(parent_path, str)
-        or not re.fullmatch(
-            r"\\\\\?\\Volume\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
-            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"
-            r"(?:\\[^\\/:\x00]+)*\\?",
-            parent_path,
-        )
-        or any(component in {".", ".."} for component in parent_path.split("\\"))
-    ):
-        raise ValueError("Windows restoration directory is not a pinned volume path")
-    # Reuse the leaf validation before combining it with the kernel-resolved
-    # volume GUID path held open by _windows_pinned_parent().
-    _windows_file_rename_information(0, leaf)
-    absolute_path = _windows_child_path(parent_path, leaf)
-    if len(absolute_path) > 32767:
-        raise ValueError("Windows restoration rename path is too long")
-    return _windows_rename_information(
+    """Build a same-directory FileRenameInfoEx value with POSIX replacement."""
+    information = _windows_file_rename_information(
         0,
-        absolute_path,
-        replace_if_exists=replace_if_exists,
+        leaf,
+        replace_if_exists=False,
     )
+    information.Flags = (
+        WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
+        | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
+        if replace_if_exists
+        else 0
+    )
+    return information
 
 
 def _windows_path_components(path: Path) -> tuple[str, list[str], str]:
@@ -678,12 +672,17 @@ class _WindowsNativeFileOps:
         *,
         replace_if_exists: bool = True,
     ) -> None:
+        pinned_parent = self.final_path(parent_handle).rstrip("\\").casefold()
+        source_parent = ntpath.dirname(self.final_path(handle)).rstrip("\\").casefold()
+        if source_parent != pinned_parent:
+            raise ValueError(
+                "Windows restoration temporary file escaped its pinned directory"
+            )
         try:
             self._set_file_information(
                 handle,
-                WINDOWS_FILE_RENAME_INFO_CLASS,
-                _windows_file_rename_information(
-                    parent_handle,
+                WINDOWS_FILE_RENAME_INFO_EX_CLASS,
+                _windows_file_rename_information_ex(
                     leaf,
                     replace_if_exists=replace_if_exists,
                 ),
@@ -692,20 +691,22 @@ class _WindowsNativeFileOps:
             error = getattr(exc, "winerror", None)
             if error is None:
                 error = exc.errno
-            if error != WINDOWS_ERROR_INVALID_PARAMETER:
+            if error not in {
+                WINDOWS_ERROR_INVALID_FUNCTION,
+                WINDOWS_ERROR_NOT_SUPPORTED,
+                WINDOWS_ERROR_INVALID_PARAMETER,
+            }:
                 raise
-            # Some Windows filesystems reject the documented relative-root
-            # representation with ERROR_INVALID_PARAMETER.  Retry only that
-            # error with the other documented form: RootDirectory=NULL and an
-            # absolute name.  The name comes from the still-held volume GUID
-            # directory handle, so drive-letter and ancestor substitution stay
-            # outside the publish boundary.
-            parent_path = self.final_path(parent_handle)
+            # FileRenameInfoEx is the race-safe path because the verified target
+            # handles deliberately remain open with FILE_SHARE_DELETE. Older
+            # filesystems may reject the information class; the legacy fallback
+            # remains same-directory and fails closed if an open target cannot be
+            # replaced.
             self._set_file_information(
                 handle,
                 WINDOWS_FILE_RENAME_INFO_CLASS,
-                _windows_absolute_file_rename_information(
-                    parent_path,
+                _windows_file_rename_information(
+                    0,
                     leaf,
                     replace_if_exists=replace_if_exists,
                 ),
