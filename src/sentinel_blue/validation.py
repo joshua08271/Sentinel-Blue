@@ -75,6 +75,7 @@ ACTION_RESULT_FIELDS = frozenset(
         "errors",
         "config_validation",
         "probes",
+        "probe_attempts",
         "retention_warnings",
         "captured",
         "capture_receipts",
@@ -1053,6 +1054,14 @@ def validate_action_result(
                 )
             normalized_probes.append(_probe(row, index))
         result["probes"] = normalized_probes
+    if "probe_attempts" in payload:
+        if result["action_type"] != "restart_service":
+            raise ValidationError(
+                "probe_attempts is valid only for restart_service results"
+            )
+        result["probe_attempts"] = _integer(
+            payload["probe_attempts"], "probe_attempts", 0, 64
+        )
     try:
         encoded = json.dumps(
             result,
