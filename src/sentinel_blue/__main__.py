@@ -262,6 +262,19 @@ def parser() -> argparse.ArgumentParser:
     policy_lab.add_argument("--runs", type=int, default=200)
     policy_lab.add_argument("--json", action="store_true")
 
+    native_lab = subcommands.add_parser(
+        "native-lab",
+        help="run the owner-gated native campaign on a disposable GitHub-hosted runner",
+    )
+    native_lab.add_argument(
+        "--output",
+        help=(
+            "report path; must resolve to "
+            "GITHUB_WORKSPACE/native-live-report.json"
+        ),
+    )
+    native_lab.add_argument("--json", action="store_true")
+
     doctor = subcommands.add_parser("doctor", help="run local readiness and package diagnostics")
     doctor.add_argument("--database")
     doctor.add_argument("--state-dir", default=str(Path.home() / ".sentinel-blue"))
@@ -362,6 +375,8 @@ def main() -> None:
         from .restoration_lab import run
     elif args.command == "policy-lab":
         from .policy_lab import run
+    elif args.command == "native-lab":
+        from .native_range_lab import run
     elif args.command == "doctor":
         from .diagnostics import run
     elif args.command.startswith("recovery-"):

@@ -138,6 +138,39 @@ class ServiceManifestPolicyTests(unittest.TestCase):
                 "agent-one", "restart_service", {"service": "web.service"}
             )
 
+    def test_approved_restart_inherits_exact_manifest_health_transactions(self):
+        manifest = service_manifest(approval=["restart_service"])
+        app, store = self.make_app(profile_for([manifest]))
+        self.addCleanup(store.close)
+        baseline = {
+            "agent_id": "agent-one",
+            "hostname": "agent-one",
+            "platform": "Linux fixture",
+            "observed_at": time.time(),
+            "accounts": [{"name": "root", "privileged": True, "enabled": True}],
+            "sessions": [],
+            "services": [{"name": "web.service", "state": "running"}],
+            "interfaces": [],
+            "collector_errors": [],
+        }
+        app.ingest(baseline)
+        self.assertTrue(store.approve_baseline("agent-one"))
+        alert_ids = app.ingest(
+            {
+                **baseline,
+                "observed_at": time.time() + 0.001,
+                "services": [{"name": "web.service", "state": "stopped"}],
+            }
+        )
+        alert_id = next(
+            identifier
+            for identifier in alert_ids
+            if store.get_alert(identifier)["kind"] == "baseline_service_stopped"
+        )
+        decision = app.decision(alert_id, "approve")
+        action = store.get_action(str(decision["action_id"]))
+        self.assertEqual(action["parameters"]["probes"], [PROBE])
+
     def test_integrity_paths_are_exact_and_every_service_must_authorize(self):
         web = service_manifest(
             automatic=["capture_restore_point"],
