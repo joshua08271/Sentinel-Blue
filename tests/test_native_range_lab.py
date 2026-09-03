@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from sentinel_blue.native_range_lab import (
     build_native_profile,
     validate_runner_environment,
 )
+from sentinel_blue.native_loopback_fixture import HEALTH_MARKER, create_server
+from sentinel_blue.probes import run_probe
 
 
 class NativeRangeGateTests(unittest.TestCase):
@@ -117,6 +120,35 @@ class NativeRangeGateTests(unittest.TestCase):
                 with self.subTest(path=path):
                     with self.assertRaises(NativeRangeError):
                         _report_path(context, str(path))
+
+
+class NativeLoopbackFixtureTests(unittest.TestCase):
+    def test_fixture_is_loopback_only_and_serves_the_exact_health_marker(self):
+        server = create_server(0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            self.assertEqual(host, "127.0.0.1")
+            result = run_probe(
+                {
+                    "name": "native-fixture-test",
+                    "kind": "http",
+                    "target": f"http://127.0.0.1:{port}/health",
+                    "expected_status": [200],
+                    "expected_body": HEALTH_MARKER,
+                    "timeout": 2.0,
+                },
+                ["127.0.0.0/8"],
+                authorized_hosts=["127.0.0.1"],
+                excluded_hosts=[],
+            )
+            self.assertTrue(result.healthy, result.detail)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

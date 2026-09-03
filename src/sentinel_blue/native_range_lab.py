@@ -33,6 +33,7 @@ from .actions import ActionExecutor
 from .collectors import collect
 from .controller import ControllerApp, assess_baseline_readiness
 from .event_profile import CAPABILITIES, EventProfile
+from .native_loopback_fixture import HEALTH_MARKER
 from .probes import run_probe
 from .range_lab import _complete_disposable_baseline_promotion
 from .risk import RiskModel
@@ -46,7 +47,6 @@ ALLOWED_EVENTS = frozenset({"pull_request", "workflow_dispatch"})
 REQUIRED_TOOLS = ("getent", "passwd", "ss", "systemctl", "useradd", "userdel")
 APPROVED_CONTENT = b"sentinel-blue-native-approved-v1\n"
 TAMPERED_CONTENT = b"sentinel-blue-native-inert-tamper-v1\n"
-HEALTH_MARKER = "sentinel-blue-native-healthy-v1"
 
 
 class NativeRangeError(RuntimeError):
@@ -138,7 +138,6 @@ def build_native_profile(
     """Build a minimal in-process range profile bound only to loopback."""
 
     config_path = root / "protected.conf"
-    web_root = root / "www"
     probe = {
         "name": "native-loopback-health",
         "kind": "http",
@@ -179,11 +178,11 @@ def build_native_profile(
                     "host": agent_id,
                     "protocol": "http",
                     "port": port,
-                    "implementation": "Python stdlib inert loopback fixture",
+                    "implementation": "Sentinel Blue inert loopback health fixture",
                     "dependencies": [],
                     "required_accounts": [],
                     "required_files": [str(config_path)],
-                    "required_data": [str(web_root)],
+                    "required_data": [],
                     "credential_source": "",
                     "expected_transactions": [probe],
                     "local_checks": [
@@ -252,7 +251,6 @@ class NativeRunnerLab:
         self.cron_path = Path("/etc/cron.d") / f"sentinel-blue-native-{context.suffix}"
         self.account_name = f"sblab{context.suffix[-8:]}"
         self.config_path = self.root / "protected.conf"
-        self.web_root = self.root / "www"
         self.state_dir = self.root / "agent-state"
         self.port = _free_loopback_port()
         self.profile, self.probe, self.restoration_probe = build_native_profile(
@@ -308,22 +306,39 @@ class NativeRunnerLab:
         except KeyError:
             return False
 
-    def _probe_healthy(self) -> bool:
+    def _probe_result(self) -> Any:
         return run_probe(
             self.probe,
             list(self.profile.authorized_networks),
             authorized_hosts=list(self.profile.authorized_hosts),
             excluded_hosts=list(self.profile.excluded_hosts),
-        ).healthy
+        )
+
+    def _probe_healthy(self) -> bool:
+        return bool(self._probe_result().healthy)
 
     def _wait_for_probe(self, expected: bool, timeout: float = 12.0) -> None:
         deadline = time.monotonic() + timeout
+        last_detail = "probe did not run"
         while time.monotonic() < deadline:
-            if self._probe_healthy() is expected:
+            result = self._probe_result()
+            last_detail = str(result.detail)[:240].replace("\n", " ")
+            if result.healthy is expected:
                 return
             time.sleep(0.2)
+        service_state = self._command(
+            [
+                "systemctl",
+                "show",
+                self.service_id,
+                "--property=ActiveState,SubState,Result,ExecMainStatus",
+                "--no-pager",
+            ],
+            check=False,
+        ).stdout.strip().replace("\n", ";")[:240]
         raise NativeRangeError(
-            "loopback health transaction did not reach the expected state"
+            "loopback health transaction did not reach the expected state: "
+            f"expected={expected}; probe={last_detail}; service={service_state or 'unknown'}"
         )
 
     def setup(self) -> None:
@@ -339,23 +354,20 @@ class NativeRunnerLab:
         if not executable.is_absolute() or any(character.isspace() for character in str(executable)):
             raise NativeRangeError("Python executable path is unsafe for the systemd fixture")
         self.root.mkdir(mode=0o755)
-        self.web_root.mkdir(mode=0o755)
         self.state_dir.mkdir(mode=0o700)
         self._write_exclusive(self.config_path, APPROVED_CONTENT, 0o640)
-        self._write_exclusive(
-            self.web_root / "health", (HEALTH_MARKER + "\n").encode("ascii"), 0o644
-        )
         unit = (
             "[Unit]\n"
             "Description=Sentinel Blue disposable native range fixture\n"
             "After=network.target\n\n"
             "[Service]\n"
             "Type=simple\n"
-            f"ExecStart={executable} -m http.server {self.port} --bind 127.0.0.1 "
-            f"--directory {self.web_root}\n"
+            f"ExecStart={executable} -m sentinel_blue.native_loopback_fixture "
+            f"--port {self.port}\n"
             "DynamicUser=yes\n"
             "NoNewPrivileges=yes\n"
             "PrivateDevices=yes\n"
+            "PrivateTmp=yes\n"
             "ProtectHome=yes\n"
             "ProtectSystem=strict\n"
             "RestrictAddressFamilies=AF_UNIX AF_INET\n"
