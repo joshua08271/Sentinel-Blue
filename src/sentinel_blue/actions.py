@@ -34,6 +34,9 @@ SERVICE_NAME = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
 MAX_SNAPSHOTS = 256
 MAX_SERVICE_TRANSACTIONS = 256
 MAX_QUARANTINE_TTL = 3600.0
+SERVICE_RECOVERY_VALIDATION_GRACE_SECONDS = 5.0
+SERVICE_RECOVERY_MAX_PROBE_ATTEMPTS = 20
+SERVICE_RECOVERY_PROBE_INTERVAL_SECONDS = 0.25
 
 
 class ActionExecutor:
@@ -767,6 +770,34 @@ class ActionExecutor:
         if result.returncode != 0:
             raise OSError(result.stderr.strip() or result.stdout.strip() or "service command failed")
 
+    def _wait_for_service_probes(
+        self, probe_specs: list[dict[str, Any]]
+    ) -> tuple[list[Any], int]:
+        """Allow a bounded application-startup grace after the service starts."""
+
+        if not probe_specs:
+            return [], 0
+        deadline = time.monotonic() + SERVICE_RECOVERY_VALIDATION_GRACE_SECONDS
+        results: list[Any] = []
+        attempts = 0
+        while attempts < SERVICE_RECOVERY_MAX_PROBE_ATTEMPTS:
+            attempts += 1
+            results = run_probes(
+                probe_specs,
+                self.authorized_networks,
+                authorized_hosts=self.authorized_hosts,
+                excluded_hosts=self.excluded_hosts,
+            )
+            if len(results) == len(probe_specs) and all(
+                item.healthy for item in results
+            ):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(SERVICE_RECOVERY_PROBE_INTERVAL_SECONDS, remaining))
+        return results, attempts
+
     def _restart_service(self, parameters: dict[str, Any], started: float) -> dict[str, Any]:
         service = str(parameters.get("service", ""))
         if not SERVICE_NAME.fullmatch(service):
@@ -800,14 +831,13 @@ class ActionExecutor:
             )
         try:
             self._set_service_state(service, "running")
-            probes = run_probes(
-                list(parameters.get("probes", [])),
-                self.authorized_networks,
-                authorized_hosts=self.authorized_hosts,
-                excluded_hosts=self.excluded_hosts,
-            )
+            probe_specs = list(parameters.get("probes", []))
+            probes, probe_attempts = self._wait_for_service_probes(probe_specs)
             state_ok = self._service_state(service) == "running"
-            probes_ok = not probes or all(item.healthy for item in probes)
+            probes_ok = not probe_specs or (
+                len(probes) == len(probe_specs)
+                and all(item.healthy for item in probes)
+            )
             if not state_ok or not probes_ok:
                 self._set_service_state(service, before if before in {"running", "stopped"} else "stopped")
                 transaction["status"] = "rolled_back"
@@ -821,6 +851,7 @@ class ActionExecutor:
                     started,
                     rolled_back=True,
                     probes=[asdict(item) for item in probes],
+                    probe_attempts=probe_attempts,
                 )
             transaction["status"] = "committed"
             transaction["completed_at"] = time.time()
@@ -833,6 +864,7 @@ class ActionExecutor:
                 started,
                 pre_state={"service": service, "desired_state": before},
                 probes=[asdict(item) for item in probes],
+                probe_attempts=probe_attempts,
             )
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             try:

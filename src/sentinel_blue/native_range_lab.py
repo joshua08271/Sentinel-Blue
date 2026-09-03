@@ -489,7 +489,19 @@ class NativeRunnerLab:
                 f"expected {expected_action!r}, received {selected_action.action_type!r}"
             )
         if selected_result.get("success") is not True:
-            raise NativeRangeError(f"{expected_action} did not complete successfully")
+            message = str(selected_result.get("message", "no diagnostic"))
+            probe_summary = [
+                {
+                    "healthy": item.get("healthy"),
+                    "detail": str(item.get("detail", ""))[:120],
+                }
+                for item in selected_result.get("probes", [])[:8]
+                if isinstance(item, dict)
+            ]
+            raise NativeRangeError(
+                f"{expected_action} did not complete successfully: "
+                f"{message[:240]}; probes={probe_summary}"
+            )
         if selected_result.get("dry_run") is True:
             raise NativeRangeError(f"{expected_action} unexpectedly ran in dry-run mode")
         return selected_result, selected_action

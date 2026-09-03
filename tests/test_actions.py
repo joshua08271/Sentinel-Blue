@@ -1017,6 +1017,10 @@ class ActionTests(unittest.TestCase):
                 patch.object(executor, "_service_state", side_effect=["stopped", "running"]),
                 patch.object(executor, "_set_service_state") as set_state,
                 patch("sentinel_blue.actions.run_probes", return_value=[unhealthy]),
+                patch(
+                    "sentinel_blue.actions.SERVICE_RECOVERY_VALIDATION_GRACE_SECONDS",
+                    0.0,
+                ),
             ):
                 result = executor.execute(
                     "restart_service",
@@ -1029,6 +1033,37 @@ class ActionTests(unittest.TestCase):
                 set_state.call_args_list,
                 [call("web.service", "running"), call("web.service", "stopped")],
             )
+
+    def test_service_recovery_retries_transaction_during_startup_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = ActionExecutor(directory, allow_containment=True)
+            unhealthy = ProbeResult(
+                "web", "http://127.0.0.1", False, 1.0, "connection refused"
+            )
+            healthy = ProbeResult(
+                "web", "http://127.0.0.1", True, 1.0, "HTTP 200"
+            )
+            with (
+                patch.object(
+                    executor, "_service_state", side_effect=["stopped", "running"]
+                ),
+                patch.object(executor, "_set_service_state") as set_state,
+                patch(
+                    "sentinel_blue.actions.run_probes",
+                    side_effect=[[unhealthy], [healthy]],
+                ) as runner,
+                patch("sentinel_blue.actions.time.sleep") as sleep,
+            ):
+                result = executor.execute(
+                    "restart_service",
+                    {"service": "web.service", "probes": [{"name": "web"}]},
+                    {},
+                )
+            self.assertTrue(result["success"])
+            self.assertEqual(result["probe_attempts"], 2)
+            self.assertEqual(runner.call_count, 2)
+            sleep.assert_called_once()
+            set_state.assert_called_once_with("web.service", "running")
 
     def test_quarantine_preparation_write_failure_never_suspends_process(self):
         with tempfile.TemporaryDirectory() as directory:
