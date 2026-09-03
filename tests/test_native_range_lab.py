@@ -4,7 +4,8 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sentinel_blue.native_range_lab import (
     CONFIRMATION,
@@ -175,6 +176,58 @@ class NativeStoredAlertTests(unittest.TestCase):
         self.assertIsInstance(selected, dict)
         self.assertEqual(selected["alert_id"], "alert-1")
         app.decision.assert_called_once_with("alert-1", "observe")
+
+
+@unittest.skipIf(os.name != "posix", "duplicate UID fixture is POSIX-only")
+class NativeAccountFixtureTests(unittest.TestCase):
+    def test_duplicate_uid_cleanup_is_forceful_but_exact_and_nonrecursive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RunnerContext(
+                repository="joshua08271/Sentinel-Blue",
+                actor="joshua08271",
+                event_name="pull_request",
+                run_id="123456789012",
+                suffix="3456789012",
+                workspace=Path(directory),
+            )
+            lab = NativeRunnerLab(context)
+            entry = SimpleNamespace(pw_name=lab.account_name, pw_uid=0)
+            lab.account_created = True
+            with (
+                patch(
+                    "sentinel_blue.native_range_lab.pwd.getpwnam",
+                    side_effect=[entry, KeyError(lab.account_name)],
+                ),
+                patch.object(lab, "_command") as command,
+            ):
+                lab._delete_duplicate_uid_zero_account()
+        command.assert_called_once_with(
+            ["userdel", "--force", lab.account_name]
+        )
+        self.assertFalse(lab.account_created)
+
+    def test_duplicate_uid_cleanup_refuses_a_changed_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RunnerContext(
+                repository="joshua08271/Sentinel-Blue",
+                actor="joshua08271",
+                event_name="pull_request",
+                run_id="123456789012",
+                suffix="3456789012",
+                workspace=Path(directory),
+            )
+            lab = NativeRunnerLab(context)
+            changed = SimpleNamespace(pw_name=lab.account_name, pw_uid=1000)
+            with (
+                patch(
+                    "sentinel_blue.native_range_lab.pwd.getpwnam",
+                    return_value=changed,
+                ),
+                patch.object(lab, "_command") as command,
+                self.assertRaisesRegex(NativeRangeError, "changed"),
+            ):
+                lab._delete_duplicate_uid_zero_account()
+        command.assert_not_called()
 
 
 if __name__ == "__main__":

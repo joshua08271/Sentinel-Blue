@@ -306,6 +306,28 @@ class NativeRunnerLab:
         except KeyError:
             return False
 
+    def _delete_duplicate_uid_zero_account(self) -> None:
+        """Delete only the exact run-scoped duplicate-UID fixture account."""
+
+        if pwd is None:
+            raise NativeRangeError("POSIX account inventory is unavailable")
+        try:
+            entry = pwd.getpwnam(self.account_name)
+        except KeyError:
+            self.account_created = False
+            return
+        if entry.pw_name != self.account_name or entry.pw_uid != 0:
+            raise NativeRangeError(
+                "refused to delete a changed emulation-account identity"
+            )
+        # A duplicate UID zero appears to userdel as a logged-in identity
+        # whenever any root process exists. --force bypasses only that check;
+        # omitting --remove ensures no home or UID-owned files are traversed.
+        self._command(["userdel", "--force", self.account_name])
+        if self._account_exists(self.account_name):
+            raise NativeRangeError("duplicate-UID emulation account remained after deletion")
+        self.account_created = False
+
     def _probe_result(self) -> Any:
         return run_probe(
             self.probe,
@@ -695,8 +717,7 @@ class NativeRunnerLab:
         result, action = self._execute_decision(
             app, store, executor, alert, "snapshot", telemetry
         )
-        self._command(["userdel", self.account_name])
-        self.account_created = False
+        self._delete_duplicate_uid_zero_account()
         record = self._scenario_record(
             "locked_duplicate_uid_zero_account",
             "unverified_privileged_account",
@@ -920,8 +941,7 @@ class NativeRunnerLab:
             attempt("cron marker", self.cron_path.unlink)
             self.cron_created = False
         if self.account_created or self._account_exists(self.account_name):
-            attempt("UID-zero account", lambda: self._command(["userdel", self.account_name]))
-            self.account_created = False
+            attempt("UID-zero account", self._delete_duplicate_uid_zero_account)
         if self.unit_created or self.unit_path.exists() or self.unit_path.is_symlink():
             attempt(
                 "systemd service stop",
