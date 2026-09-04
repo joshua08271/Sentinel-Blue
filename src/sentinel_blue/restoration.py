@@ -737,25 +737,36 @@ def _windows_child_path(parent_path: str, leaf: str) -> str:
 
 
 @contextmanager
-def _windows_pinned_parent(path: Path, native: _WindowsNativeFileOps):
+def _windows_pinned_parent(
+    path: Path,
+    native: _WindowsNativeFileOps,
+    *,
+    allow_target_rename: bool = False,
+):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
     handles: list[Any] = []
     try:
         candidate = root
-        for component in [None, *components]:
+        walk = [None, *components]
+        for index, component in enumerate(walk):
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
+            share_mode = WINDOWS_FILE_SHARE_READ
+            if allow_target_rename and index == len(walk) - 1:
+                # SetFileInformationByHandle opens the absolute target's final
+                # directory for FILE_WRITE_DATA. Let that kernel-internal open
+                # coexist with this identity-pinning handle, while continuing
+                # to withhold FILE_SHARE_DELETE so the directory itself cannot
+                # be renamed or removed during publication.
+                share_mode |= WINDOWS_FILE_SHARE_WRITE
             handle = native.open_file(
                 candidate,
                 WINDOWS_FILE_LIST_DIRECTORY
                 | WINDOWS_FILE_TRAVERSE
                 | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE,
-                # Withhold FILE_SHARE_WRITE and FILE_SHARE_DELETE. Child-file
-                # creation does not need either share on the directory object;
-                # excluding them pins the name and blocks reparse mutation.
-                WINDOWS_FILE_SHARE_READ,
+                share_mode,
                 WINDOWS_OPEN_EXISTING,
                 WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
                 | WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1007,7 +1018,11 @@ def _windows_atomic_write(
         else nullcontext()
     )
     with privilege_scope:
-        with _windows_pinned_parent(destination, native) as (
+        with _windows_pinned_parent(
+            destination,
+            native,
+            allow_target_rename=True,
+        ) as (
             parent_handle,
             parent_path,
             leaf,

@@ -584,6 +584,23 @@ class WindowsRestorationTests(unittest.TestCase):
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_DELETE)
         self.assertEqual(native.events[-2:], [("close", 11), ("close", 10)])
 
+    def test_mutating_parent_walk_shares_write_only_on_final_directory(self):
+        native = _FakeWindowsFileOps()
+        with restoration._windows_pinned_parent(
+            Path(r"C:\safe\target.conf"),
+            native,
+            allow_target_rename=True,
+        ):
+            pass
+        opens = [event for event in native.events if event[0] == "open"]
+        self.assertEqual(opens[0][4], restoration.WINDOWS_FILE_SHARE_READ)
+        self.assertEqual(
+            opens[1][4],
+            restoration.WINDOWS_FILE_SHARE_READ
+            | restoration.WINDOWS_FILE_SHARE_WRITE,
+        )
+        self.assertFalse(opens[1][4] & restoration.WINDOWS_FILE_SHARE_DELETE)
+
     def test_parent_walk_rejects_reparse_and_closes_every_open_handle(self):
         native = _FakeWindowsFileOps(reparse_handle=11)
         with self.assertRaisesRegex(ValueError, "reparse point"):
