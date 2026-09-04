@@ -436,11 +436,11 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symbolic link"):
                 configure_agent_logging("INFO", state, str(state / "agent.log"))
 
+    @unittest.skipUnless(os.name == "posix", "systemd notification is POSIX-only")
     def test_systemd_readiness_and_watchdog_notification(self):
         notifier = MagicMock()
         with (
             patch.dict(os.environ, {"NOTIFY_SOCKET": "/run/systemd/notify"}),
-            patch("sentinel_blue.agent.os.name", "posix"),
             patch("sentinel_blue.agent.socket.socket", return_value=notifier),
         ):
             self.assertTrue(systemd_notify("READY=1\nWATCHDOG=1"))

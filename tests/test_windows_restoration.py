@@ -332,7 +332,7 @@ class WindowsRestorationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe file name"):
             restoration._windows_file_rename_information(77, "..\\escape")
 
-    def test_native_rename_uses_same_directory_posix_replacement(self):
+    def test_native_rename_uses_absolute_pinned_path_and_posix_replacement(self):
         native = object.__new__(restoration._WindowsNativeFileOps)
         observed = []
         parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
@@ -362,7 +362,7 @@ class WindowsRestorationTests(unittest.TestCase):
             ctypes.addressof(information) + kind.FileName.offset,
             information.FileNameLength,
         )
-        self.assertEqual(encoded.decode("utf-16-le"), "target.conf")
+        self.assertEqual(encoded.decode("utf-16-le"), parent + r"\target.conf")
 
     def test_native_rename_rejects_source_outside_pinned_directory(self):
         native = object.__new__(restoration._WindowsNativeFileOps)
@@ -399,6 +399,19 @@ class WindowsRestorationTests(unittest.TestCase):
         )
         self.assertFalse(observed[1][2].RootDirectory)
         self.assertEqual(observed[1][2].ReplaceIfExists, 1)
+        kind = type(observed[1][2])
+        encoded = ctypes.string_at(
+            ctypes.addressof(observed[1][2]) + kind.FileName.offset,
+            observed[1][2].FileNameLength,
+        )
+        self.assertEqual(encoded.decode("utf-16-le"), parent + r"\target.conf")
+
+    def test_extended_rename_rejects_an_unpinned_parent_path(self):
+        with self.assertRaisesRegex(ValueError, "pinned local volume"):
+            restoration._windows_file_rename_information_ex(
+                r"C:\safe",
+                "target.conf",
+            )
 
     def test_non_parameter_rename_error_is_not_retried(self):
         native = object.__new__(restoration._WindowsNativeFileOps)

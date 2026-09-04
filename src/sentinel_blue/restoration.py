@@ -200,14 +200,28 @@ def _windows_file_rename_information(
 
 
 def _windows_file_rename_information_ex(
+    parent_path: str,
     leaf: str,
     *,
     replace_if_exists: bool = True,
 ):
-    """Build a same-directory FileRenameInfoEx value with POSIX replacement."""
-    information = _windows_file_rename_information(
+    """Build an absolute FileRenameInfoEx value with POSIX replacement."""
+    if (
+        not isinstance(parent_path, str)
+        or "\x00" in parent_path
+        or not parent_path.casefold().startswith("\\\\?\\volume{")
+    ):
+        raise ValueError("Windows restoration parent is not a pinned local volume path")
+    if (
+        not isinstance(leaf, str)
+        or not leaf
+        or leaf in {".", ".."}
+        or any(character in leaf for character in "\\/:\x00")
+    ):
+        raise ValueError("Windows restoration target has an unsafe file name")
+    information = _windows_rename_information(
         0,
-        leaf,
+        _windows_child_path(parent_path, leaf),
         replace_if_exists=False,
     )
     information.Flags = (
@@ -672,9 +686,9 @@ class _WindowsNativeFileOps:
         *,
         replace_if_exists: bool = True,
     ) -> None:
-        pinned_parent = self.final_path(parent_handle).rstrip("\\").casefold()
-        source_parent = ntpath.dirname(self.final_path(handle)).rstrip("\\").casefold()
-        if source_parent != pinned_parent:
+        pinned_parent = self.final_path(parent_handle).rstrip("\\")
+        source_parent = ntpath.dirname(self.final_path(handle)).rstrip("\\")
+        if source_parent.casefold() != pinned_parent.casefold():
             raise ValueError(
                 "Windows restoration temporary file escaped its pinned directory"
             )
@@ -683,6 +697,7 @@ class _WindowsNativeFileOps:
                 handle,
                 WINDOWS_FILE_RENAME_INFO_EX_CLASS,
                 _windows_file_rename_information_ex(
+                    pinned_parent,
                     leaf,
                     replace_if_exists=replace_if_exists,
                 ),
@@ -705,9 +720,9 @@ class _WindowsNativeFileOps:
             self._set_file_information(
                 handle,
                 WINDOWS_FILE_RENAME_INFO_CLASS,
-                _windows_file_rename_information(
+                _windows_rename_information(
                     0,
-                    leaf,
+                    _windows_child_path(pinned_parent, leaf),
                     replace_if_exists=replace_if_exists,
                 ),
             )
