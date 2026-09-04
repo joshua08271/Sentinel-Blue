@@ -120,7 +120,8 @@ def _first_available(*commands: str) -> str | None:
 def validation_command(path: str | Path) -> tuple[str, list[str]] | None:
     """Return an exact argv validator for a recognized live configuration path."""
     target = Path(path)
-    normalized = target.as_posix().casefold()
+    posix_target = target.as_posix()
+    normalized = posix_target.casefold()
     name = target.name.casefold()
     executable: str | None = None
     arguments: list[str] = []
@@ -129,14 +130,14 @@ def validation_command(path: str | Path) -> tuple[str, list[str]] | None:
 
     if normalized == "/etc/ssh/sshd_config" or normalized.startswith("/etc/ssh/sshd_config.d/"):
         executable = _first_available("sshd")
-        arguments = ["-t", "-f", str(target)]
+        arguments = ["-t", "-f", posix_target]
     elif windows_text.endswith("\\programdata\\ssh\\sshd_config"):
         candidate = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "OpenSSH" / "sshd.exe"
         executable = str(candidate) if candidate.is_file() else _first_available("sshd.exe", "sshd")
         arguments = ["-t", "-f", str(target)]
     elif normalized == "/etc/sudoers" or normalized.startswith("/etc/sudoers.d/"):
         executable = _first_available("visudo")
-        arguments = ["-c", "-f", str(target)]
+        arguments = ["-c", "-f", posix_target]
     elif normalized.startswith("/etc/nginx/"):
         executable = _first_available("nginx")
         arguments = ["-t"]
@@ -148,13 +149,13 @@ def validation_command(path: str | Path) -> tuple[str, list[str]] | None:
         arguments = ["-t"]
     elif normalized == "/etc/named.conf" or normalized.startswith("/etc/named/"):
         executable = _first_available("named-checkconf")
-        arguments = [str(target)] if name.endswith(".conf") else []
+        arguments = [posix_target] if name.endswith(".conf") else []
     elif normalized.startswith("/etc/samba/"):
         executable = _first_available("testparm")
-        arguments = ["-s", str(target)] if name == "smb.conf" else ["-s"]
+        arguments = ["-s", posix_target] if name == "smb.conf" else ["-s"]
     elif normalized.startswith("/etc/systemd/system/") and name.endswith((".service", ".socket", ".timer")):
         executable = _first_available("systemd-analyze")
-        arguments = ["verify", str(target)]
+        arguments = ["verify", posix_target]
     elif "\\windows\\system32\\inetsrv\\config\\" in windows_text:
         candidate = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "inetsrv" / "appcmd.exe"
         executable = str(candidate) if candidate.is_file() else None

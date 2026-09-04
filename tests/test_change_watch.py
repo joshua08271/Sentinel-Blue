@@ -40,7 +40,8 @@ class ChangeWatcherTests(unittest.TestCase):
                     watcher.stop()
 
     def test_paths_are_absolute_deduplicated_and_bounded(self):
-        paths = [f"/tmp/sentinel-watch-{index}" for index in range(300)]
+        root = Path(tempfile.gettempdir()).resolve()
+        paths = [str(root / f"sentinel-watch-{index}") for index in range(300)]
         watcher = ChangeWatcher([paths[0], paths[0], "relative", *paths[1:]])
         self.assertEqual(len(watcher.paths), 256)
         self.assertEqual(str(watcher.paths[0]), paths[0])

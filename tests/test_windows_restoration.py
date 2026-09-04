@@ -1,3 +1,4 @@
+import base64
 import ctypes
 import hashlib
 import json
@@ -235,6 +236,55 @@ class WindowsRestorationTests(unittest.TestCase):
             patch.object(ctypes, "set_last_error", create=True, side_effect=api.set_last_error),
         )
 
+    @staticmethod
+    def _encoded_descriptor(
+        *,
+        reordered: bool = False,
+        control: int | None = None,
+        acl_revision: int = 2,
+        ace_flags: int | None = None,
+        access_mask: int = 1,
+    ) -> str:
+        sid = b"\x01\x01\x00\x00\x00\x00\x00\x05\x12\x00\x00\x00"
+        ace = (
+            b""
+            if ace_flags is None
+            else (
+                bytes((0, ace_flags))
+                + (8 + len(sid)).to_bytes(2, "little")
+                + access_mask.to_bytes(4, "little")
+                + sid
+            )
+        )
+        dacl = (
+            bytes((acl_revision, 0))
+            + (8 + len(ace)).to_bytes(2, "little")
+            + (1 if ace else 0).to_bytes(2, "little")
+            + b"\x00\x00"
+            + ace
+        )
+        descriptor_control = (
+            restoration.WINDOWS_SE_SELF_RELATIVE
+            | restoration.WINDOWS_SE_DACL_PRESENT
+            if control is None
+            else control
+        )
+        if reordered:
+            raw = bytearray(64)
+            owner_offset, group_offset, dacl_offset = 52, 36, 24
+        else:
+            raw = bytearray(52)
+            owner_offset, group_offset, dacl_offset = 20, 32, 44
+        raw[0] = 1
+        raw[2:4] = descriptor_control.to_bytes(2, "little")
+        raw[4:8] = owner_offset.to_bytes(4, "little")
+        raw[8:12] = group_offset.to_bytes(4, "little")
+        raw[16:20] = dacl_offset.to_bytes(4, "little")
+        raw[owner_offset : owner_offset + len(sid)] = sid
+        raw[group_offset : group_offset + len(sid)] = sid
+        raw[dacl_offset : dacl_offset + len(dacl)] = dacl
+        return base64.b64encode(raw).decode("ascii")
+
     def test_privilege_scope_uses_disposable_thread_token(self):
         api = _TokenApis()
         first, second, third = self._patched_token_apis(api)
@@ -331,6 +381,104 @@ class WindowsRestorationTests(unittest.TestCase):
         self.assertEqual(non_replacing.ReplaceIfExists, 0)
         with self.assertRaisesRegex(ValueError, "unsafe file name"):
             restoration._windows_file_rename_information(77, "..\\escape")
+
+    def test_native_rename_uses_absolute_pinned_path_and_posix_replacement(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        observed = []
+        parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+
+        def set_information(handle, information_class, information):
+            observed.append((handle, information_class, information))
+
+        native._set_file_information = set_information
+        native.final_path = lambda handle: (
+            parent if handle == 77 else parent + r"\.sentinel-temporary.tmp"
+        )
+        native.rename_file(41, 77, "target.conf")
+
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            observed[0][1], restoration.WINDOWS_FILE_RENAME_INFO_EX_CLASS
+        )
+        information = observed[0][2]
+        self.assertFalse(information.RootDirectory)
+        self.assertEqual(
+            information.Flags,
+            restoration.WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
+            | restoration.WINDOWS_FILE_RENAME_POSIX_SEMANTICS,
+        )
+        kind = type(information)
+        encoded = ctypes.string_at(
+            ctypes.addressof(information) + kind.FileName.offset,
+            information.FileNameLength,
+        )
+        self.assertEqual(encoded.decode("utf-16-le"), parent + r"\target.conf")
+
+    def test_native_rename_rejects_source_outside_pinned_directory(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        native._set_file_information = lambda *_args: self.fail("must not rename")
+        native.final_path = lambda handle: (
+            r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+            if handle == 77
+            else r"\\?\Volume{00000000-0000-0000-0000-000000000001}\other\temp"
+        )
+        with self.assertRaisesRegex(ValueError, "escaped"):
+            native.rename_file(41, 77, "target.conf")
+
+    def test_unsupported_extended_rename_falls_back_to_legacy_same_directory(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        observed = []
+        parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+
+        def set_information(handle, information_class, information):
+            observed.append((handle, information_class, information))
+            if len(observed) == 1:
+                raise OSError(restoration.WINDOWS_ERROR_INVALID_PARAMETER, "invalid")
+
+        native._set_file_information = set_information
+        native.final_path = lambda handle: (
+            parent if handle == 77 else parent + r"\.sentinel-temporary.tmp"
+        )
+        native.rename_file(41, 77, "target.conf")
+        self.assertEqual(
+            [item[1] for item in observed],
+            [
+                restoration.WINDOWS_FILE_RENAME_INFO_EX_CLASS,
+                restoration.WINDOWS_FILE_RENAME_INFO_CLASS,
+            ],
+        )
+        self.assertFalse(observed[1][2].RootDirectory)
+        self.assertEqual(observed[1][2].ReplaceIfExists, 1)
+        kind = type(observed[1][2])
+        encoded = ctypes.string_at(
+            ctypes.addressof(observed[1][2]) + kind.FileName.offset,
+            observed[1][2].FileNameLength,
+        )
+        self.assertEqual(encoded.decode("utf-16-le"), parent + r"\target.conf")
+
+    def test_extended_rename_rejects_an_unpinned_parent_path(self):
+        with self.assertRaisesRegex(ValueError, "pinned local volume"):
+            restoration._windows_file_rename_information_ex(
+                r"C:\safe",
+                "target.conf",
+            )
+
+    def test_non_parameter_rename_error_is_not_retried(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        observed = []
+
+        def set_information(handle, information_class, information):
+            observed.append((handle, information_class, information))
+            raise OSError(5, "denied")
+
+        native._set_file_information = set_information
+        parent = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\safe"
+        native.final_path = lambda handle: (
+            parent if handle == 77 else parent + r"\.sentinel-temporary.tmp"
+        )
+        with self.assertRaisesRegex(OSError, "denied"):
+            native.rename_file(41, 77, "target.conf")
+        self.assertEqual(len(observed), 1)
 
     def test_delete_disposition_is_passed_as_a_one_byte_boolean(self):
         observed = []
@@ -485,6 +633,23 @@ class WindowsRestorationTests(unittest.TestCase):
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_WRITE)
             self.assertFalse(event[4] & restoration.WINDOWS_FILE_SHARE_DELETE)
         self.assertEqual(native.events[-2:], [("close", 11), ("close", 10)])
+
+    def test_mutating_parent_walk_shares_write_only_on_final_directory(self):
+        native = _FakeWindowsFileOps()
+        with restoration._windows_pinned_parent(
+            Path(r"C:\safe\target.conf"),
+            native,
+            allow_target_rename=True,
+        ):
+            pass
+        opens = [event for event in native.events if event[0] == "open"]
+        self.assertEqual(opens[0][4], restoration.WINDOWS_FILE_SHARE_READ)
+        self.assertEqual(
+            opens[1][4],
+            restoration.WINDOWS_FILE_SHARE_READ
+            | restoration.WINDOWS_FILE_SHARE_WRITE,
+        )
+        self.assertFalse(opens[1][4] & restoration.WINDOWS_FILE_SHARE_DELETE)
 
     def test_parent_walk_rejects_reparse_and_closes_every_open_handle(self):
         native = _FakeWindowsFileOps(reparse_handle=11)
@@ -834,6 +999,162 @@ class WindowsRestorationTests(unittest.TestCase):
             ("rename", 90, 11, "target.conf", True),
         )
 
+    def test_conditional_snapshot_diagnostic_names_only_the_changed_field(self):
+        expected_data = b"approved bytes"
+        expected = self._expected_metadata(data=expected_data)
+        observed = {
+            "attributes": restoration.WINDOWS_FILE_ATTRIBUTE_NORMAL,
+            "size": len(expected_data),
+            "creation_ticks": expected["windows_creation_ticks"],
+            "modified_ticks": expected["windows_modified_ticks"],
+            "identity": tuple(expected["windows_file_identity"]),
+            "links": expected["windows_hard_links"],
+            "windows_security_descriptor": expected[
+                "windows_security_descriptor"
+            ],
+        }
+        self.assertIsNone(
+            restoration._windows_expected_snapshot_mismatch(
+                expected_data,
+                expected,
+                expected_data,
+                observed,
+            )
+        )
+        self.assertTrue(
+            restoration._windows_expected_snapshot_matches(
+                expected_data,
+                expected,
+                expected_data,
+                observed,
+            )
+        )
+        changed = dict(observed)
+        changed["windows_security_descriptor"] = "different-descriptor"
+        self.assertEqual(
+            restoration._windows_expected_snapshot_mismatch(
+                expected_data,
+                expected,
+                expected_data,
+                changed,
+            ),
+            "security descriptor",
+        )
+        changed = dict(observed)
+        changed["identity"] = (1, 2, 999)
+        self.assertEqual(
+            restoration._windows_expected_snapshot_mismatch(
+                expected_data,
+                expected,
+                expected_data,
+                changed,
+            ),
+            "windows_file_identity",
+        )
+
+    def test_security_descriptor_comparison_ignores_only_self_relative_layout(self):
+        expected = self._encoded_descriptor()
+        reordered = self._encoded_descriptor(reordered=True)
+        self.assertNotEqual(expected, reordered)
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                expected,
+                reordered,
+            )
+        )
+        self.assertIsNone(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                reordered,
+            )
+        )
+        defaulted = self._encoded_descriptor(
+            reordered=True,
+            control=(
+                restoration.WINDOWS_SE_SELF_RELATIVE
+                | restoration.WINDOWS_SE_DACL_PRESENT
+                | restoration.WINDOWS_SE_OWNER_DEFAULTED
+                | restoration.WINDOWS_SE_GROUP_DEFAULTED
+                | restoration.WINDOWS_SE_DACL_DEFAULTED
+                | restoration.WINDOWS_SE_SACL_DEFAULTED
+            ),
+        )
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                expected,
+                defaulted,
+            )
+        )
+        auto_inherited = self._encoded_descriptor(
+            reordered=True,
+            control=(
+                restoration.WINDOWS_SE_SELF_RELATIVE
+                | restoration.WINDOWS_SE_DACL_PRESENT
+                | restoration.WINDOWS_SE_DACL_AUTO_INHERIT_REQ
+                | restoration.WINDOWS_SE_DACL_AUTO_INHERITED
+                | restoration.WINDOWS_SE_SACL_AUTO_INHERIT_REQ
+                | restoration.WINDOWS_SE_SACL_AUTO_INHERITED
+            ),
+        )
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                expected,
+                auto_inherited,
+            )
+        )
+
+        changed_dacl = self._encoded_descriptor(reordered=True, acl_revision=4)
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                changed_dacl,
+            ),
+            "DACL revision",
+        )
+        one_ace = self._encoded_descriptor(ace_flags=0)
+        inherited_ace = self._encoded_descriptor(ace_flags=0x10)
+        changed_mask = self._encoded_descriptor(ace_flags=0, access_mask=2)
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(expected, one_ace),
+            "DACL ACE count",
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                one_ace,
+                inherited_ace,
+            ),
+            "DACL ACE flags",
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                one_ace,
+                changed_mask,
+            ),
+            "DACL ACE data",
+        )
+        changed_control = self._encoded_descriptor(
+            reordered=True,
+            control=(
+                restoration.WINDOWS_SE_SELF_RELATIVE
+                | restoration.WINDOWS_SE_DACL_PRESENT
+                | restoration.WINDOWS_SE_DACL_PROTECTED
+            ),
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                changed_control,
+            ),
+            "control",
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                "not-base64",
+            ),
+            "invalid descriptor",
+        )
+
     def test_conditional_publish_rejects_stale_native_identity_before_staging(self):
         native = _FakeWindowsFileOps()
         expected = self._expected_metadata(handle=999)
@@ -1165,40 +1486,24 @@ class WindowsRestorationTests(unittest.TestCase):
             [("delete", 91, True), ("close", 91), ("close", 11), ("close", 10)],
         )
 
-    def test_security_information_rejects_null_dacl_and_tracks_sacl_separately(self):
-        with self.assertRaisesRegex(ValueError, "no DACL"):
-            restoration._windows_restoration_security_information(
-                0, dacl_present=False, dacl_pointer=0, sacl_present=False
-            )
-        with self.assertRaisesRegex(ValueError, "NULL DACL"):
-            restoration._windows_restoration_security_information(
-                0, dacl_present=True, dacl_pointer=0, sacl_present=False
-            )
-        without_sacl = restoration._windows_restoration_security_information(
-            0, dacl_present=True, dacl_pointer=1, sacl_present=False
+    def test_backup_security_stream_contains_only_the_validated_descriptor(self):
+        descriptor = base64.b64decode(self._encoded_descriptor())
+        stream = restoration._windows_backup_security_stream(descriptor)
+        self.assertEqual(
+            int.from_bytes(stream[0:4], "little"),
+            restoration.WINDOWS_BACKUP_SECURITY_DATA,
         )
-        self.assertFalse(without_sacl & restoration.WINDOWS_SACL_SECURITY_INFORMATION)
-        self.assertFalse(
-            without_sacl
-            & (
-                restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION
-                | restoration.WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION
-            )
+        self.assertEqual(
+            int.from_bytes(stream[4:8], "little"),
+            restoration.WINDOWS_STREAM_CONTAINS_SECURITY,
         )
-        with_sacl = restoration._windows_restoration_security_information(
-            restoration.WINDOWS_SE_DACL_PROTECTED
-            | restoration.WINDOWS_SE_SACL_PROTECTED,
-            dacl_present=True,
-            dacl_pointer=1,
-            sacl_present=True,
-        )
-        self.assertTrue(with_sacl & restoration.WINDOWS_SACL_SECURITY_INFORMATION)
-        self.assertTrue(
-            with_sacl & restoration.WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
-        )
-        self.assertTrue(
-            with_sacl & restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION
-        )
+        self.assertEqual(int.from_bytes(stream[8:16], "little"), len(descriptor))
+        self.assertEqual(int.from_bytes(stream[16:20], "little"), 0)
+        self.assertEqual(stream[20:], descriptor)
+        for invalid in (b"", "not-bytes"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "outside its accepted size"):
+                    restoration._windows_backup_security_stream(invalid)
 
 if __name__ == "__main__":
     unittest.main()

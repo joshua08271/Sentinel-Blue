@@ -148,6 +148,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
             "--no-legend",
             "--no-pager",
             "--plain",
+            "--full",
         ],
         timeout=15,
     )
@@ -155,6 +156,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
         errors.append("systemctl service inventory unavailable")
         return []
     start_modes: dict[str, str] = {}
+    installed_names: list[str] = []
     try:
         unit_files = _run(
             [
@@ -164,6 +166,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 "--no-legend",
                 "--no-pager",
                 "--plain",
+                "--full",
             ],
             timeout=15,
         )
@@ -172,6 +175,9 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 fields = line.split()
                 if len(fields) >= 2:
                     start_modes[fields[0]] = fields[1]
+                    installed_names.append(fields[0])
+        else:
+            errors.append("systemctl service startup inventory unavailable")
     except (OSError, subprocess.TimeoutExpired):
         errors.append("systemctl service startup inventory unavailable")
     parsed: list[tuple[str, str, str]] = []
@@ -208,6 +214,15 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 errors.append("systemctl service failure metadata unavailable")
         except (OSError, subprocess.TimeoutExpired):
             errors.append("systemctl service failure metadata unavailable")
+    # systemd may garbage-collect a stopped static unit from list-units even
+    # while its unit file remains installed.  Preserve those identities so a
+    # baseline service cannot disappear from telemetry at the moment it stops.
+    # Do not include unloaded names in the batched `systemctl show`: some valid
+    # alias and generated unit-file entries make that command return nonzero.
+    loaded_names = {name for name, _active, _substate in parsed}
+    for name in installed_names:
+        if name not in loaded_names and len(parsed) < 2000:
+            parsed.append((name, "inactive", "dead"))
     services: list[Service] = []
     for name, active, substate in parsed:
         detail = details.get(name, {})

@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -53,12 +54,29 @@ WINDOWS_CORE_SECURITY_INFORMATION = (
 WINDOWS_SECURITY_INFORMATION = (
     WINDOWS_BACKUP_SECURITY_INFORMATION | WINDOWS_CORE_SECURITY_INFORMATION
 )
-WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
-WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
-WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
+WINDOWS_BACKUP_SECURITY_DATA = 0x00000003
+WINDOWS_STREAM_CONTAINS_SECURITY = 0x00000002
+WINDOWS_SE_OWNER_DEFAULTED = 0x0001
+WINDOWS_SE_GROUP_DEFAULTED = 0x0002
+WINDOWS_SE_DACL_PRESENT = 0x0004
+WINDOWS_SE_DACL_DEFAULTED = 0x0008
+WINDOWS_SE_SACL_PRESENT = 0x0010
+WINDOWS_SE_SACL_DEFAULTED = 0x0020
+WINDOWS_SE_DACL_AUTO_INHERIT_REQ = 0x0100
+WINDOWS_SE_SACL_AUTO_INHERIT_REQ = 0x0200
+WINDOWS_SE_DACL_AUTO_INHERITED = 0x0400
+WINDOWS_SE_SACL_AUTO_INHERITED = 0x0800
 WINDOWS_SE_DACL_PROTECTED = 0x1000
 WINDOWS_SE_SACL_PROTECTED = 0x2000
+WINDOWS_SE_RM_CONTROL_VALID = 0x4000
+WINDOWS_SE_SELF_RELATIVE = 0x8000
+WINDOWS_SEMANTIC_CONTROL_MASK = (
+    WINDOWS_SE_DACL_PRESENT
+    | WINDOWS_SE_SACL_PRESENT
+    | WINDOWS_SE_DACL_PROTECTED
+    | WINDOWS_SE_SACL_PROTECTED
+    | WINDOWS_SE_RM_CONTROL_VALID
+)
 WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
@@ -84,10 +102,16 @@ WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 WINDOWS_FILE_BASIC_INFO_CLASS = 0
 WINDOWS_FILE_RENAME_INFO_CLASS = 3
 WINDOWS_FILE_DISPOSITION_INFO_CLASS = 4
+WINDOWS_FILE_RENAME_INFO_EX_CLASS = 22
+WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001
+WINDOWS_FILE_RENAME_POSIX_SEMANTICS = 0x00000002
 WINDOWS_VOLUME_NAME_GUID = 0x00000001
 WINDOWS_ERROR_FILE_NOT_FOUND = 2
 WINDOWS_ERROR_PATH_NOT_FOUND = 3
+WINDOWS_ERROR_INVALID_FUNCTION = 1
+WINDOWS_ERROR_NOT_SUPPORTED = 50
 WINDOWS_ERROR_FILE_EXISTS = 80
+WINDOWS_ERROR_INVALID_PARAMETER = 87
 WINDOWS_ERROR_ALREADY_EXISTS = 183
 WINDOWS_TEMP_RECORD_LIMIT = 256
 WINDOWS_TEMP_RECORD_BYTES = 4096
@@ -135,21 +159,18 @@ class _WindowsFileDispositionInformation(ctypes.Structure):
     _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
 
-def _windows_file_rename_information(
-    parent_handle,
-    leaf: str,
+def _windows_rename_information(
+    root_directory,
+    file_name: str,
     *,
     replace_if_exists: bool = True,
 ):
     """Build an ABI-correct variable-length FILE_RENAME_INFO value."""
-    if (
-        not isinstance(leaf, str)
-        or not leaf
-        or leaf in {".", ".."}
-        or any(character in leaf for character in "\\/:\x00")
-    ):
-        raise ValueError("Windows restoration target has an unsafe file name")
-    encoded = leaf.encode("utf-16-le")
+    if not isinstance(file_name, str) or not file_name or "\x00" in file_name:
+        raise ValueError("Windows restoration rename path is invalid")
+    encoded = file_name.encode("utf-16-le")
+    if len(encoded) > 0xFFFFFFFF:
+        raise ValueError("Windows restoration rename path is too long")
     units = len(encoded) // 2 + 1
 
     class FileRenameInformation(ctypes.Structure):
@@ -163,12 +184,69 @@ def _windows_file_rename_information(
 
     information = FileRenameInformation()
     information.ReplaceIfExists = 1 if replace_if_exists else 0
-    information.RootDirectory = int(getattr(parent_handle, "value", parent_handle) or 0)
+    information.RootDirectory = int(
+        getattr(root_directory, "value", root_directory) or 0
+    )
     information.FileNameLength = len(encoded)
     ctypes.memmove(
         ctypes.addressof(information) + FileRenameInformation.FileName.offset,
         encoded,
         len(encoded),
+    )
+    return information
+
+
+def _windows_file_rename_information(
+    parent_handle,
+    leaf: str,
+    *,
+    replace_if_exists: bool = True,
+):
+    """Build relative FILE_RENAME_INFO bound to an already pinned directory."""
+    if (
+        not isinstance(leaf, str)
+        or not leaf
+        or leaf in {".", ".."}
+        or any(character in leaf for character in "\\/:\x00")
+    ):
+        raise ValueError("Windows restoration target has an unsafe file name")
+    return _windows_rename_information(
+        parent_handle,
+        leaf,
+        replace_if_exists=replace_if_exists,
+    )
+
+
+def _windows_file_rename_information_ex(
+    parent_path: str,
+    leaf: str,
+    *,
+    replace_if_exists: bool = True,
+):
+    """Build an absolute FileRenameInfoEx value with POSIX replacement."""
+    if (
+        not isinstance(parent_path, str)
+        or "\x00" in parent_path
+        or not parent_path.casefold().startswith("\\\\?\\volume{")
+    ):
+        raise ValueError("Windows restoration parent is not a pinned local volume path")
+    if (
+        not isinstance(leaf, str)
+        or not leaf
+        or leaf in {".", ".."}
+        or any(character in leaf for character in "\\/:\x00")
+    ):
+        raise ValueError("Windows restoration target has an unsafe file name")
+    information = _windows_rename_information(
+        0,
+        _windows_child_path(parent_path, leaf),
+        replace_if_exists=False,
+    )
+    information.Flags = (
+        WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS
+        | WINDOWS_FILE_RENAME_POSIX_SEMANTICS
+        if replace_if_exists
+        else 0
     )
     return information
 
@@ -626,15 +704,46 @@ class _WindowsNativeFileOps:
         *,
         replace_if_exists: bool = True,
     ) -> None:
-        self._set_file_information(
-            handle,
-            WINDOWS_FILE_RENAME_INFO_CLASS,
-            _windows_file_rename_information(
-                parent_handle,
-                leaf,
-                replace_if_exists=replace_if_exists,
-            ),
-        )
+        pinned_parent = self.final_path(parent_handle).rstrip("\\")
+        source_parent = ntpath.dirname(self.final_path(handle)).rstrip("\\")
+        if source_parent.casefold() != pinned_parent.casefold():
+            raise ValueError(
+                "Windows restoration temporary file escaped its pinned directory"
+            )
+        try:
+            self._set_file_information(
+                handle,
+                WINDOWS_FILE_RENAME_INFO_EX_CLASS,
+                _windows_file_rename_information_ex(
+                    pinned_parent,
+                    leaf,
+                    replace_if_exists=replace_if_exists,
+                ),
+            )
+        except OSError as exc:
+            error = getattr(exc, "winerror", None)
+            if error is None:
+                error = exc.errno
+            if error not in {
+                WINDOWS_ERROR_INVALID_FUNCTION,
+                WINDOWS_ERROR_NOT_SUPPORTED,
+                WINDOWS_ERROR_INVALID_PARAMETER,
+            }:
+                raise
+            # FileRenameInfoEx is the race-safe path because the verified target
+            # handles deliberately remain open with FILE_SHARE_DELETE. Older
+            # filesystems may reject the information class; the legacy fallback
+            # remains same-directory and fails closed if an open target cannot be
+            # replaced.
+            self._set_file_information(
+                handle,
+                WINDOWS_FILE_RENAME_INFO_CLASS,
+                _windows_rename_information(
+                    0,
+                    _windows_child_path(pinned_parent, leaf),
+                    replace_if_exists=replace_if_exists,
+                ),
+            )
 
     def close(self, handle) -> None:
         if not self._close_handle(handle):
@@ -646,25 +755,36 @@ def _windows_child_path(parent_path: str, leaf: str) -> str:
 
 
 @contextmanager
-def _windows_pinned_parent(path: Path, native: _WindowsNativeFileOps):
+def _windows_pinned_parent(
+    path: Path,
+    native: _WindowsNativeFileOps,
+    *,
+    allow_target_rename: bool = False,
+):
     """Hold a non-reparse handle for every ancestor until the mutation completes."""
     root, components, leaf = _windows_path_components(path)
     handles: list[Any] = []
     try:
         candidate = root
-        for component in [None, *components]:
+        walk = [None, *components]
+        for index, component in enumerate(walk):
             if component is not None:
                 candidate = _windows_child_path(candidate, component)
+            share_mode = WINDOWS_FILE_SHARE_READ
+            if allow_target_rename and index == len(walk) - 1:
+                # SetFileInformationByHandle opens the absolute target's final
+                # directory for FILE_WRITE_DATA. Let that kernel-internal open
+                # coexist with this identity-pinning handle, while continuing
+                # to withhold FILE_SHARE_DELETE so the directory itself cannot
+                # be renamed or removed during publication.
+                share_mode |= WINDOWS_FILE_SHARE_WRITE
             handle = native.open_file(
                 candidate,
                 WINDOWS_FILE_LIST_DIRECTORY
                 | WINDOWS_FILE_TRAVERSE
                 | WINDOWS_FILE_READ_ATTRIBUTES
                 | WINDOWS_SYNCHRONIZE,
-                # Withhold FILE_SHARE_WRITE and FILE_SHARE_DELETE. Child-file
-                # creation does not need either share on the directory object;
-                # excluding them pins the name and blocks reparse mutation.
-                WINDOWS_FILE_SHARE_READ,
+                share_mode,
                 WINDOWS_OPEN_EXISTING,
                 WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
                 | WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
@@ -837,33 +957,204 @@ def _windows_read_file_snapshot_if_present(
         raise
 
 
-def _windows_expected_snapshot_matches(
+def _windows_security_descriptor_semantics(
+    encoded_descriptor: str,
+) -> tuple[Any, ...]:
+    """Decode the security-bearing components of a self-relative descriptor.
+
+    GetSecurityInfo is free to lay out an equivalent self-relative descriptor at
+    different offsets.  Offset and gap bytes therefore cannot be used as an ACL
+    equality test; component bytes, descriptor control, and component presence can.
+    """
+    if (
+        not isinstance(encoded_descriptor, str)
+        or not encoded_descriptor
+        or len(encoded_descriptor) > MAX_WINDOWS_SECURITY_DESCRIPTOR_TEXT
+        or "\x00" in encoded_descriptor
+    ):
+        raise ValueError("Windows security descriptor metadata is invalid")
+    try:
+        raw = base64.b64decode(encoded_descriptor.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("Windows security descriptor metadata is invalid") from exc
+    if not 20 <= len(raw) <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES:
+        raise ValueError("Windows security descriptor metadata is invalid")
+
+    revision = raw[0]
+    resource_manager_control = raw[1]
+    control = int.from_bytes(raw[2:4], "little")
+    if revision != 1 or not control & WINDOWS_SE_SELF_RELATIVE:
+        raise ValueError("Windows security descriptor metadata is invalid")
+    owner_offset = int.from_bytes(raw[4:8], "little")
+    group_offset = int.from_bytes(raw[8:12], "little")
+    sacl_offset = int.from_bytes(raw[12:16], "little")
+    dacl_offset = int.from_bytes(raw[16:20], "little")
+
+    def sid(offset: int) -> bytes:
+        if offset == 0:
+            return b""
+        if offset < 20 or offset + 8 > len(raw):
+            raise ValueError("Windows security descriptor SID is invalid")
+        length = 8 + 4 * raw[offset + 1]
+        if offset + length > len(raw):
+            raise ValueError("Windows security descriptor SID is invalid")
+        return raw[offset : offset + length]
+
+    def acl(offset: int) -> tuple[int, tuple[tuple[int, int, bytes], ...]] | None:
+        if offset == 0:
+            return None
+        if offset < 20 or offset + 8 > len(raw):
+            raise ValueError("Windows security descriptor ACL is invalid")
+        length = int.from_bytes(raw[offset + 2 : offset + 4], "little")
+        if length < 8 or offset + length > len(raw):
+            raise ValueError("Windows security descriptor ACL is invalid")
+        ace_count = int.from_bytes(raw[offset + 4 : offset + 6], "little")
+        position = offset + 8
+        end = offset + length
+        aces: list[tuple[int, int, bytes]] = []
+        for _index in range(ace_count):
+            if position + 4 > end:
+                raise ValueError("Windows security descriptor ACE is invalid")
+            ace_length = int.from_bytes(raw[position + 2 : position + 4], "little")
+            if ace_length < 4 or position + ace_length > end:
+                raise ValueError("Windows security descriptor ACE is invalid")
+            aces.append(
+                (
+                    raw[position],
+                    raw[position + 1],
+                    raw[position + 4 : position + ace_length],
+                )
+            )
+            position += ace_length
+        return raw[offset], tuple(aces)
+
+    # OWNER/GROUP/DACL/SACL_DEFAULTED describe how Windows obtained a
+    # component, not what access it grants. They are also intentionally absent
+    # from the portable SDDL representation. SetSecurityInfo necessarily turns
+    # a restored defaulted component into an explicit one. AUTO_INHERIT flags
+    # describe or request propagation to child objects; this module accepts only
+    # regular-file targets, which cannot have children, and SetSecurityInfo does
+    # not preserve those status flags. Exact ACL bytes still bind every ACE and
+    # its inherited-ACE flags. Compare the presence, protection, and
+    # resource-manager control flags that remain security-bearing for a file.
+    semantic_control = control & WINDOWS_SEMANTIC_CONTROL_MASK
+    semantic_resource_manager_control = (
+        resource_manager_control
+        if semantic_control & WINDOWS_SE_RM_CONTROL_VALID
+        else 0
+    )
+    return (
+        revision,
+        semantic_resource_manager_control,
+        semantic_control,
+        sid(owner_offset),
+        sid(group_offset),
+        acl(sacl_offset),
+        acl(dacl_offset),
+    )
+
+
+def _windows_security_descriptor_mismatch(
+    expected: str,
+    observed: str,
+) -> str | None:
+    """Name an ACL component mismatch without disclosing descriptor material."""
+    if not isinstance(expected, str) or not isinstance(observed, str):
+        return "invalid descriptor"
+    if hmac.compare_digest(expected, observed):
+        return None
+    try:
+        expected_parts = _windows_security_descriptor_semantics(expected)
+        observed_parts = _windows_security_descriptor_semantics(observed)
+    except ValueError:
+        return "invalid descriptor"
+    labels = (
+        "revision",
+        "resource manager control",
+        "control",
+        "owner",
+        "group",
+        "SACL",
+        "DACL",
+    )
+    for label, expected_part, observed_part in zip(
+        labels,
+        expected_parts,
+        observed_parts,
+        strict=True,
+    ):
+        if expected_part == observed_part:
+            continue
+        if label in {"SACL", "DACL"}:
+            return _windows_acl_mismatch(label, expected_part, observed_part)
+        return label
+    return None
+
+
+def _windows_acl_mismatch(label: str, expected: Any, observed: Any) -> str:
+    """Classify an ACL difference without logging any SID or access mask."""
+    if expected is None or observed is None:
+        return f"{label} presence"
+    if (
+        not isinstance(expected, tuple)
+        or len(expected) != 2
+        or not isinstance(observed, tuple)
+        or len(observed) != 2
+    ):
+        return f"{label} invalid"
+    if expected[0] != observed[0]:
+        return f"{label} revision"
+    expected_aces = expected[1]
+    observed_aces = observed[1]
+    if len(expected_aces) != len(observed_aces):
+        return f"{label} ACE count"
+    if sorted(expected_aces) == sorted(observed_aces):
+        return f"{label} ACE order"
+    for expected_ace, observed_ace in zip(
+        expected_aces,
+        observed_aces,
+        strict=True,
+    ):
+        if expected_ace[0] != observed_ace[0]:
+            return f"{label} ACE type"
+        if expected_ace[1] != observed_ace[1]:
+            return f"{label} ACE flags"
+        if expected_ace[2] != observed_ace[2]:
+            return f"{label} ACE data"
+    return f"{label} encoding"
+
+
+def _windows_security_descriptors_equivalent(expected: str, observed: str) -> bool:
+    return _windows_security_descriptor_mismatch(expected, observed) is None
+
+
+def _windows_expected_snapshot_mismatch(
     expected_data: bytes,
     expected_metadata: dict[str, Any],
     observed_data: bytes,
     observed: dict[str, Any],
-) -> bool:
-    """Bind a conditional mutation to the bytes, ACL, and native file identity read earlier."""
+) -> str | None:
+    """Name the first changed field without disclosing protected data."""
     if not isinstance(expected_data, bytes) or not isinstance(expected_metadata, dict):
-        return False
+        return "invalid expected snapshot"
     expected_descriptor = expected_metadata.get("windows_security_descriptor")
     try:
         expected_mode = int(expected_metadata.get("mode", 0))
     except (TypeError, ValueError):
-        return False
+        return "invalid expected mode"
     observed_mode = (
         0o444
         if int(observed["attributes"]) & WINDOWS_FILE_ATTRIBUTE_READONLY
         else 0o666
     )
-    if (
-        observed_data != expected_data
-        or expected_mode != observed_mode
-        or not isinstance(expected_descriptor, str)
-        or not expected_descriptor
-        or observed.get("windows_security_descriptor") != expected_descriptor
-    ):
-        return False
+    if observed_data != expected_data:
+        return "content"
+    if expected_mode != observed_mode:
+        return "mode"
+    if not isinstance(expected_descriptor, str) or not expected_descriptor:
+        return "missing expected security descriptor"
+    if observed.get("windows_security_descriptor") != expected_descriptor:
+        return "security descriptor"
     exact_fields = {
         "windows_file_identity": "identity",
         "windows_creation_ticks": "creation_ticks",
@@ -882,12 +1173,30 @@ def _windows_expected_snapshot_matches(
                 expected_value = tuple(int(value) for value in expected_value)
                 observed_value = tuple(int(value) for value in observed_value)
             except (TypeError, ValueError):
-                return False
+                return f"invalid {metadata_name}"
         elif isinstance(expected_value, bool) or not isinstance(expected_value, int):
-            return False
+            return f"invalid {metadata_name}"
         if expected_value != observed_value:
-            return False
-    return True
+            return metadata_name
+    return None
+
+
+def _windows_expected_snapshot_matches(
+    expected_data: bytes,
+    expected_metadata: dict[str, Any],
+    observed_data: bytes,
+    observed: dict[str, Any],
+) -> bool:
+    """Bind a conditional mutation to bytes, ACL, and native file identity."""
+    return (
+        _windows_expected_snapshot_mismatch(
+            expected_data,
+            expected_metadata,
+            observed_data,
+            observed,
+        )
+        is None
+    )
 
 
 def _windows_atomic_write(
@@ -916,7 +1225,11 @@ def _windows_atomic_write(
         else nullcontext()
     )
     with privilege_scope:
-        with _windows_pinned_parent(destination, native) as (
+        with _windows_pinned_parent(
+            destination,
+            native,
+            allow_target_rename=True,
+        ) as (
             parent_handle,
             parent_path,
             leaf,
@@ -963,15 +1276,16 @@ def _windows_atomic_write(
                             allow_security_failure=False,
                             native=native,
                         )
-                        if not _windows_expected_snapshot_matches(
+                        mismatch = _windows_expected_snapshot_mismatch(
                             expected_data,
                             expected_metadata,
                             observed_data,
                             observed_snapshot,
-                        ):
+                        )
+                        if mismatch is not None:
                             raise ValueError(
                                 "Windows restoration target changed before publish; "
-                                "refusing to overwrite newer data"
+                                f"refusing to overwrite newer data ({mismatch})"
                             )
                     else:
                         # FILE_RENAME_INFO with ReplaceIfExists=false is the
@@ -1032,9 +1346,14 @@ def _windows_atomic_write(
                         destination,
                         native_handle=handle,
                     )
-                    if observed != encoded_descriptor:
+                    descriptor_mismatch = _windows_security_descriptor_mismatch(
+                        encoded_descriptor,
+                        observed,
+                    )
+                    if descriptor_mismatch is not None:
                         raise OSError(
-                            "post-restoration Windows security descriptor did not match"
+                            "post-restoration Windows security descriptor did not match "
+                            f"({descriptor_mismatch})"
                         )
                 if temp_registry is not None:
                     ownership_record = temp_registry.register(
@@ -1075,15 +1394,16 @@ def _windows_atomic_write(
                     )
                     assert expected_data is not None
                     assert expected_metadata is not None
-                    if not _windows_expected_snapshot_matches(
+                    mismatch = _windows_expected_snapshot_mismatch(
                         expected_data,
                         expected_metadata,
                         verification_data,
                         verification_snapshot,
-                    ):
+                    )
+                    if mismatch is not None:
                         raise ValueError(
                             "Windows restoration target name changed before publish; "
-                            "refusing to overwrite newer data"
+                            f"refusing to overwrite newer data ({mismatch})"
                         )
                 # Clearing delete-on-close and publishing cannot be one Win32 call. A
                 # durable authenticated ownership record is established first, so a
@@ -1232,15 +1552,16 @@ def _windows_unlink(
                         allow_security_failure=False,
                         native=native,
                     )
-                    if not _windows_expected_snapshot_matches(
+                    mismatch = _windows_expected_snapshot_mismatch(
                         expected_data,
                         expected_metadata,
                         observed_data,
                         observed_snapshot,
-                    ):
+                    )
+                    if mismatch is not None:
                         raise ValueError(
                             "Windows restoration target changed before removal; "
-                            "refusing to delete newer data"
+                            f"refusing to delete newer data ({mismatch})"
                         )
                 native.set_delete_disposition(handle, True)
             finally:
@@ -1851,43 +2172,22 @@ def _capture_windows_security_descriptor(
             local_free(descriptor)
 
 
-def _windows_restoration_security_information(
-    control: int,
-    *,
-    dacl_present: bool,
-    dacl_pointer: int,
-    sacl_present: bool,
-) -> int:
-    """Select safe SetSecurityInfo fields without ever publishing a NULL DACL."""
-    if not dacl_present:
-        raise ValueError(
-            "Windows security descriptor has no DACL; refusing NULL-DACL restoration"
-        )
-    if not dacl_pointer:
-        raise ValueError(
-            "Windows security descriptor has a NULL DACL; refusing unrestricted restoration"
-        )
-    # Set only components that are actually present. An absent SACL is tracked
-    # independently and intentionally left absent; same-handle recapture verifies
-    # that the final descriptor still matches the approved binary descriptor.
-    security_information = (
-        WINDOWS_OWNER_SECURITY_INFORMATION
-        | WINDOWS_GROUP_SECURITY_INFORMATION
-        | WINDOWS_DACL_SECURITY_INFORMATION
-    )
-    security_information |= (
-        WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
-        if control & WINDOWS_SE_DACL_PROTECTED
-        else WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION
-    )
-    if sacl_present:
-        security_information |= WINDOWS_SACL_SECURITY_INFORMATION
-        security_information |= (
-            WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION
-            if control & WINDOWS_SE_SACL_PROTECTED
-            else WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION
-        )
-    return security_information
+def _windows_backup_security_stream(raw_descriptor: bytes) -> bytes:
+    """Frame one validated descriptor as a BackupWrite security-only stream."""
+    if (
+        not isinstance(raw_descriptor, bytes)
+        or not 1 <= len(raw_descriptor) <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES
+    ):
+        raise ValueError("Windows file security descriptor is outside its accepted size")
+    # WIN32_STREAM_ID through (but not including) cStreamName is exactly
+    # DWORD, DWORD, LARGE_INTEGER, DWORD. No name follows this header.
+    return struct.pack(
+        "<IIqI",
+        WINDOWS_BACKUP_SECURITY_DATA,
+        WINDOWS_STREAM_CONTAINS_SECURITY,
+        len(raw_descriptor),
+        0,
+    ) + raw_descriptor
 
 
 def _restore_windows_security_descriptor(
@@ -1980,45 +2280,35 @@ def _restore_windows_security_descriptor(
             raise OSError(
                 ctypes.get_last_error(), "Windows security descriptor component is invalid"
             )
-    get_control = advapi32.GetSecurityDescriptorControl
-    get_control.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.WORD),
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    get_control.restype = wintypes.BOOL
-    control = wintypes.WORD()
-    revision = wintypes.DWORD()
-    if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
-        raise OSError(
-            ctypes.get_last_error(), "Windows security descriptor protection state is invalid"
+    if not dacl_present.value:
+        raise ValueError(
+            "Windows security descriptor has no DACL; refusing NULL-DACL restoration"
         )
-    security_information = _windows_restoration_security_information(
-        int(control.value),
-        dacl_present=bool(dacl_present.value),
-        dacl_pointer=int(dacl.value or 0),
-        sacl_present=bool(sacl_present.value),
-    )
-    set_security = advapi32.SetSecurityInfo
-    set_security.argtypes = [
+    if not dacl.value:
+        raise ValueError(
+            "Windows security descriptor has a NULL DACL; refusing unrestricted restoration"
+        )
+
+    backup_stream = _windows_backup_security_stream(raw_descriptor)
+    backup_buffer = ctypes.create_string_buffer(backup_stream, len(backup_stream))
+    backup_write = kernel32.BackupWrite
+    backup_write.argtypes = [
         wintypes.HANDLE,
+        ctypes.c_void_p,
         wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.BOOL,
+        wintypes.BOOL,
+        ctypes.POINTER(ctypes.c_void_p),
     ]
-    set_security.restype = wintypes.DWORD
+    backup_write.restype = wintypes.BOOL
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = [wintypes.HANDLE]
     close_handle.restype = wintypes.BOOL
     handle = native_handle
     owns_handle = native_handle is None
     try:
-        privilege_names = ["SeRestorePrivilege"]
-        if sacl_present.value:
-            privilege_names.append("SeSecurityPrivilege")
+        privilege_names = ["SeRestorePrivilege", "SeSecurityPrivilege"]
         privilege_scope = (
             _windows_privileges(*privilege_names) if owns_handle else nullcontext()
         )
@@ -2028,25 +2318,54 @@ def _restore_windows_security_descriptor(
                     WINDOWS_WRITE_DAC
                     | WINDOWS_WRITE_OWNER
                     | WINDOWS_FILE_READ_ATTRIBUTES
+                    | WINDOWS_ACCESS_SYSTEM_SECURITY
                 )
-                if sacl_present.value:
-                    desired_access |= WINDOWS_ACCESS_SYSTEM_SECURITY
                 handle = _windows_open_security_handle(
                     path,
                     desired_access,
                     file_descriptor,
                 )
-            code = set_security(
-                handle,
-                1,
-                security_information,
-                owner,
-                group,
-                dacl,
-                sacl,
-            )
-        if code != 0:
-            raise OSError(int(code), "Windows file security descriptor could not be restored")
+            bytes_written = wintypes.DWORD()
+            context = ctypes.c_void_p()
+            write_completed = False
+            write_attempted = False
+            try:
+                write_attempted = True
+                if not backup_write(
+                    handle,
+                    ctypes.cast(backup_buffer, ctypes.c_void_p),
+                    len(backup_stream),
+                    ctypes.byref(bytes_written),
+                    False,
+                    True,
+                    ctypes.byref(context),
+                ):
+                    raise OSError(
+                        ctypes.get_last_error(),
+                        "Windows file security descriptor could not be restored",
+                    )
+                if int(bytes_written.value) != len(backup_stream):
+                    raise OSError(
+                        "Windows file security descriptor restore was incomplete"
+                    )
+                write_completed = True
+            finally:
+                if write_attempted:
+                    abort_written = wintypes.DWORD()
+                    abort_ok = backup_write(
+                        handle,
+                        None,
+                        0,
+                        ctypes.byref(abort_written),
+                        True,
+                        True,
+                        ctypes.byref(context),
+                    )
+                    if write_completed and not abort_ok:
+                        raise OSError(
+                            ctypes.get_last_error(),
+                            "Windows security restore context could not be released",
+                        )
     finally:
         if owns_handle and handle is not None:
             close_handle(handle)
@@ -2375,13 +2694,23 @@ class RestorePointStore:
             }
         except Exception:
             try:
-                self._restore_before_verified(
-                    path,
-                    existed,
-                    before,
-                    before_meta,
-                    expected_current=restored_expected,
-                )
+                current_target = self._read_target_if_present(path)
+                if existed:
+                    original_unchanged = bool(
+                        current_target is not None
+                        and current_target[0] == before
+                        and self._metadata_matches(before_meta, current_target[1])
+                    )
+                else:
+                    original_unchanged = current_target is None
+                if not original_unchanged:
+                    self._restore_before_verified(
+                        path,
+                        existed,
+                        before,
+                        before_meta,
+                        expected_current=restored_expected,
+                    )
                 transaction["rolled_back"] = True
                 transaction["status"] = "rolled_back"
                 self._write_json(self.transactions / f"{transaction_id}.json", transaction)
@@ -3074,8 +3403,10 @@ class RestorePointStore:
                 and observed.get("windows_security_descriptor_version")
                 == WINDOWS_SECURITY_DESCRIPTOR_VERSION
                 and int(expected.get("mode", 0)) == int(observed.get("mode", -1))
-                and expected_descriptor
-                == observed.get("windows_security_descriptor")
+                and _windows_security_descriptors_equivalent(
+                    expected_descriptor,
+                    observed.get("windows_security_descriptor"),
+                )
             )
         return cls._metadata_snapshot(expected) == cls._metadata_snapshot(observed)
 

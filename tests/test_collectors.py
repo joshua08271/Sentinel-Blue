@@ -210,8 +210,12 @@ class CollectorTests(unittest.TestCase):
             "Id=web.service\nActiveState=active\nSubState=running\nUnitFileState=enabled\nNRestarts=2\nResult=success\nExecMainStatus=0\n\n",
             "",
         )
-        with patch("sentinel_blue.collectors._run", side_effect=[units, files, details]):
+        with patch(
+            "sentinel_blue.collectors._run", side_effect=[units, files, details]
+        ) as runner:
             services = _linux_services([])
+        self.assertIn("--full", runner.call_args_list[0].args[0])
+        self.assertIn("--full", runner.call_args_list[1].args[0])
         self.assertEqual(services[0].state, "running")
         self.assertEqual(services[0].start_mode, "enabled")
         self.assertEqual(services[0].restart_count, 2)
@@ -234,6 +238,22 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(service.start_mode, "unknown")
         self.assertEqual(service.substate, "dead")
         self.assertEqual(service.result, "success")
+
+    def test_linux_stopped_unloaded_unit_file_remains_in_inventory(self):
+        units = CompletedProcess([], 0, "", "")
+        files = CompletedProcess(
+            [], 0, "sentinel-example.service static -\n", ""
+        )
+        with patch(
+            "sentinel_blue.collectors._run", side_effect=[units, files]
+        ) as runner:
+            services = _linux_services([])
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(len(services), 1)
+        self.assertEqual(services[0].name, "sentinel-example.service")
+        self.assertEqual(services[0].state, "inactive")
+        self.assertEqual(services[0].substate, "dead")
+        self.assertEqual(services[0].start_mode, "static")
 
     def test_firewall_packet_counters_do_not_change_rules_fingerprint(self):
         first = "ip saddr 198.51.100.1 counter packets 2 bytes 100 accept"

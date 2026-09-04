@@ -1683,6 +1683,34 @@ class ControllerApp:
                 selected.append(dict(spec))
         return selected
 
+    def service_recovery_probes(
+        self, agent_id: str, service_id: str
+    ) -> list[dict[str, Any]]:
+        """Return exact manifest transactions for one service recovery.
+
+        A service manager's ``running`` state is not enough to prove that the
+        application transaction recovered. Confirmed manifests define the
+        probes a manually approved restart must pass. An absent or ambiguous
+        mapping returns no probes so the existing manifest policy can reject
+        the restart instead of guessing.
+        """
+
+        if not self.event_profile.services_confirmed:
+            return []
+        matches = [
+            service
+            for service in self.event_profile.services
+            if service.get("host") == agent_id
+            and service.get("service_id") == service_id
+        ]
+        if len(matches) != 1:
+            return []
+        return [
+            dict(probe)
+            for probe in matches[0].get("expected_transactions", [])
+            if isinstance(probe, dict)
+        ]
+
     def dashboard(self) -> dict[str, Any]:
         payload = self.store.dashboard(self.health_stale_after)
         agent_by_id = {
@@ -2368,6 +2396,10 @@ class ControllerApp:
                 if action_type in PROCESS_SIGNAL_ACTIONS
                 else dict(evidence)
             )
+            if action_type == "restart_service" and "probes" not in parameters:
+                parameters["probes"] = self.service_recovery_probes(
+                    str(row["agent_id"]), str(parameters.get("service", ""))
+                )
             action_id = self._queue_action(
                 row["agent_id"], action_type, parameters, alert_id,
                 authorization_code=authorization_code,
