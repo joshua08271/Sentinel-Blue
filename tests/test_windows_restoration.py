@@ -242,9 +242,27 @@ class WindowsRestorationTests(unittest.TestCase):
         reordered: bool = False,
         control: int | None = None,
         acl_revision: int = 2,
+        ace_flags: int | None = None,
+        access_mask: int = 1,
     ) -> str:
         sid = b"\x01\x01\x00\x00\x00\x00\x00\x05\x12\x00\x00\x00"
-        dacl = bytes((acl_revision, 0, 8, 0, 0, 0, 0, 0))
+        ace = (
+            b""
+            if ace_flags is None
+            else (
+                bytes((0, ace_flags))
+                + (8 + len(sid)).to_bytes(2, "little")
+                + access_mask.to_bytes(4, "little")
+                + sid
+            )
+        )
+        dacl = (
+            bytes((acl_revision, 0))
+            + (8 + len(ace)).to_bytes(2, "little")
+            + (1 if ace else 0).to_bytes(2, "little")
+            + b"\x00\x00"
+            + ace
+        )
         descriptor_control = (
             restoration.WINDOWS_SE_SELF_RELATIVE
             | restoration.WINDOWS_SE_DACL_PRESENT
@@ -1091,7 +1109,28 @@ class WindowsRestorationTests(unittest.TestCase):
                 expected,
                 changed_dacl,
             ),
-            "DACL",
+            "DACL revision",
+        )
+        one_ace = self._encoded_descriptor(ace_flags=0)
+        inherited_ace = self._encoded_descriptor(ace_flags=0x10)
+        changed_mask = self._encoded_descriptor(ace_flags=0, access_mask=2)
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(expected, one_ace),
+            "DACL ACE count",
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                one_ace,
+                inherited_ace,
+            ),
+            "DACL ACE flags",
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                one_ace,
+                changed_mask,
+            ),
+            "DACL ACE data",
         )
         changed_control = self._encoded_descriptor(
             reordered=True,

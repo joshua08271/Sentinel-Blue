@@ -960,7 +960,7 @@ def _windows_read_file_snapshot_if_present(
 
 def _windows_security_descriptor_semantics(
     encoded_descriptor: str,
-) -> tuple[int, int, int, bytes, bytes, bytes, bytes]:
+) -> tuple[Any, ...]:
     """Decode the security-bearing components of a self-relative descriptor.
 
     GetSecurityInfo is free to lay out an equivalent self-relative descriptor at
@@ -1001,9 +1001,9 @@ def _windows_security_descriptor_semantics(
             raise ValueError("Windows security descriptor SID is invalid")
         return raw[offset : offset + length]
 
-    def acl(offset: int) -> bytes:
+    def acl(offset: int) -> tuple[int, tuple[tuple[int, int, bytes], ...]] | None:
         if offset == 0:
-            return b""
+            return None
         if offset < 20 or offset + 8 > len(raw):
             raise ValueError("Windows security descriptor ACL is invalid")
         length = int.from_bytes(raw[offset + 2 : offset + 4], "little")
@@ -1012,14 +1012,22 @@ def _windows_security_descriptor_semantics(
         ace_count = int.from_bytes(raw[offset + 4 : offset + 6], "little")
         position = offset + 8
         end = offset + length
+        aces: list[tuple[int, int, bytes]] = []
         for _index in range(ace_count):
             if position + 4 > end:
                 raise ValueError("Windows security descriptor ACE is invalid")
             ace_length = int.from_bytes(raw[position + 2 : position + 4], "little")
             if ace_length < 4 or position + ace_length > end:
                 raise ValueError("Windows security descriptor ACE is invalid")
+            aces.append(
+                (
+                    raw[position],
+                    raw[position + 1],
+                    raw[position + 4 : position + ace_length],
+                )
+            )
             position += ace_length
-        return raw[offset:end]
+        return raw[offset], tuple(aces)
 
     # OWNER/GROUP/DACL/SACL_DEFAULTED describe how Windows obtained a
     # component, not what access it grants. They are also intentionally absent
@@ -1076,9 +1084,45 @@ def _windows_security_descriptor_mismatch(
         observed_parts,
         strict=True,
     ):
-        if expected_part != observed_part:
-            return label
+        if expected_part == observed_part:
+            continue
+        if label in {"SACL", "DACL"}:
+            return _windows_acl_mismatch(label, expected_part, observed_part)
+        return label
     return None
+
+
+def _windows_acl_mismatch(label: str, expected: Any, observed: Any) -> str:
+    """Classify an ACL difference without logging any SID or access mask."""
+    if expected is None or observed is None:
+        return f"{label} presence"
+    if (
+        not isinstance(expected, tuple)
+        or len(expected) != 2
+        or not isinstance(observed, tuple)
+        or len(observed) != 2
+    ):
+        return f"{label} invalid"
+    if expected[0] != observed[0]:
+        return f"{label} revision"
+    expected_aces = expected[1]
+    observed_aces = observed[1]
+    if len(expected_aces) != len(observed_aces):
+        return f"{label} ACE count"
+    if sorted(expected_aces) == sorted(observed_aces):
+        return f"{label} ACE order"
+    for expected_ace, observed_ace in zip(
+        expected_aces,
+        observed_aces,
+        strict=True,
+    ):
+        if expected_ace[0] != observed_ace[0]:
+            return f"{label} ACE type"
+        if expected_ace[1] != observed_ace[1]:
+            return f"{label} ACE flags"
+        if expected_ace[2] != observed_ace[2]:
+            return f"{label} ACE data"
+    return f"{label} encoding"
 
 
 def _windows_security_descriptors_equivalent(expected: str, observed: str) -> bool:
