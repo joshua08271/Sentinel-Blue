@@ -2193,7 +2193,8 @@ def _windows_restoration_security_information(
     # independently and intentionally left absent; same-handle recapture verifies
     # that the final descriptor still matches the approved binary descriptor.
     security_information = (
-        WINDOWS_OWNER_SECURITY_INFORMATION
+        WINDOWS_BACKUP_SECURITY_INFORMATION
+        | WINDOWS_OWNER_SECURITY_INFORMATION
         | WINDOWS_GROUP_SECURITY_INFORMATION
         | WINDOWS_DACL_SECURITY_INFORMATION
     )
@@ -2338,9 +2339,11 @@ def _restore_windows_security_descriptor(
     handle = native_handle
     owns_handle = native_handle is None
     try:
-        privilege_names = ["SeRestorePrivilege"]
-        if sacl_present.value:
-            privilege_names.append("SeSecurityPrivilege")
+        # BACKUP_SECURITY_INFORMATION is the documented backup/restore mode for
+        # preserving the complete descriptor. It requires ACCESS_SYSTEM_SECURITY
+        # even when the captured descriptor has no SACL, so keep the privilege and
+        # handle right consistent in both cases.
+        privilege_names = ["SeRestorePrivilege", "SeSecurityPrivilege"]
         privilege_scope = (
             _windows_privileges(*privilege_names) if owns_handle else nullcontext()
         )
@@ -2350,9 +2353,8 @@ def _restore_windows_security_descriptor(
                     WINDOWS_WRITE_DAC
                     | WINDOWS_WRITE_OWNER
                     | WINDOWS_FILE_READ_ATTRIBUTES
+                    | WINDOWS_ACCESS_SYSTEM_SECURITY
                 )
-                if sacl_present.value:
-                    desired_access |= WINDOWS_ACCESS_SYSTEM_SECURITY
                 handle = _windows_open_security_handle(
                     path,
                     desired_access,

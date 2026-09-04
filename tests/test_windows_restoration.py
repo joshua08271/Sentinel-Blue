@@ -1498,6 +1498,9 @@ class WindowsRestorationTests(unittest.TestCase):
         without_sacl = restoration._windows_restoration_security_information(
             0, dacl_present=True, dacl_pointer=1, sacl_present=False
         )
+        self.assertTrue(
+            without_sacl & restoration.WINDOWS_BACKUP_SECURITY_INFORMATION
+        )
         self.assertFalse(without_sacl & restoration.WINDOWS_SACL_SECURITY_INFORMATION)
         self.assertFalse(
             without_sacl
