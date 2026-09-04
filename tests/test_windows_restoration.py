@@ -1,3 +1,4 @@
+import base64
 import ctypes
 import hashlib
 import json
@@ -234,6 +235,37 @@ class WindowsRestorationTests(unittest.TestCase):
             ),
             patch.object(ctypes, "set_last_error", create=True, side_effect=api.set_last_error),
         )
+
+    @staticmethod
+    def _encoded_descriptor(
+        *,
+        reordered: bool = False,
+        control: int | None = None,
+        acl_revision: int = 2,
+    ) -> str:
+        sid = b"\x01\x01\x00\x00\x00\x00\x00\x05\x12\x00\x00\x00"
+        dacl = bytes((acl_revision, 0, 8, 0, 0, 0, 0, 0))
+        descriptor_control = (
+            restoration.WINDOWS_SE_SELF_RELATIVE
+            | restoration.WINDOWS_SE_DACL_PRESENT
+            if control is None
+            else control
+        )
+        if reordered:
+            raw = bytearray(64)
+            owner_offset, group_offset, dacl_offset = 52, 36, 24
+        else:
+            raw = bytearray(52)
+            owner_offset, group_offset, dacl_offset = 20, 32, 44
+        raw[0] = 1
+        raw[2:4] = descriptor_control.to_bytes(2, "little")
+        raw[4:8] = owner_offset.to_bytes(4, "little")
+        raw[8:12] = group_offset.to_bytes(4, "little")
+        raw[16:20] = dacl_offset.to_bytes(4, "little")
+        raw[owner_offset : owner_offset + len(sid)] = sid
+        raw[group_offset : group_offset + len(sid)] = sid
+        raw[dacl_offset : dacl_offset + len(dacl)] = dacl
+        return base64.b64encode(raw).decode("ascii")
 
     def test_privilege_scope_uses_disposable_thread_token(self):
         api = _TokenApis()
@@ -1000,6 +1032,54 @@ class WindowsRestorationTests(unittest.TestCase):
                 changed,
             ),
             "windows_file_identity",
+        )
+
+    def test_security_descriptor_comparison_ignores_only_self_relative_layout(self):
+        expected = self._encoded_descriptor()
+        reordered = self._encoded_descriptor(reordered=True)
+        self.assertNotEqual(expected, reordered)
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                expected,
+                reordered,
+            )
+        )
+        self.assertIsNone(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                reordered,
+            )
+        )
+
+        changed_dacl = self._encoded_descriptor(reordered=True, acl_revision=4)
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                changed_dacl,
+            ),
+            "DACL",
+        )
+        changed_control = self._encoded_descriptor(
+            reordered=True,
+            control=(
+                restoration.WINDOWS_SE_SELF_RELATIVE
+                | restoration.WINDOWS_SE_DACL_PRESENT
+                | restoration.WINDOWS_SE_DACL_PROTECTED
+            ),
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                changed_control,
+            ),
+            "control",
+        )
+        self.assertEqual(
+            restoration._windows_security_descriptor_mismatch(
+                expected,
+                "not-base64",
+            ),
+            "invalid descriptor",
         )
 
     def test_conditional_publish_rejects_stale_native_identity_before_staging(self):

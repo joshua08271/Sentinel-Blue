@@ -759,6 +759,50 @@ class ActionTests(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertEqual(target.read_text(encoding="utf-8"), "prechange")
 
+    def test_prepublish_failure_preserves_original_error_without_rewriting_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "protected.conf"
+            target.write_text("approved", encoding="utf-8")
+            approved = hashlib.sha256(target.read_bytes()).hexdigest()
+            executor = ActionExecutor(directory, allow_restoration=True)
+            executor.execute(
+                "capture_restore_point",
+                self._capture_parameters(executor.restore_points, target, approved),
+                {},
+            )
+            target.write_text("prechange", encoding="utf-8")
+            with (
+                patch.object(
+                    executor.restore_points,
+                    "_replace_target",
+                    side_effect=OSError("synthetic prepublish failure"),
+                ),
+                patch.object(
+                    executor.restore_points,
+                    "_restore_before_verified",
+                    wraps=executor.restore_points._restore_before_verified,
+                ) as rollback,
+            ):
+                result = executor.execute(
+                    "restore_integrity",
+                    self._restore_parameters(
+                        executor.restore_points,
+                        target,
+                        approved,
+                    ),
+                    {},
+                )
+            self.assertFalse(result["success"])
+            self.assertIn("synthetic prepublish failure", result["message"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "prechange")
+            rollback.assert_not_called()
+            transaction = json.loads(
+                next(executor.restore_points.transactions.glob("*.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(transaction["status"], "rolled_back")
+
     def test_startup_recovers_a_restoration_interrupted_after_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "protected.conf"
@@ -929,7 +973,8 @@ class ActionTests(unittest.TestCase):
                 {},
             )
             self.assertFalse(result["success"])
-            self.assertIn("non-symlink", result["message"])
+            expected = "reparse point" if os.name == "nt" else "non-symlink"
+            self.assertIn(expected, result["message"])
             self.assertEqual(target.read_text(encoding="utf-8"), "tampered")
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links unavailable")
@@ -966,7 +1011,8 @@ class ActionTests(unittest.TestCase):
                 {},
             )
             self.assertFalse(result["success"])
-            self.assertIn("non-symlink", result["message"])
+            expected = "reparse point" if os.name == "nt" else "non-symlink"
+            self.assertIn(expected, result["message"])
 
     def test_containment_is_dry_run_by_default(self):
         with tempfile.TemporaryDirectory() as directory:

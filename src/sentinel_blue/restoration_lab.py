@@ -233,10 +233,10 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 original = executor.restore_points._replace_target
                 calls = 0
 
-                def interrupt_once(path, data, metadata):
+                def interrupt_once(path, data, metadata, **kwargs):
                     nonlocal calls
                     calls += 1
-                    original(path, data, metadata)
+                    original(path, data, metadata, **kwargs)
                     if calls == 1:
                         raise OSError("synthetic interrupted replacement")
 

@@ -57,8 +57,11 @@ WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
 WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
 WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
+WINDOWS_SE_DACL_PRESENT = 0x0004
+WINDOWS_SE_SACL_PRESENT = 0x0010
 WINDOWS_SE_DACL_PROTECTED = 0x1000
 WINDOWS_SE_SACL_PROTECTED = 0x2000
+WINDOWS_SE_SELF_RELATIVE = 0x8000
 WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
@@ -939,6 +942,118 @@ def _windows_read_file_snapshot_if_present(
         raise
 
 
+def _windows_security_descriptor_semantics(
+    encoded_descriptor: str,
+) -> tuple[int, int, int, bytes, bytes, bytes, bytes]:
+    """Decode the security-bearing components of a self-relative descriptor.
+
+    GetSecurityInfo is free to lay out an equivalent self-relative descriptor at
+    different offsets.  Offset and gap bytes therefore cannot be used as an ACL
+    equality test; component bytes, descriptor control, and component presence can.
+    """
+    if (
+        not isinstance(encoded_descriptor, str)
+        or not encoded_descriptor
+        or len(encoded_descriptor) > MAX_WINDOWS_SECURITY_DESCRIPTOR_TEXT
+        or "\x00" in encoded_descriptor
+    ):
+        raise ValueError("Windows security descriptor metadata is invalid")
+    try:
+        raw = base64.b64decode(encoded_descriptor.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("Windows security descriptor metadata is invalid") from exc
+    if not 20 <= len(raw) <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES:
+        raise ValueError("Windows security descriptor metadata is invalid")
+
+    revision = raw[0]
+    resource_manager_control = raw[1]
+    control = int.from_bytes(raw[2:4], "little")
+    if revision != 1 or not control & WINDOWS_SE_SELF_RELATIVE:
+        raise ValueError("Windows security descriptor metadata is invalid")
+    owner_offset = int.from_bytes(raw[4:8], "little")
+    group_offset = int.from_bytes(raw[8:12], "little")
+    sacl_offset = int.from_bytes(raw[12:16], "little")
+    dacl_offset = int.from_bytes(raw[16:20], "little")
+
+    def sid(offset: int) -> bytes:
+        if offset == 0:
+            return b""
+        if offset < 20 or offset + 8 > len(raw):
+            raise ValueError("Windows security descriptor SID is invalid")
+        length = 8 + 4 * raw[offset + 1]
+        if offset + length > len(raw):
+            raise ValueError("Windows security descriptor SID is invalid")
+        return raw[offset : offset + length]
+
+    def acl(offset: int) -> bytes:
+        if offset == 0:
+            return b""
+        if offset < 20 or offset + 8 > len(raw):
+            raise ValueError("Windows security descriptor ACL is invalid")
+        length = int.from_bytes(raw[offset + 2 : offset + 4], "little")
+        if length < 8 or offset + length > len(raw):
+            raise ValueError("Windows security descriptor ACL is invalid")
+        ace_count = int.from_bytes(raw[offset + 4 : offset + 6], "little")
+        position = offset + 8
+        end = offset + length
+        for _index in range(ace_count):
+            if position + 4 > end:
+                raise ValueError("Windows security descriptor ACE is invalid")
+            ace_length = int.from_bytes(raw[position + 2 : position + 4], "little")
+            if ace_length < 4 or position + ace_length > end:
+                raise ValueError("Windows security descriptor ACE is invalid")
+            position += ace_length
+        return raw[offset:end]
+
+    return (
+        revision,
+        resource_manager_control,
+        control,
+        sid(owner_offset),
+        sid(group_offset),
+        acl(sacl_offset),
+        acl(dacl_offset),
+    )
+
+
+def _windows_security_descriptor_mismatch(
+    expected: str,
+    observed: str,
+) -> str | None:
+    """Name an ACL component mismatch without disclosing descriptor material."""
+    if not isinstance(expected, str) or not isinstance(observed, str):
+        return "invalid descriptor"
+    if hmac.compare_digest(expected, observed):
+        return None
+    try:
+        expected_parts = _windows_security_descriptor_semantics(expected)
+        observed_parts = _windows_security_descriptor_semantics(observed)
+    except ValueError:
+        return "invalid descriptor"
+    labels = (
+        "revision",
+        "resource manager control",
+        "control",
+        "owner",
+        "group",
+        "SACL",
+        "DACL",
+    )
+    for label, expected_part, observed_part in zip(
+        labels,
+        expected_parts,
+        observed_parts,
+        strict=True,
+    ):
+        if expected_part != observed_part:
+            return label
+    return None
+
+
+def _windows_security_descriptors_equivalent(expected: str, observed: str) -> bool:
+    return _windows_security_descriptor_mismatch(expected, observed) is None
+
+
 def _windows_expected_snapshot_mismatch(
     expected_data: bytes,
     expected_metadata: dict[str, Any],
@@ -1157,9 +1272,14 @@ def _windows_atomic_write(
                         destination,
                         native_handle=handle,
                     )
-                    if observed != encoded_descriptor:
+                    descriptor_mismatch = _windows_security_descriptor_mismatch(
+                        encoded_descriptor,
+                        observed,
+                    )
+                    if descriptor_mismatch is not None:
                         raise OSError(
-                            "post-restoration Windows security descriptor did not match"
+                            "post-restoration Windows security descriptor did not match "
+                            f"({descriptor_mismatch})"
                         )
                 if temp_registry is not None:
                     ownership_record = temp_registry.register(
@@ -2502,13 +2622,23 @@ class RestorePointStore:
             }
         except Exception:
             try:
-                self._restore_before_verified(
-                    path,
-                    existed,
-                    before,
-                    before_meta,
-                    expected_current=restored_expected,
-                )
+                current_target = self._read_target_if_present(path)
+                if existed:
+                    original_unchanged = bool(
+                        current_target is not None
+                        and current_target[0] == before
+                        and self._metadata_matches(before_meta, current_target[1])
+                    )
+                else:
+                    original_unchanged = current_target is None
+                if not original_unchanged:
+                    self._restore_before_verified(
+                        path,
+                        existed,
+                        before,
+                        before_meta,
+                        expected_current=restored_expected,
+                    )
                 transaction["rolled_back"] = True
                 transaction["status"] = "rolled_back"
                 self._write_json(self.transactions / f"{transaction_id}.json", transaction)
@@ -3201,8 +3331,10 @@ class RestorePointStore:
                 and observed.get("windows_security_descriptor_version")
                 == WINDOWS_SECURITY_DESCRIPTOR_VERSION
                 and int(expected.get("mode", 0)) == int(observed.get("mode", -1))
-                and expected_descriptor
-                == observed.get("windows_security_descriptor")
+                and _windows_security_descriptors_equivalent(
+                    expected_descriptor,
+                    observed.get("windows_security_descriptor"),
+                )
             )
         return cls._metadata_snapshot(expected) == cls._metadata_snapshot(observed)
 
