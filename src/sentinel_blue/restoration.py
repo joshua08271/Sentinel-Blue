@@ -57,11 +57,31 @@ WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
 WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
 WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
+WINDOWS_SE_OWNER_DEFAULTED = 0x0001
+WINDOWS_SE_GROUP_DEFAULTED = 0x0002
 WINDOWS_SE_DACL_PRESENT = 0x0004
+WINDOWS_SE_DACL_DEFAULTED = 0x0008
 WINDOWS_SE_SACL_PRESENT = 0x0010
+WINDOWS_SE_SACL_DEFAULTED = 0x0020
+WINDOWS_SE_DACL_AUTO_INHERIT_REQ = 0x0100
+WINDOWS_SE_SACL_AUTO_INHERIT_REQ = 0x0200
+WINDOWS_SE_DACL_AUTO_INHERITED = 0x0400
+WINDOWS_SE_SACL_AUTO_INHERITED = 0x0800
 WINDOWS_SE_DACL_PROTECTED = 0x1000
 WINDOWS_SE_SACL_PROTECTED = 0x2000
+WINDOWS_SE_RM_CONTROL_VALID = 0x4000
 WINDOWS_SE_SELF_RELATIVE = 0x8000
+WINDOWS_SEMANTIC_CONTROL_MASK = (
+    WINDOWS_SE_DACL_PRESENT
+    | WINDOWS_SE_SACL_PRESENT
+    | WINDOWS_SE_DACL_AUTO_INHERIT_REQ
+    | WINDOWS_SE_SACL_AUTO_INHERIT_REQ
+    | WINDOWS_SE_DACL_AUTO_INHERITED
+    | WINDOWS_SE_SACL_AUTO_INHERITED
+    | WINDOWS_SE_DACL_PROTECTED
+    | WINDOWS_SE_SACL_PROTECTED
+    | WINDOWS_SE_RM_CONTROL_VALID
+)
 WINDOWS_FILE_ATTRIBUTE_READONLY = 0x00000001
 WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080
@@ -1005,10 +1025,21 @@ def _windows_security_descriptor_semantics(
             position += ace_length
         return raw[offset:end]
 
+    # OWNER/GROUP/DACL/SACL_DEFAULTED describe how Windows obtained a
+    # component, not what access it grants. They are also intentionally absent
+    # from the portable SDDL representation. SetSecurityInfo necessarily turns
+    # a restored defaulted component into an explicit one, so compare only the
+    # presence, inheritance, protection, and resource-manager control flags.
+    semantic_control = control & WINDOWS_SEMANTIC_CONTROL_MASK
+    semantic_resource_manager_control = (
+        resource_manager_control
+        if semantic_control & WINDOWS_SE_RM_CONTROL_VALID
+        else 0
+    )
     return (
         revision,
-        resource_manager_control,
-        control,
+        semantic_resource_manager_control,
+        semantic_control,
         sid(owner_offset),
         sid(group_offset),
         acl(sacl_offset),

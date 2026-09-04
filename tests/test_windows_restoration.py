@@ -1050,6 +1050,23 @@ class WindowsRestorationTests(unittest.TestCase):
                 reordered,
             )
         )
+        defaulted = self._encoded_descriptor(
+            reordered=True,
+            control=(
+                restoration.WINDOWS_SE_SELF_RELATIVE
+                | restoration.WINDOWS_SE_DACL_PRESENT
+                | restoration.WINDOWS_SE_OWNER_DEFAULTED
+                | restoration.WINDOWS_SE_GROUP_DEFAULTED
+                | restoration.WINDOWS_SE_DACL_DEFAULTED
+                | restoration.WINDOWS_SE_SACL_DEFAULTED
+            ),
+        )
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                expected,
+                defaulted,
+            )
+        )
 
         changed_dacl = self._encoded_descriptor(reordered=True, acl_revision=4)
         self.assertEqual(
