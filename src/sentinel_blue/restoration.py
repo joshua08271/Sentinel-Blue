@@ -939,33 +939,33 @@ def _windows_read_file_snapshot_if_present(
         raise
 
 
-def _windows_expected_snapshot_matches(
+def _windows_expected_snapshot_mismatch(
     expected_data: bytes,
     expected_metadata: dict[str, Any],
     observed_data: bytes,
     observed: dict[str, Any],
-) -> bool:
-    """Bind a conditional mutation to the bytes, ACL, and native file identity read earlier."""
+) -> str | None:
+    """Name the first changed field without disclosing protected data."""
     if not isinstance(expected_data, bytes) or not isinstance(expected_metadata, dict):
-        return False
+        return "invalid expected snapshot"
     expected_descriptor = expected_metadata.get("windows_security_descriptor")
     try:
         expected_mode = int(expected_metadata.get("mode", 0))
     except (TypeError, ValueError):
-        return False
+        return "invalid expected mode"
     observed_mode = (
         0o444
         if int(observed["attributes"]) & WINDOWS_FILE_ATTRIBUTE_READONLY
         else 0o666
     )
-    if (
-        observed_data != expected_data
-        or expected_mode != observed_mode
-        or not isinstance(expected_descriptor, str)
-        or not expected_descriptor
-        or observed.get("windows_security_descriptor") != expected_descriptor
-    ):
-        return False
+    if observed_data != expected_data:
+        return "content"
+    if expected_mode != observed_mode:
+        return "mode"
+    if not isinstance(expected_descriptor, str) or not expected_descriptor:
+        return "missing expected security descriptor"
+    if observed.get("windows_security_descriptor") != expected_descriptor:
+        return "security descriptor"
     exact_fields = {
         "windows_file_identity": "identity",
         "windows_creation_ticks": "creation_ticks",
@@ -984,12 +984,30 @@ def _windows_expected_snapshot_matches(
                 expected_value = tuple(int(value) for value in expected_value)
                 observed_value = tuple(int(value) for value in observed_value)
             except (TypeError, ValueError):
-                return False
+                return f"invalid {metadata_name}"
         elif isinstance(expected_value, bool) or not isinstance(expected_value, int):
-            return False
+            return f"invalid {metadata_name}"
         if expected_value != observed_value:
-            return False
-    return True
+            return metadata_name
+    return None
+
+
+def _windows_expected_snapshot_matches(
+    expected_data: bytes,
+    expected_metadata: dict[str, Any],
+    observed_data: bytes,
+    observed: dict[str, Any],
+) -> bool:
+    """Bind a conditional mutation to bytes, ACL, and native file identity."""
+    return (
+        _windows_expected_snapshot_mismatch(
+            expected_data,
+            expected_metadata,
+            observed_data,
+            observed,
+        )
+        is None
+    )
 
 
 def _windows_atomic_write(
@@ -1069,15 +1087,16 @@ def _windows_atomic_write(
                             allow_security_failure=False,
                             native=native,
                         )
-                        if not _windows_expected_snapshot_matches(
+                        mismatch = _windows_expected_snapshot_mismatch(
                             expected_data,
                             expected_metadata,
                             observed_data,
                             observed_snapshot,
-                        ):
+                        )
+                        if mismatch is not None:
                             raise ValueError(
                                 "Windows restoration target changed before publish; "
-                                "refusing to overwrite newer data"
+                                f"refusing to overwrite newer data ({mismatch})"
                             )
                     else:
                         # FILE_RENAME_INFO with ReplaceIfExists=false is the
@@ -1181,15 +1200,16 @@ def _windows_atomic_write(
                     )
                     assert expected_data is not None
                     assert expected_metadata is not None
-                    if not _windows_expected_snapshot_matches(
+                    mismatch = _windows_expected_snapshot_mismatch(
                         expected_data,
                         expected_metadata,
                         verification_data,
                         verification_snapshot,
-                    ):
+                    )
+                    if mismatch is not None:
                         raise ValueError(
                             "Windows restoration target name changed before publish; "
-                            "refusing to overwrite newer data"
+                            f"refusing to overwrite newer data ({mismatch})"
                         )
                 # Clearing delete-on-close and publishing cannot be one Win32 call. A
                 # durable authenticated ownership record is established first, so a
@@ -1338,15 +1358,16 @@ def _windows_unlink(
                         allow_security_failure=False,
                         native=native,
                     )
-                    if not _windows_expected_snapshot_matches(
+                    mismatch = _windows_expected_snapshot_mismatch(
                         expected_data,
                         expected_metadata,
                         observed_data,
                         observed_snapshot,
-                    ):
+                    )
+                    if mismatch is not None:
                         raise ValueError(
                             "Windows restoration target changed before removal; "
-                            "refusing to delete newer data"
+                            f"refusing to delete newer data ({mismatch})"
                         )
                 native.set_delete_disposition(handle, True)
             finally:

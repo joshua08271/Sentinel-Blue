@@ -27,6 +27,7 @@ from .policy_lab import competition_policy_campaign
 from .range_lab import (
     _complete_disposable_baseline_promotion,
     _materialize_disposable_integrity,
+    _windows_integrity_security_digest,
     campaign,
 )
 from .restoration_lab import restoration_policy_campaign
@@ -587,20 +588,32 @@ def self_test(
         protected_file.write_text("approved-state\n", encoding="utf-8")
         approved_digest = hashlib.sha256(protected_file.read_bytes()).hexdigest()
         restore_executor = ActionExecutor(root / "restoration", allow_restoration=True)
+        capture_item = {"path": str(protected_file), "sha256": approved_digest}
+        baseline_security = _windows_integrity_security_digest(protected_file)
+        if baseline_security:
+            capture_item["security_descriptor_sha256"] = baseline_security
         captured = restore_executor.execute(
             "capture_restore_point",
-            {"files": [{"path": str(protected_file), "sha256": approved_digest}]},
+            {"files": [capture_item]},
             telemetry,
         )
         protected_file.write_text("simulated-tamper\n", encoding="utf-8")
         observed_digest = hashlib.sha256(protected_file.read_bytes()).hexdigest()
+        restore_parameters = {
+            "path": str(protected_file),
+            "baseline_sha256": approved_digest,
+            "observed_sha256": observed_digest,
+        }
+        if baseline_security:
+            restore_parameters["baseline_security_descriptor_sha256"] = (
+                baseline_security
+            )
+            restore_parameters["observed_security_descriptor_sha256"] = (
+                _windows_integrity_security_digest(protected_file)
+            )
         restored = restore_executor.execute(
             "restore_integrity",
-            {
-                "path": str(protected_file),
-                "baseline_sha256": approved_digest,
-                "observed_sha256": observed_digest,
-            },
+            restore_parameters,
             telemetry,
         )
         undone = restore_executor.execute(

@@ -949,6 +949,59 @@ class WindowsRestorationTests(unittest.TestCase):
             ("rename", 90, 11, "target.conf", True),
         )
 
+    def test_conditional_snapshot_diagnostic_names_only_the_changed_field(self):
+        expected_data = b"approved bytes"
+        expected = self._expected_metadata(data=expected_data)
+        observed = {
+            "attributes": restoration.WINDOWS_FILE_ATTRIBUTE_NORMAL,
+            "size": len(expected_data),
+            "creation_ticks": expected["windows_creation_ticks"],
+            "modified_ticks": expected["windows_modified_ticks"],
+            "identity": tuple(expected["windows_file_identity"]),
+            "links": expected["windows_hard_links"],
+            "windows_security_descriptor": expected[
+                "windows_security_descriptor"
+            ],
+        }
+        self.assertIsNone(
+            restoration._windows_expected_snapshot_mismatch(
+                expected_data,
+                expected,
+                expected_data,
+                observed,
+            )
+        )
+        self.assertTrue(
+            restoration._windows_expected_snapshot_matches(
+                expected_data,
+                expected,
+                expected_data,
+                observed,
+            )
+        )
+        changed = dict(observed)
+        changed["windows_security_descriptor"] = "different-descriptor"
+        self.assertEqual(
+            restoration._windows_expected_snapshot_mismatch(
+                expected_data,
+                expected,
+                expected_data,
+                changed,
+            ),
+            "security descriptor",
+        )
+        changed = dict(observed)
+        changed["identity"] = (1, 2, 999)
+        self.assertEqual(
+            restoration._windows_expected_snapshot_mismatch(
+                expected_data,
+                expected,
+                expected_data,
+                changed,
+            ),
+            "windows_file_identity",
+        )
+
     def test_conditional_publish_rejects_stale_native_identity_before_staging(self):
         native = _FakeWindowsFileOps()
         expected = self._expected_metadata(handle=999)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import tempfile
 import time
 from dataclasses import asdict
@@ -17,6 +18,19 @@ from .controller import ControllerApp
 from .risk import RiskModel
 from .simulator import _telemetry_scenarios
 from .store import Store
+
+
+def _windows_integrity_security_digest(path: Path) -> str:
+    """Return the collector-compatible ACL fingerprint for a Windows fixture."""
+    if os.name != "nt":
+        return ""
+    from .restoration import _windows_read_file_snapshot
+
+    _data, snapshot = _windows_read_file_snapshot(path, 2 * 1024 * 1024)
+    descriptor = snapshot.get("windows_security_descriptor")
+    if not isinstance(descriptor, str) or not descriptor:
+        raise ValueError("disposable Windows security metadata is unavailable")
+    return hashlib.sha256(descriptor.encode("ascii")).hexdigest()
 
 
 def _materialize_disposable_integrity(
@@ -55,6 +69,9 @@ def _materialize_disposable_integrity(
             "size": len(content),
             "modified_at": target.stat().st_mtime,
         }
+        security_digest = _windows_integrity_security_digest(target)
+        if security_digest:
+            row["security_descriptor_sha256"] = security_digest
         materialized.append(row)
         mapped[str(original["path"])] = (original, row)
     baseline["integrity"] = materialized
@@ -86,6 +103,10 @@ def _materialize_disposable_integrity(
             "sha256": hashlib.sha256(content).hexdigest(),
             "size": len(content),
         }
+        if approved_row.get("security_descriptor_sha256"):
+            changed_row["security_descriptor_sha256"] = approved_row[
+                "security_descriptor_sha256"
+            ]
         updated_current.append(changed_row)
         deferred.append((target, content, changed_row))
     current["integrity"] = updated_current
@@ -98,6 +119,9 @@ def _apply_disposable_integrity_changes(
     for path, content, telemetry_row in changes:
         path.write_bytes(content)
         telemetry_row["modified_at"] = path.stat().st_mtime
+        security_digest = _windows_integrity_security_digest(path)
+        if security_digest:
+            telemetry_row["security_descriptor_sha256"] = security_digest
 
 
 def _complete_disposable_baseline_promotion(
