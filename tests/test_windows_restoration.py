@@ -1486,43 +1486,24 @@ class WindowsRestorationTests(unittest.TestCase):
             [("delete", 91, True), ("close", 91), ("close", 11), ("close", 10)],
         )
 
-    def test_security_information_rejects_null_dacl_and_tracks_sacl_separately(self):
-        with self.assertRaisesRegex(ValueError, "no DACL"):
-            restoration._windows_restoration_security_information(
-                0, dacl_present=False, dacl_pointer=0, sacl_present=False
-            )
-        with self.assertRaisesRegex(ValueError, "NULL DACL"):
-            restoration._windows_restoration_security_information(
-                0, dacl_present=True, dacl_pointer=0, sacl_present=False
-            )
-        without_sacl = restoration._windows_restoration_security_information(
-            0, dacl_present=True, dacl_pointer=1, sacl_present=False
+    def test_backup_security_stream_contains_only_the_validated_descriptor(self):
+        descriptor = base64.b64decode(self._encoded_descriptor())
+        stream = restoration._windows_backup_security_stream(descriptor)
+        self.assertEqual(
+            int.from_bytes(stream[0:4], "little"),
+            restoration.WINDOWS_BACKUP_SECURITY_DATA,
         )
-        self.assertTrue(
-            without_sacl & restoration.WINDOWS_BACKUP_SECURITY_INFORMATION
+        self.assertEqual(
+            int.from_bytes(stream[4:8], "little"),
+            restoration.WINDOWS_STREAM_CONTAINS_SECURITY,
         )
-        self.assertFalse(without_sacl & restoration.WINDOWS_SACL_SECURITY_INFORMATION)
-        self.assertFalse(
-            without_sacl
-            & (
-                restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION
-                | restoration.WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION
-            )
-        )
-        with_sacl = restoration._windows_restoration_security_information(
-            restoration.WINDOWS_SE_DACL_PROTECTED
-            | restoration.WINDOWS_SE_SACL_PROTECTED,
-            dacl_present=True,
-            dacl_pointer=1,
-            sacl_present=True,
-        )
-        self.assertTrue(with_sacl & restoration.WINDOWS_SACL_SECURITY_INFORMATION)
-        self.assertTrue(
-            with_sacl & restoration.WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
-        )
-        self.assertTrue(
-            with_sacl & restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION
-        )
+        self.assertEqual(int.from_bytes(stream[8:16], "little"), len(descriptor))
+        self.assertEqual(int.from_bytes(stream[16:20], "little"), 0)
+        self.assertEqual(stream[20:], descriptor)
+        for invalid in (b"", "not-bytes"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "outside its accepted size"):
+                    restoration._windows_backup_security_stream(invalid)
 
 if __name__ == "__main__":
     unittest.main()

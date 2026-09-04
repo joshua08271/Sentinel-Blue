@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -53,10 +54,8 @@ WINDOWS_CORE_SECURITY_INFORMATION = (
 WINDOWS_SECURITY_INFORMATION = (
     WINDOWS_BACKUP_SECURITY_INFORMATION | WINDOWS_CORE_SECURITY_INFORMATION
 )
-WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
-WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
-WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
+WINDOWS_BACKUP_SECURITY_DATA = 0x00000003
+WINDOWS_STREAM_CONTAINS_SECURITY = 0x00000002
 WINDOWS_SE_OWNER_DEFAULTED = 0x0001
 WINDOWS_SE_GROUP_DEFAULTED = 0x0002
 WINDOWS_SE_DACL_PRESENT = 0x0004
@@ -2173,44 +2172,22 @@ def _capture_windows_security_descriptor(
             local_free(descriptor)
 
 
-def _windows_restoration_security_information(
-    control: int,
-    *,
-    dacl_present: bool,
-    dacl_pointer: int,
-    sacl_present: bool,
-) -> int:
-    """Select safe SetSecurityInfo fields without ever publishing a NULL DACL."""
-    if not dacl_present:
-        raise ValueError(
-            "Windows security descriptor has no DACL; refusing NULL-DACL restoration"
-        )
-    if not dacl_pointer:
-        raise ValueError(
-            "Windows security descriptor has a NULL DACL; refusing unrestricted restoration"
-        )
-    # Set only components that are actually present. An absent SACL is tracked
-    # independently and intentionally left absent; same-handle recapture verifies
-    # that the final descriptor still matches the approved binary descriptor.
-    security_information = (
-        WINDOWS_BACKUP_SECURITY_INFORMATION
-        | WINDOWS_OWNER_SECURITY_INFORMATION
-        | WINDOWS_GROUP_SECURITY_INFORMATION
-        | WINDOWS_DACL_SECURITY_INFORMATION
-    )
-    security_information |= (
-        WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
-        if control & WINDOWS_SE_DACL_PROTECTED
-        else WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION
-    )
-    if sacl_present:
-        security_information |= WINDOWS_SACL_SECURITY_INFORMATION
-        security_information |= (
-            WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION
-            if control & WINDOWS_SE_SACL_PROTECTED
-            else WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION
-        )
-    return security_information
+def _windows_backup_security_stream(raw_descriptor: bytes) -> bytes:
+    """Frame one validated descriptor as a BackupWrite security-only stream."""
+    if (
+        not isinstance(raw_descriptor, bytes)
+        or not 1 <= len(raw_descriptor) <= MAX_WINDOWS_SECURITY_DESCRIPTOR_BYTES
+    ):
+        raise ValueError("Windows file security descriptor is outside its accepted size")
+    # WIN32_STREAM_ID through (but not including) cStreamName is exactly
+    # DWORD, DWORD, LARGE_INTEGER, DWORD. No name follows this header.
+    return struct.pack(
+        "<IIqI",
+        WINDOWS_BACKUP_SECURITY_DATA,
+        WINDOWS_STREAM_CONTAINS_SECURITY,
+        len(raw_descriptor),
+        0,
+    ) + raw_descriptor
 
 
 def _restore_windows_security_descriptor(
@@ -2303,46 +2280,34 @@ def _restore_windows_security_descriptor(
             raise OSError(
                 ctypes.get_last_error(), "Windows security descriptor component is invalid"
             )
-    get_control = advapi32.GetSecurityDescriptorControl
-    get_control.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.WORD),
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    get_control.restype = wintypes.BOOL
-    control = wintypes.WORD()
-    revision = wintypes.DWORD()
-    if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
-        raise OSError(
-            ctypes.get_last_error(), "Windows security descriptor protection state is invalid"
+    if not dacl_present.value:
+        raise ValueError(
+            "Windows security descriptor has no DACL; refusing NULL-DACL restoration"
         )
-    security_information = _windows_restoration_security_information(
-        int(control.value),
-        dacl_present=bool(dacl_present.value),
-        dacl_pointer=int(dacl.value or 0),
-        sacl_present=bool(sacl_present.value),
-    )
-    set_security = advapi32.SetSecurityInfo
-    set_security.argtypes = [
+    if not dacl.value:
+        raise ValueError(
+            "Windows security descriptor has a NULL DACL; refusing unrestricted restoration"
+        )
+
+    backup_stream = _windows_backup_security_stream(raw_descriptor)
+    backup_buffer = ctypes.create_string_buffer(backup_stream, len(backup_stream))
+    backup_write = kernel32.BackupWrite
+    backup_write.argtypes = [
         wintypes.HANDLE,
+        ctypes.c_void_p,
         wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.BOOL,
+        wintypes.BOOL,
+        ctypes.POINTER(ctypes.c_void_p),
     ]
-    set_security.restype = wintypes.DWORD
+    backup_write.restype = wintypes.BOOL
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = [wintypes.HANDLE]
     close_handle.restype = wintypes.BOOL
     handle = native_handle
     owns_handle = native_handle is None
     try:
-        # BACKUP_SECURITY_INFORMATION is the documented backup/restore mode for
-        # preserving the complete descriptor. It requires ACCESS_SYSTEM_SECURITY
-        # even when the captured descriptor has no SACL, so keep the privilege and
-        # handle right consistent in both cases.
         privilege_names = ["SeRestorePrivilege", "SeSecurityPrivilege"]
         privilege_scope = (
             _windows_privileges(*privilege_names) if owns_handle else nullcontext()
@@ -2360,17 +2325,47 @@ def _restore_windows_security_descriptor(
                     desired_access,
                     file_descriptor,
                 )
-            code = set_security(
-                handle,
-                1,
-                security_information,
-                owner,
-                group,
-                dacl,
-                sacl,
-            )
-        if code != 0:
-            raise OSError(int(code), "Windows file security descriptor could not be restored")
+            bytes_written = wintypes.DWORD()
+            context = ctypes.c_void_p()
+            write_completed = False
+            write_attempted = False
+            try:
+                write_attempted = True
+                if not backup_write(
+                    handle,
+                    ctypes.cast(backup_buffer, ctypes.c_void_p),
+                    len(backup_stream),
+                    ctypes.byref(bytes_written),
+                    False,
+                    True,
+                    ctypes.byref(context),
+                ):
+                    raise OSError(
+                        ctypes.get_last_error(),
+                        "Windows file security descriptor could not be restored",
+                    )
+                if int(bytes_written.value) != len(backup_stream):
+                    raise OSError(
+                        "Windows file security descriptor restore was incomplete"
+                    )
+                write_completed = True
+            finally:
+                if write_attempted:
+                    abort_written = wintypes.DWORD()
+                    abort_ok = backup_write(
+                        handle,
+                        None,
+                        0,
+                        ctypes.byref(abort_written),
+                        True,
+                        True,
+                        ctypes.byref(context),
+                    )
+                    if write_completed and not abort_ok:
+                        raise OSError(
+                            ctypes.get_last_error(),
+                            "Windows security restore context could not be released",
+                        )
     finally:
         if owns_handle and handle is not None:
             close_handle(handle)
