@@ -1067,6 +1067,23 @@ class WindowsRestorationTests(unittest.TestCase):
                 defaulted,
             )
         )
+        auto_inherited = self._encoded_descriptor(
+            reordered=True,
+            control=(
+                restoration.WINDOWS_SE_SELF_RELATIVE
+                | restoration.WINDOWS_SE_DACL_PRESENT
+                | restoration.WINDOWS_SE_DACL_AUTO_INHERIT_REQ
+                | restoration.WINDOWS_SE_DACL_AUTO_INHERITED
+                | restoration.WINDOWS_SE_SACL_AUTO_INHERIT_REQ
+                | restoration.WINDOWS_SE_SACL_AUTO_INHERITED
+            ),
+        )
+        self.assertTrue(
+            restoration._windows_security_descriptors_equivalent(
+                expected,
+                auto_inherited,
+            )
+        )
 
         changed_dacl = self._encoded_descriptor(reordered=True, acl_revision=4)
         self.assertEqual(

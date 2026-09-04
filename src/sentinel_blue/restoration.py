@@ -74,10 +74,6 @@ WINDOWS_SE_SELF_RELATIVE = 0x8000
 WINDOWS_SEMANTIC_CONTROL_MASK = (
     WINDOWS_SE_DACL_PRESENT
     | WINDOWS_SE_SACL_PRESENT
-    | WINDOWS_SE_DACL_AUTO_INHERIT_REQ
-    | WINDOWS_SE_SACL_AUTO_INHERIT_REQ
-    | WINDOWS_SE_DACL_AUTO_INHERITED
-    | WINDOWS_SE_SACL_AUTO_INHERITED
     | WINDOWS_SE_DACL_PROTECTED
     | WINDOWS_SE_SACL_PROTECTED
     | WINDOWS_SE_RM_CONTROL_VALID
@@ -1028,8 +1024,12 @@ def _windows_security_descriptor_semantics(
     # OWNER/GROUP/DACL/SACL_DEFAULTED describe how Windows obtained a
     # component, not what access it grants. They are also intentionally absent
     # from the portable SDDL representation. SetSecurityInfo necessarily turns
-    # a restored defaulted component into an explicit one, so compare only the
-    # presence, inheritance, protection, and resource-manager control flags.
+    # a restored defaulted component into an explicit one. AUTO_INHERIT flags
+    # describe or request propagation to child objects; this module accepts only
+    # regular-file targets, which cannot have children, and SetSecurityInfo does
+    # not preserve those status flags. Exact ACL bytes still bind every ACE and
+    # its inherited-ACE flags. Compare the presence, protection, and
+    # resource-manager control flags that remain security-bearing for a file.
     semantic_control = control & WINDOWS_SEMANTIC_CONTROL_MASK
     semantic_resource_manager_control = (
         resource_manager_control
