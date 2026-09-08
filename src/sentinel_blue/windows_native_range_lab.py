@@ -750,6 +750,7 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
         set_file.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p]
         set_file.restype = ctypes.c_int32
         cases = (
+            ("backup_only", "backup", 0),
             ("handle_sacl_protection", "handle", 0x8 | (protection & 0x50000000)),
             ("handle_backup_protection", "handle", security.WINDOWS_SECURITY_INFORMATION | protection),
             ("named_sacl_protection", "named", 0x8 | (protection & 0x50000000)),
@@ -763,9 +764,11 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
         results = []
         native = security._WindowsNativeFileOps()
         with security._windows_privileges("SeBackupPrivilege", "SeRestorePrivilege", "SeSecurityPrivilege"):
-            for name, operation, information in cases:
-                path = self.root / ("security-diagnostic-" + name + ".tmp")
-                row: dict[str, Any] = {"case": name, "expected_control": f"0x{parts[2]:04x}"}
+            for creation, (name, operation, information) in (
+                (creation, case) for creation in ("explicit", "inherited") for case in cases
+            ):
+                path = self.root / ("security-diagnostic-" + creation + "-" + name + ".tmp")
+                row: dict[str, Any] = {"case": name, "creation": creation, "expected_control": f"0x{parts[2]:04x}"}
                 with security._windows_pinned_parent(path, native) as (_parent, parent_path, leaf):
                     exact_path = security._windows_child_path(parent_path, leaf)
                     handle = native.open_file(
@@ -779,7 +782,7 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
                         security.WINDOWS_FILE_ATTRIBUTE_NORMAL
                         | security.WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
                         | security.WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
-                        security_descriptor=encoded,
+                        **({"security_descriptor": encoded} if creation == "explicit" else {}),
                     )
                     try:
                         if native.final_path(handle).casefold() != exact_path.casefold():
@@ -788,7 +791,9 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
                         row["before_control"] = f"0x{security._windows_security_descriptor_semantics(before)[2]:04x}"
                         if name.endswith("delete_pending"):
                             native.set_delete_disposition(handle, True)
-                        if operation == "file":
+                        if operation == "backup":
+                            security._restore_windows_security_descriptor(path, encoded, native_handle=handle)
+                        elif operation == "file":
                             if not set_file(exact_path, information, ctypes.byref(buffer)):
                                 raise OSError(ctypes.get_last_error(), "file security diagnostic failed")
                         else:
