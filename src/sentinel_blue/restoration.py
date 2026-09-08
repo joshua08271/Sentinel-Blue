@@ -45,6 +45,10 @@ WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
 WINDOWS_GROUP_SECURITY_INFORMATION = 0x00000002
 WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
 WINDOWS_SACL_SECURITY_INFORMATION = 0x00000008
+WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
+WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
+WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
 WINDOWS_CORE_SECURITY_INFORMATION = (
     WINDOWS_OWNER_SECURITY_INFORMATION
     | WINDOWS_GROUP_SECURITY_INFORMATION
@@ -2192,6 +2196,33 @@ def _windows_backup_security_stream(raw_descriptor: bytes) -> bytes:
     ) + raw_descriptor
 
 
+def _restore_windows_protection_flags(handle, expected: int, observed: int) -> None:
+    """Restore changed inheritance protection without replacing ACL contents."""
+    information = 0
+    for bit, protected, unprotected in (
+        (WINDOWS_SE_DACL_PROTECTED, WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION,
+         WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION),
+        (WINDOWS_SE_SACL_PROTECTED, WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION,
+         WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION),
+    ):
+        if (expected ^ observed) & bit:
+            information |= protected if expected & bit else unprotected
+    if not information:
+        return
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL('Advapi32.dll', use_last_error=True)
+    set_security = api.SetSecurityInfo
+    set_security.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    set_security.restype = wintypes.DWORD
+    # Neither DACL_SECURITY_INFORMATION nor SACL_SECURITY_INFORMATION is set:
+    # NULL component arguments must never replace the approved ACLs.
+    code = set_security(handle, 1, information, None, None, None, None)
+    if code != 0:
+        raise OSError(int(code), 'Windows security descriptor protection could not be restored')
+
+
 def _restore_windows_security_descriptor(
     path: Path,
     encoded_descriptor: str,
@@ -2368,6 +2399,17 @@ def _restore_windows_security_descriptor(
                             ctypes.get_last_error(),
                             "Windows security restore context could not be released",
                         )
+            # BackupWrite can drop SACL protection when the approved SACL is
+            # absent. Presence and inheritance protection are independent.
+            # Restore only changed protection flags on this same held handle;
+            # the caller still requires the entire descriptor to match before
+            # publishing any replacement.
+            observed_descriptor = _capture_windows_security_descriptor(path, native_handle=handle)
+            _restore_windows_protection_flags(
+                handle,
+                _windows_security_descriptor_semantics(encoded_descriptor)[2],
+                _windows_security_descriptor_semantics(observed_descriptor)[2],
+            )
     finally:
         if owns_handle and handle is not None:
             close_handle(handle)

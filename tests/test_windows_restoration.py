@@ -1505,5 +1505,34 @@ class WindowsRestorationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "outside its accepted size"):
                     restoration._windows_backup_security_stream(invalid)
 
+    def test_protection_restore_preserves_absent_sacl_and_never_replaces_acl_components(self):
+        cases = (
+            (0x2004, 0x0004, restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION),
+            (0x0004, 0x2004, restoration.WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION),
+            (0x1004, 0x0004, restoration.WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION),
+            (0x0004, 0x1004, restoration.WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION),
+            (0x3004, 0x0004, restoration.WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
+             | restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION),
+        )
+        for expected, observed, information in cases:
+            with self.subTest(expected=expected, observed=observed):
+                calls = []
+                api = SimpleNamespace(SetSecurityInfo=_NativeFunction(lambda *args: calls.append(args) or 0))
+                with patch.object(restoration.ctypes, 'WinDLL', return_value=api, create=True):
+                    restoration._restore_windows_protection_flags(41, expected, observed)
+                self.assertEqual(calls, [(41, 1, information, None, None, None, None)])
+                self.assertFalse(information & restoration.WINDOWS_CORE_SECURITY_INFORMATION)
+        with patch.object(restoration.ctypes, 'WinDLL', side_effect=AssertionError('no change needed'), create=True):
+            restoration._restore_windows_protection_flags(41, 0x2004, 0x2004)
+            # Presence mismatches remain the full-descriptor verifier's job.
+            restoration._restore_windows_protection_flags(41, 0x0004, 0x0014)
+
+    def test_protection_restore_failure_is_not_accepted(self):
+        api = SimpleNamespace(SetSecurityInfo=_NativeFunction(lambda *_args: 5))
+        with patch.object(restoration.ctypes, 'WinDLL', return_value=api, create=True):
+            with self.assertRaisesRegex(OSError, 'protection could not be restored') as caught:
+                restoration._restore_windows_protection_flags(41, 0x2004, 0x0004)
+        self.assertEqual(caught.exception.errno, 5)
+
 if __name__ == "__main__":
     unittest.main()
