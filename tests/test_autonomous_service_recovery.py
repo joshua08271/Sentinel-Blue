@@ -201,13 +201,17 @@ class AutonomousServiceRecoveryTests(unittest.TestCase):
 
     def test_agent_restart_does_not_reset_native_recovery_cooldown(self):
         with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "unit.conf"
+            target = Path(directory).resolve() / "unit.conf"
             target.write_bytes(b"trusted")
             profile, baseline = fixtures(str(target))
+            state = Path(directory).resolve() / "state"
+            executor = ActionExecutor(state, allow_containment=True)
+            _data, metadata = executor.restore_points._read_target(target)
+            baseline['integrity'][0]['security_descriptor_sha256'] = (
+                executor.restore_points._metadata_security_descriptor_sha256(metadata)
+            )
             current = stopped(baseline)
             parameters = recovery_parameters(profile, "agent-one", "web.service", baseline, current)
-            state = Path(directory) / "state"
-            executor = ActionExecutor(state, allow_containment=True)
             with patch.object(executor, "_service_state", side_effect=["stopped", "running"]), patch.object(
                 executor, "_set_service_state"
             ), patch("sentinel_blue.actions.run_probes", return_value=[ProbeResult("web-health", PROBE["target"], True)]), patch(

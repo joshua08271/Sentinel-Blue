@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class WindowsNativeRangeGateTests(unittest.TestCase):
     def _environment(self, workspace: str) -> dict[str, str]:
+        # The runner's TEMP may use an 8.3 alias. Supply the actual fixture
+        # directory to the unchanged production no-alias/no-reparse gate.
+        workspace = str(Path(workspace).resolve(strict=True))
         return {
             "SENTINEL_BLUE_WINDOWS_DISPOSABLE_LAB": CONFIRMATION,
             "SENTINEL_BLUE_HEAD_REPOSITORY": "joshua08271/Sentinel-Blue",
@@ -142,6 +145,21 @@ class WindowsNativeRangeGateTests(unittest.TestCase):
 
 
 class WindowsNativeOwnershipTests(unittest.TestCase):
+    def test_disable_fixture_refuses_a_replaced_sid_or_unowned_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lab = self._lab(directory)
+            lab.account_sid = 'S-1-5-21-1-2-3-1001'
+            for owned, observed in ((False, lab.account_sid), (True, 'S-1-5-21-1-2-3-1002')):
+                lab.account_created = owned
+                with (
+                    patch.object(lab, '_account_state', return_value={'Exists': True, 'SID': observed,
+                                                                      'Description': ACCOUNT_DESCRIPTION}),
+                    patch.object(lab, '_powershell') as command,
+                    self.assertRaisesRegex(WindowsNativeRangeError, 'changed account'),
+                ):
+                    lab._disable_account_exact()
+                command.assert_not_called()
+
     def test_setup_refusal_never_deletes_a_preexisting_root_or_queries_native_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             lab = self._lab(directory)

@@ -108,12 +108,12 @@ class RehearsalRegressionTests(unittest.TestCase):
 
     def test_discovered_service_alias_is_pinned_to_regular_inventory_target(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             target = root / 'canonical.service'; target.write_text('trusted unit')
             alias = root / 'alias.service'; alias.symlink_to(target)
             original = Path.glob
             def entries(path, pattern):
-                if str(path) == '/etc/systemd/system':
+                if path.as_posix() == '/etc/systemd/system':
                     return iter([alias])
                 return original(path, pattern)
             with patch.object(Path, 'glob', entries):

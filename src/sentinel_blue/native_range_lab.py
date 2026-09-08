@@ -32,6 +32,7 @@ from . import __version__
 from .actions import ActionExecutor
 from .collectors import collect
 from .controller import ControllerApp, assess_baseline_readiness
+from .detection import detect
 from .event_profile import CAPABILITIES, EventProfile
 from .native_loopback_fixture import HEALTH_MARKER
 from .probes import run_probe
@@ -710,6 +711,11 @@ class NativeRunnerLab:
         if not credential_locked:
             raise NativeRangeError("UID-zero emulation account was not credential-locked")
         telemetry = self._collect_payload()
+        existing = [item for item in detect(telemetry, telemetry, store.protected_accounts(self.agent_id), RiskModel())
+                    if item.kind == 'unverified_privileged_account'
+                    and item.evidence.get('account', {}).get('name') == self.account_name]
+        if len(existing) != 1 or existing[0].evidence.get('new_since_baseline') is not False:
+            raise NativeRangeError('native UID-zero fixture was trusted merely because it existed in the baseline')
         alert_ids = app.ingest(telemetry)
         alert = self._alert_for(store, alert_ids, "unverified_privileged_account")
         detected_at = time.perf_counter()
@@ -726,6 +732,7 @@ class NativeRunnerLab:
             action,
             result,
             account_had_no_configured_credential=credential_locked,
+            present_in_baseline_still_detected=True,
             account_removed=not self._account_exists(self.account_name),
             evidence_snapshot_created=True,
         )

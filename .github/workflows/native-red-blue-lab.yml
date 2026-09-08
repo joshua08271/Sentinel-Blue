@@ -137,6 +137,14 @@ jobs:
           --load-seconds 180 --samples 3
           --output windows-collection-pressure-report.json
 
+      - name: Measure native Windows collection with one available CPU
+        if: success() || failure()
+        shell: pwsh
+        run: >-
+          python tools/measure_collection_pressure.py
+          --cpu-limit 1 --workers 1 --load-seconds 180 --samples 3
+          --output windows-single-cpu-pressure-report.json
+
       - name: Summarize Windows-native campaign
         if: always() && hashFiles('windows-native-live-report.json') != ''
         shell: pwsh
@@ -168,3 +176,4 @@ jobs:
           path: |
             windows-native-live-report.json
             windows-collection-pressure-report.json
+            windows-single-cpu-pressure-report.json

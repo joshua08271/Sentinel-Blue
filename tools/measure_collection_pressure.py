@@ -16,11 +16,65 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from sentinel_blue import __version__
 from sentinel_blue import collectors
 from sentinel_blue.service_recovery import RECOVERY_FRESHNESS_SECONDS
+
+
+@contextmanager
+def limit_cpus(count: int | None):
+    """Constrain this measurement and its children, then restore our affinity."""
+    if count is None:
+        yield None
+        return
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        api = ctypes.WinDLL('kernel32', use_last_error=True)
+        api.GetCurrentProcess.restype = wintypes.HANDLE
+        api.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+        api.GetProcessAffinityMask.restype = wintypes.BOOL
+        api.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+        api.SetProcessAffinityMask.restype = wintypes.BOOL
+        handle = api.GetCurrentProcess()
+
+        def read_mask():
+            process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+            if not api.GetProcessAffinityMask(handle, ctypes.byref(process_mask), ctypes.byref(system_mask)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return process_mask.value
+
+        previous = read_mask()
+        available = [1 << index for index in range(ctypes.sizeof(ctypes.c_size_t) * 8) if previous & (1 << index)]
+        if len(available) < count:
+            raise RuntimeError('requested CPU affinity is unavailable')
+        selected = sum(available[:count])
+        if not api.SetProcessAffinityMask(handle, selected):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if read_mask() != selected:
+                raise RuntimeError('CPU affinity did not take effect')
+            yield count
+        finally:
+            if not api.SetProcessAffinityMask(handle, previous) or read_mask() != previous:
+                raise RuntimeError('measurement could not restore its original CPU affinity')
+    elif hasattr(os, 'sched_getaffinity'):
+        previous = os.sched_getaffinity(0)
+        if len(previous) < count:
+            raise RuntimeError('requested CPU affinity is unavailable')
+        selected = set(sorted(previous)[:count])
+        os.sched_setaffinity(0, selected)
+        try:
+            if os.sched_getaffinity(0) != selected:
+                raise RuntimeError('CPU affinity did not take effect')
+            yield count
+        finally:
+            os.sched_setaffinity(0, previous)
+    else:
+        raise RuntimeError('CPU affinity is unavailable on this measurement host')
 
 
 def busy_worker(seconds: float) -> None:
@@ -157,6 +211,7 @@ def main() -> None:
     parser.add_argument('--workers', type=int, default=min(os.cpu_count() or 1, 8))
     parser.add_argument('--load-seconds', type=float, default=180)
     parser.add_argument('--samples', type=int, default=3)
+    parser.add_argument('--cpu-limit', type=int, help='limit this measurement and its children to this many CPUs')
     parser.add_argument('--worker-seconds', type=float, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_seconds is not None:
@@ -166,7 +221,12 @@ def main() -> None:
         return
     if not 1 <= args.workers <= 8 or not 3 <= args.load_seconds <= 900 or not 1 <= args.samples <= 10:
         parser.error('workers: 1..8; load-seconds: 3..900; samples: 1..10')
-    report = measure(workers=args.workers, load_seconds=args.load_seconds, samples=args.samples)
+    if args.cpu_limit is not None and not 1 <= args.cpu_limit <= 8:
+        parser.error('cpu-limit must be 1..8')
+    with limit_cpus(args.cpu_limit) as applied_limit:
+        report = measure(workers=args.workers, load_seconds=args.load_seconds, samples=args.samples)
+        report['applied_cpu_limit'] = applied_limit
+    report['affinity_restored'] = True
     encoded = json.dumps(report, indent=2, sort_keys=True) + '\n'
     if args.output:
         args.output.write_text(encoded, encoding='utf-8')

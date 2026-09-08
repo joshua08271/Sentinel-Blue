@@ -408,6 +408,25 @@ if (@($key.GetValueNames()) -notcontains $env:SENTINEL_BLUE_FIXTURE_RUN_NAME) {
             and observed_program == expected_program
         )
 
+    def _disable_account_exact(self) -> None:
+        state = self._account_state()
+        if (not self.account_created or not self.account_sid or not state.get('Exists')
+                or state.get('SID') != self.account_sid or state.get('Description') != ACCOUNT_DESCRIPTION):
+            raise WindowsNativeRangeError('refused to disable a changed account identity')
+        self._powershell(r"""
+$user = Get-LocalUser -Name $env:SENTINEL_BLUE_FIXTURE_ACCOUNT -ErrorAction Stop
+if ($user.SID.Value -ne $env:SENTINEL_BLUE_FIXTURE_SID) { throw 'account SID changed' }
+if ($user.Description -ne $env:SENTINEL_BLUE_FIXTURE_DESCRIPTION) { throw 'account marker changed' }
+Disable-LocalUser -InputObject $user -ErrorAction Stop
+""", extra_env={
+            'SENTINEL_BLUE_FIXTURE_ACCOUNT': self.account_name,
+            'SENTINEL_BLUE_FIXTURE_SID': self.account_sid,
+            'SENTINEL_BLUE_FIXTURE_DESCRIPTION': ACCOUNT_DESCRIPTION,
+        }, label='disable only the run-owned account fixture')
+        state = self._account_state()
+        if state.get('SID') != self.account_sid or state.get('Enabled') is not False or state.get('Privileged') is not True:
+            raise WindowsNativeRangeError('disabled privileged-account fixture did not retain its exact identity')
+
     def _delete_account_exact(self) -> None:
         state = self._account_state()
         if not state.get("Exists"):
@@ -860,10 +879,21 @@ New-NetFirewallRule `
         }
 
     def _account_scenario(
-        self, candidate: Any, attacked: dict[str, Any], started: float, detected: float
+        self, candidate: Any, attacked: dict[str, Any], started: float, detected: float,
+        protected_accounts: set[str],
     ) -> dict[str, Any]:
         assert self.executor is not None
         result = self.executor.execute("snapshot", {}, attacked)
+        matches_account = lambda item: str(item.evidence.get('account', {}).get('name', '')).casefold() == self.account_name.casefold()
+        existing = self._candidate(detect(attacked, attacked, protected_accounts, RiskModel()),
+                                   'unverified_privileged_account', matches_account)
+        self._disable_account_exact()
+        disabled = self._collect_payload()
+        disabled_candidate = self._candidate(detect(disabled, attacked, protected_accounts, RiskModel()),
+                                             'unverified_privileged_account', matches_account)
+        disabled_snapshot = self.executor.execute('snapshot', {}, disabled)
+        if disabled_snapshot.get('success') is not True:
+            raise WindowsNativeRangeError('disabled privileged-account evidence was not preserved')
         self._delete_account_exact()
         return self._record(
             "enabled_unapproved_local_administrator",
@@ -877,6 +907,12 @@ New-NetFirewallRule `
                 == self.account_name.casefold()
             ),
             evidence_snapshot_created=True,
+            present_in_baseline_still_detected=existing.evidence.get('new_since_baseline') is False,
+            disabled_baseline_account_still_detected=(
+                disabled_candidate.evidence.get('new_since_baseline') is False
+                and disabled_candidate.evidence.get('account', {}).get('enabled') is False
+                and disabled_candidate.evidence.get('account', {}).get('account_id') == existing.evidence.get('account', {}).get('account_id')
+            ),
             account_removed=not self._account_state().get("Exists"),
         )
 
@@ -1364,7 +1400,7 @@ New-NetFirewallRule `
         )
 
         scenarios = [
-            self._account_scenario(account, attacked, started, detected),
+            self._account_scenario(account, attacked, started, detected, protected_accounts),
             self._task_scenario(task, attacked, started, detected),
             self._run_value_scenario(run_value, attacked, started, detected),
             self._listener_scenario(listener, attacked, started, detected),

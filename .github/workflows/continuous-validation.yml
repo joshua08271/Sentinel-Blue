@@ -75,6 +75,12 @@ jobs:
           if os.name == "posix":
               command.append("--exercise-lifecycle")
           subprocess.run(command, check=True)
+          subprocess.run([
+              sys.executable, "tools/endurance_recovery.py",
+              "--runtime", f"release/sentinel-blue-{version}.pyz",
+              "--duration-seconds", "330",
+              "--output", "release/endurance-recovery-report.json",
+          ], check=True)
       - run: pyinstaller --clean --onefile --name sentinel-blue --collect-data sentinel_blue packaging/sentinel_blue_entry.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -84,3 +90,4 @@ jobs:
             dist/sentinel-blue*
             release/sentinel-blue-*
             release/SHA256SUMS
+            release/endurance-recovery-report.json
