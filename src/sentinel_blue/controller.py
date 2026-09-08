@@ -12,6 +12,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import socket
 import sqlite3
 import ssl
@@ -20,12 +21,13 @@ import sys
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
@@ -70,6 +72,7 @@ from .protocol import (
     AlertCandidate,
 )
 from .risk import RiskModel, features_for_kind
+from .service_recovery import ServiceRecoveryPlanner, RECOVERY_CONFIRMATIONS, RECOVERY_FRESHNESS_SECONDS
 from .store import (
     ActionQuotaExceeded,
     Store,
@@ -861,7 +864,7 @@ def relay_probe_loop(
 ) -> None:
     from dataclasses import asdict
 
-    from .probes import run_probes
+    from .probes import ProbeBatchCancelled, run_probes
 
     while not stop.is_set():
         try:
@@ -870,7 +873,10 @@ def relay_probe_loop(
                 app.authorized_networks,
                 authorized_hosts=app.authorized_hosts,
                 excluded_hosts=app.excluded_hosts,
+                stop_event=stop,
             )
+            if stop.is_set():
+                return
             app.ingest(
                 {
                     "agent_id": "sentinel-relay-probes",
@@ -892,6 +898,8 @@ def relay_probe_loop(
                     "profile_fingerprint": app.event_profile.fingerprint,
                 }
             )
+        except ProbeBatchCancelled:
+            return
         except Exception:
             LOG.exception("relay probe cycle failed")
         stop.wait(max(5.0, interval))
@@ -922,6 +930,7 @@ class ControllerApp:
         require_authenticated_recovery: bool = False,
         force_safe_governance: bool = False,
         campaign_id: str | None = None,
+        auto_recover_services: bool = False,
     ):
         if len(token) < 16:
             raise ValueError("the enrollment token must be at least 16 characters")
@@ -1023,6 +1032,8 @@ class ControllerApp:
         )
         self.health_stale_after = max(15.0, health_stale_after)
         self.auto_restore = auto_restore
+        self.auto_recover_services = bool(auto_recover_services)
+        self.service_recovery_planner = ServiceRecoveryPlanner(self.event_profile)
         self.restoration_probes = restoration_probes or []
         self.restore_confirmations = max(1, min(int(restore_confirmations), 5))
         self.allow_unprobed_restoration = bool(allow_unprobed_restoration)
@@ -1068,6 +1079,12 @@ class ControllerApp:
             raise ValueError("automatic restoration is not authorized by the event profile")
         if self.allow_unprobed_restoration and self.event_profile.environment == "live-competition":
             raise ValueError("live competition profiles cannot authorize unprobed restoration")
+        if self.auto_recover_services and (
+            not self.event_profile.services_confirmed or not self.event_profile.action_allowed(
+                "restart_service", automated=True, autonomy_mode=self.event_profile.autonomy_mode
+            )
+        ):
+            raise ValueError("automatic service recovery is not authorized by confirmed event manifests")
         self._integrity_lock = threading.Lock()
         self._decision_lock = threading.Lock()
         # The outer barrier spans both leasing and the actual HTTP write. Any
@@ -1821,6 +1838,9 @@ class ControllerApp:
             "restoration_blocked_agents": restoration_blocked_agents,
             "restoration_blockers": restoration_blockers,
             "restore_confirmations": self.restore_confirmations,
+            "automatic_service_recovery": self.auto_recover_services,
+            "service_recovery_confirmations": RECOVERY_CONFIRMATIONS,
+            "service_recovery_status": self.service_recovery_status(telemetry_by_agent),
             "allow_unprobed_restoration": self.allow_unprobed_restoration,
             "connection_pressure": self.connection_pressure_provider(),
             "credential_migration_blockers": self.credential_migration_blockers(),
@@ -1848,6 +1868,41 @@ class ControllerApp:
             "failed_actions": sum(action.get("status") == "failed" for action in payload["actions"]),
         }
         return payload
+
+    def service_recovery_status(self, telemetry_by_agent: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        observations = {
+            (item["agent_id"], item["service"]): item["status"]
+            for item in self.service_recovery_planner.status()
+        }
+        rows = []
+        now = time.time()
+        for manifest in self.event_profile.services:
+            agent_id, service = manifest["host"], manifest["service_id"]
+            status = observations.get((agent_id, service), "awaiting observations")
+            budget = self.store.service_recovery_budget_status(agent_id, service)
+            telemetry = telemetry_by_agent.get(agent_id) or {}
+            observed = telemetry.get("observed_at")
+            if not self.auto_recover_services:
+                status = "automatic service recovery disabled"
+            elif self.emergency_stopped:
+                status = "emergency stop enabled"
+            elif not self.event_profile.action_allowed(
+                "restart_service", automated=True, autonomy_mode=self.autonomy_mode,
+                emergency_stopped=self.emergency_stopped,
+            ):
+                status = "current governance holds automatic recovery"
+            elif not self.store.agent_enabled(agent_id):
+                status = "agent disabled or not enrolled"
+            elif type(observed) not in (int, float) or not 0 <= now - observed <= RECOVERY_FRESHNESS_SECONDS:
+                status = "fresh telemetry unavailable"
+            elif not budget["allowed"]:
+                status = budget["reason"]
+            rows.append({
+                "agent_id": agent_id, "service": service, "status": status,
+                "observation_status": observations.get((agent_id, service), "awaiting observations"),
+                "budget": budget,
+            })
+        return rows
 
     def enroll(
         self,
@@ -2068,6 +2123,10 @@ class ControllerApp:
                     )
         if baseline is None:
             self.store.create_baseline(agent_id, payload, binding)
+        service_recoveries = (
+            self.service_recovery_planner.observe(agent_id, baseline, baseline_status == "approved", payload)
+            if self.auto_recover_services else {}
+        )
         alert_ids: list[str] = []
         alert_quota_by_kind: Counter[str] = Counter()
         alert_quota_by_severity: Counter[str] = Counter()
@@ -2172,6 +2231,15 @@ class ControllerApp:
                     dict(candidate.evidence),
                     alert_id,
                     automated=True,
+                )
+            elif (
+                candidate.kind == "baseline_service_stopped"
+                and candidate.evidence.get("service") in service_recoveries
+                and self.store.action_for_alert(alert_id, "restart_service") is None
+            ):
+                self._queue_action(
+                    agent_id, "restart_service", service_recoveries[candidate.evidence["service"]],
+                    alert_id, automated=True,
                 )
             elif should_automate_evidence(candidate.recommended_action, candidate.severity):
                 self._queue_action(
@@ -3433,6 +3501,8 @@ def make_handler(app: ControllerApp) -> type[BaseHTTPRequestHandler]:
                     if not self._deadline_expired():
                         self.server._record_expected_connection_failure(type(exc).__name__)
                 return
+            except ActionQuotaExceeded as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except PermissionError as exc:
                 self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -3452,6 +3522,63 @@ def run(args: argparse.Namespace) -> None:
     # second process fails here even when it intends to bind a different port.
     with ControllerDatabaseLock(args.database):
         _run_locked(args)
+
+
+@contextmanager
+def _controller_shutdown_signals(server: ControllerServer) -> Iterator[None]:
+    """Keep repeated service-manager signals harmless through session cleanup."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    requested = False
+    worker: threading.Thread | None = None
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        nonlocal worker, requested
+        if requested:
+            return
+        requested = True
+        # BaseServer.shutdown must run outside the serve_forever thread.
+        worker = threading.Thread(target=server.shutdown, daemon=True, name="sentinel-shutdown")
+        worker.start()
+
+    previous = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for number in previous:
+            signal.signal(number, request_stop)
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        if worker:
+            worker.join(timeout=3)
+
+
+def _drain_controller_workers(
+    server: ControllerServer,
+    workers: list[threading.Thread],
+    *,
+    timeout: float = 20.0,
+) -> bool:
+    """Wait on all database users against one shared monotonic deadline."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        live_workers = [worker for worker in workers if worker.is_alive()]
+        connections = server.active_connections()
+        if not live_workers and not connections:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            LOG.error(
+                "controller shutdown did not drain: workers=%s, active_requests=%s; "
+                "unclean-session marker retained",
+                [worker.name for worker in live_workers], sum(connections.values()),
+            )
+            return False
+        if live_workers:
+            live_workers[0].join(timeout=min(0.05, remaining))
+        else:
+            time.sleep(min(0.05, remaining))
 
 
 def _run_locked(args: argparse.Namespace) -> None:
@@ -3551,6 +3678,7 @@ def _run_locked(args: argparse.Namespace) -> None:
         max_agents=args.max_agents,
         health_stale_after=args.stale_after,
         auto_restore=args.auto_restore,
+        auto_recover_services=getattr(args, "auto_recover_services", False),
         restoration_probes=probe_specs,
         restore_confirmations=args.restore_confirmations,
         allow_unprobed_restoration=args.allow_unprobed_restoration,
@@ -3611,48 +3739,56 @@ def _run_locked(args: argparse.Namespace) -> None:
         syslog_monitor.start()
     scheme = "https" if args.tls_cert else "http"
     LOG.warning("controller listening on %s://%s:%s", scheme, args.bind, args.port)
-    clean_shutdown = False
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        clean_shutdown = True
-    else:
-        clean_shutdown = True
-    finally:
-        probe_stop.set()
-        if probe_thread:
-            probe_thread.join(timeout=3)
-        maintenance_thread.join(timeout=3)
-        if syslog_monitor:
-            syslog_monitor.stop()
-        server.server_close()
-        if args.adaptive_model_output:
-            try:
-                from .learning import train_candidate
+    with _controller_shutdown_signals(server):
+        clean_shutdown = False
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            clean_shutdown = True
+        else:
+            clean_shutdown = True
+        finally:
+            probe_stop.set()
+            if syslog_monitor:
+                syslog_monitor.stop()
+            server.server_close()
+            # Probes can legitimately outlast the old three-second join. Drain them
+            # together with maintenance and HTTP handlers before closing the store.
+            workers = [maintenance_thread]
+            if probe_thread:
+                workers.append(probe_thread)
+            workers_drained = _drain_controller_workers(server, workers)
+            if args.adaptive_model_output and workers_drained:
+                try:
+                    from .learning import train_candidate
 
-                provenance_filter = {
-                    "campaign_id": app.campaign_id,
-                    "profile_id": event_profile.profile_id,
-                    "profile_fingerprint": event_profile.fingerprint,
-                    "release_sha256": str(
-                        event_profile.release.get("sha256", "")
-                    ).casefold(),
-                    "agent_version": __version__,
-                    "model_fingerprint": model.fingerprint(),
-                }
-                report = train_candidate(
-                    store,
-                    model,
-                    args.adaptive_model_output,
-                    provenance_filter=provenance_filter,
-                    require_structured_lineage=app._strict_release_binding,
+                    provenance_filter = {
+                        "campaign_id": app.campaign_id,
+                        "profile_id": event_profile.profile_id,
+                        "profile_fingerprint": event_profile.fingerprint,
+                        "release_sha256": str(
+                            event_profile.release.get("sha256", "")
+                        ).casefold(),
+                        "agent_version": __version__,
+                        "model_fingerprint": model.fingerprint(),
+                    }
+                    report = train_candidate(
+                        store,
+                        model,
+                        args.adaptive_model_output,
+                        provenance_filter=provenance_filter,
+                        require_structured_lineage=app._strict_release_binding,
+                    )
+                    LOG.warning("adaptive model evaluation: %s", json.dumps(report, sort_keys=True))
+                except Exception:
+                    LOG.exception("adaptive model training failed; current model retained")
+            if clean_shutdown and workers_drained and not app._governance_persistence_uncertain:
+                if not store.end_controller_session(controller_session_id):
+                    LOG.error("controller clean-session marker could not be cleared")
+            else:
+                LOG.error(
+                    "controller session remains unclean: normal_stop=%s, drained=%s, "
+                    "governance_persistence_uncertain=%s",
+                    clean_shutdown, workers_drained, app._governance_persistence_uncertain,
                 )
-                LOG.warning("adaptive model evaluation: %s", json.dumps(report, sort_keys=True))
-            except Exception:
-                LOG.exception("adaptive model training failed; current model retained")
-        if clean_shutdown and not app._governance_persistence_uncertain and not maintenance_thread.is_alive() and not (
-            probe_thread and probe_thread.is_alive()
-        ):
-            if not store.end_controller_session(controller_session_id):
-                LOG.error("controller clean-session marker could not be cleared")
-        store.close()
+            store.close()

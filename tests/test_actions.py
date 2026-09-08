@@ -1186,7 +1186,7 @@ class ActionTests(unittest.TestCase):
                 patch.object(executor, "_set_service_state") as set_state,
                 patch(
                     "sentinel_blue.actions.run_probes",
-                    side_effect=[[unhealthy], [healthy]],
+                    side_effect=[[unhealthy], [healthy], [healthy], [healthy]],
                 ) as runner,
                 patch("sentinel_blue.actions.time.sleep") as sleep,
             ):
@@ -1196,9 +1196,9 @@ class ActionTests(unittest.TestCase):
                     {},
                 )
             self.assertTrue(result["success"])
-            self.assertEqual(result["probe_attempts"], 2)
-            self.assertEqual(runner.call_count, 2)
-            sleep.assert_called_once()
+            self.assertEqual(result["probe_attempts"], 4)
+            self.assertEqual(runner.call_count, 4)
+            self.assertEqual(sleep.call_count, 3)
             set_state.assert_called_once_with("web.service", "running")
 
     def test_quarantine_preparation_write_failure_never_suspends_process(self):

@@ -31,17 +31,24 @@ def analyze_identity(
     alerts: list[AlertCandidate] = []
     for name, old in previous.items():
         new = current.get(name)
-        if name in protected_accounts and (not new or not new.get("enabled", True)):
+        old_identity = str(old.get("account_id") or "")
+        new_identity = str((new or {}).get("account_id") or "")
+        identity_changed = bool(old_identity and new_identity and old_identity != new_identity)
+        if name in protected_accounts and (not new or not new.get("enabled", True) or identity_changed):
             features = {"protected_identity_loss": 1.0}
             alerts.append(
                 ModelBoundAlertCandidate(
                     kind="protected_identity_unavailable",
                     title="Protected competition identity is unavailable",
-                    summary=f"Protected account {old.get('name', name)} is missing or disabled.",
+                    summary=(
+                        f"Protected account {old.get('name', name)} now has a different UID or SID."
+                        if identity_changed else
+                        f"Protected account {old.get('name', name)} is missing or disabled."
+                    ),
                     severity="critical",
                     confidence=_confidence(model, features, 0.94),
                     model_features=features,
-                    evidence={"account": old, "current": new},
+                    evidence={"account": old, "current": new, "identity_changed": identity_changed},
                     recommendation=(
                         "Confirm whether Black Team or a scored service requires this identity. "
                         "Preserve evidence before restoring it through an event-approved procedure."
@@ -160,7 +167,13 @@ def analyze_persistence(
     for item in telemetry.get("persistence", []):
         key = _persistence_key(item)
         old = previous.get(key)
-        changed = bool(old and item.get("sha256") and old.get("sha256") != item.get("sha256"))
+        change_fields = (
+            [field for field in ("enabled", "owner") if field in old and field in item and old[field] != item[field]]
+            if old else []
+        )
+        if old and item.get("sha256") and old.get("sha256") != item["sha256"]:
+            change_fields.insert(0, "sha256")
+        changed = bool(change_fields)
         if old and not changed:
             continue
         owner = str(item.get("owner", "unknown")).casefold()
@@ -177,7 +190,7 @@ def analyze_persistence(
                 severity="high" if privileged_owner else "medium",
                 confidence=_confidence(model, features, 0.78 if privileged_owner else 0.62),
                 model_features=features,
-                evidence={"persistence": item, "baseline": old},
+                evidence={"persistence": item, "baseline": old, "changed_fields": change_fields},
                 recommendation=(
                     "Review the owner, target, creation time, and related authentication activity. "
                     "Preserve the item before any removal."

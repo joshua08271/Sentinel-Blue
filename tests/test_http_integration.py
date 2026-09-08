@@ -31,10 +31,23 @@ from sentinel_blue.operator_auth import (
     OPERATOR_HEADER_VERSION,
     operator_signature,
 )
-from sentinel_blue.store import Store
+from sentinel_blue.store import Store, ActionQuotaExceeded
 
 
 class HttpIntegrationTests(unittest.TestCase):
+    def test_baseline_storage_hold_is_a_conflict_and_preserves_reason(self):
+        path = "/api/v1/agents/test-agent/baseline/approve"
+        body = b"{}"
+        request = Request(
+            self.url + path, data=body, method="POST",
+            headers={"Content-Type": "application/json", **self._operator_headers("POST", path, body)},
+        )
+        with patch.object(self.app, "approve_baseline", side_effect=ActionQuotaExceeded("stored_data_quarantine_blocks_mutation")):
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(request)
+        self.assertEqual(rejected.exception.code, 409)
+        self.assertEqual(json.loads(rejected.exception.read())["error"], "stored_data_quarantine_blocks_mutation")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.directory.name) / "http.db")

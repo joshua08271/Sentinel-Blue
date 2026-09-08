@@ -154,6 +154,8 @@ def deployment_plan(
                 raise ValueError(f"session containment is not approved for {address}")
             if host.get("allow_restoration") and not event_profile.allows("file_restoration"):
                 raise ValueError(f"file restoration is not approved for {address}")
+            if host.get("allow_service_recovery") and not event_profile.allows("in_place_repair"):
+                raise ValueError(f"service recovery is not approved for {address}")
         operation = "install-agent"
         requires = ["approved credentials", "reachable management service"]
         if transport == "web-console":
@@ -182,6 +184,7 @@ def deployment_plan(
                         "python",
                         "allow_containment",
                         "allow_restoration",
+                        "allow_service_recovery",
                         "probe_config",
                         "install_directory",
                         "quarantine_ttl",
@@ -319,6 +322,7 @@ def _linux_unit(
     range_deployment: bool = False,
     agent_id: str | None = None,
     ca_file: str | None = None,
+    service_recovery: bool = False,
 ) -> str:
     args = [
         "/usr/bin/python3",
@@ -351,6 +355,8 @@ def _linux_unit(
         args.append("--allow-containment")
     if restoration:
         args.append("--allow-restoration")
+    if service_recovery:
+        args.append("--allow-service-recovery")
     command = " ".join(shlex.quote(value) for value in args)
     return "\n".join(
         (
@@ -501,6 +507,7 @@ def _deploy_ssh(
                 bool(step.options.get("range_deployment", False)),
                 str(step.options.get("agent_id", "")) or None,
                 remote_ca,
+                service_recovery=bool(step.options.get("allow_service_recovery", False)),
             ),
             encoding="utf-8",
         )
@@ -655,6 +662,7 @@ def _deploy_winrm(
         )
         containment = " --allow-containment" if step.options.get("allow_containment") else ""
         restoration = " --allow-restoration" if step.options.get("allow_restoration") else ""
+        service_recovery = " --allow-service-recovery" if step.options.get("allow_service_recovery") else ""
         range_argument = (
             " --range-deployment" if step.options.get("range_deployment", False) else ""
         )
@@ -730,9 +738,9 @@ try {{
       if ((Get-FileHash -Algorithm SHA256 $package).Hash.ToLowerInvariant() -ne '{checksum}') {{ throw 'Sentinel Blue package checksum mismatch' }}
       py -3 $package agent --controller '{controller}' --token-file C:\\ProgramData\\SentinelBlue\\enrollment.json --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --once {network_args}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}
       if ($LASTEXITCODE -ne 0) {{ throw ('Sentinel Blue enrollment failed with exit code ' + $LASTEXITCODE) }}
-      $action = New-ScheduledTaskAction -Execute 'py.exe' -Argument '-3 C:\\ProgramData\\SentinelBlue\\sentinel-blue.pyz agent --controller {controller} --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --log-file C:\\ProgramData\\SentinelBlue\\state\\agent.log --log-max-bytes 5242880 --log-backups 3 --quarantine-ttl {quarantine_ttl} {network_args}{containment}{restoration}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}'
+      $action = New-ScheduledTaskAction -Execute 'py.exe' -Argument '-3 C:\\ProgramData\\SentinelBlue\\sentinel-blue.pyz agent --controller {controller} --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --log-file C:\\ProgramData\\SentinelBlue\\state\\agent.log --log-max-bytes 5242880 --log-backups 3 --quarantine-ttl {quarantine_ttl} {network_args}{containment}{restoration}{service_recovery}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}'
       $trigger = New-ScheduledTaskTrigger -AtStartup
-      $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+      $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4
       Register-ScheduledTask -TaskName 'SentinelBlueAgent' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
       Start-ScheduledTask -TaskName 'SentinelBlueAgent'
       Get-ScheduledTask -TaskName 'SentinelBlueAgent' -ErrorAction Stop | Out-Null

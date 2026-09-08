@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   disposable-native-runner:
-    name: Disposable native runner campaign
+    name: Disposable Linux-native runner campaign
     if: >-
       github.actor == 'joshua08271' &&
       (github.event_name == 'workflow_dispatch' ||
@@ -92,3 +92,79 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
           path: native-live-report.json
+
+  disposable-windows-native-runner:
+    name: Disposable Windows-native runner campaign
+    if: >-
+      github.actor == 'joshua08271' &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      SENTINEL_BLUE_WINDOWS_DISPOSABLE_LAB: github-hosted-ephemeral-windows-runner
+      SENTINEL_BLUE_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install candidate
+        shell: pwsh
+        run: python -m pip install .
+
+      - name: Run the complete non-privileged regression suite
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Run owner-gated Windows-native red-on-blue campaign
+        shell: pwsh
+        run: >-
+          python -m sentinel_blue windows-native-lab
+          --output "$env:GITHUB_WORKSPACE\windows-native-live-report.json"
+          --json
+
+      - name: Measure native Windows collection during sustained CPU load
+        if: success() || failure()
+        shell: pwsh
+        run: >-
+          python tools/measure_collection_pressure.py
+          --load-seconds 180 --samples 3
+          --output windows-collection-pressure-report.json
+
+      - name: Summarize Windows-native campaign
+        if: always() && hashFiles('windows-native-live-report.json') != ''
+        shell: pwsh
+        run: |
+          $report = Get-Content -Raw -Path 'windows-native-live-report.json' | ConvertFrom-Json
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $lines.Add('### Sentinel Blue Windows-native red-on-blue lab')
+          $lines.Add('')
+          $lines.Add("- Status: **$($report.status)**")
+          $lines.Add("- Scenarios: $($report.scenarios_passed)/$($report.scenario_count)")
+          $lines.Add("- Cleanup verified: $($report.cleanup.verified)")
+          $lines.Add("- External targets contacted: $($report.scope.external_targets_contacted)")
+          $lines.Add('')
+          $lines.Add('| Scenario | Detection | Response | Native result |')
+          $lines.Add('|---|---|---|---|')
+          foreach ($scenario in @($report.scenarios)) {
+            $result = if ($scenario.response_success) { 'pass' } else { 'fail' }
+            $lines.Add("| $($scenario.name) | $($scenario.expected_alert) | $($scenario.response_action) | $result |")
+          }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+
+      - name: Upload sanitized Windows-native report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sentinel-blue-windows-native-red-blue-report
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            windows-native-live-report.json
+            windows-collection-pressure-report.json

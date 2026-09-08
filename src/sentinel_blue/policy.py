@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Any
 
 from .process_identity import validate_process_identity
@@ -117,6 +118,27 @@ def validate_action_parameters(
             raise ValueError(f"{action_type} requires a service name")
     if action_type == "rollback_service" and parameters.get("desired_state") not in {"running", "stopped"}:
         raise ValueError("rollback_service requires a running or stopped desired_state")
+    if action_type == "restart_service" and "recovery_guard" in parameters:
+        guard = parameters["recovery_guard"]
+        fields = {"files", "dependencies", "dependency_probes", "required_accounts", "boot_id", "sequence", "observed_at"}
+        if not isinstance(guard, dict) or set(guard) != fields:
+            raise ValueError("service recovery requires a complete guard")
+        validate_action_parameters("capture_restore_point", {"files": guard["files"]})
+        if any(not isinstance(item.get("security_descriptor_sha256"), str) for item in guard["files"]):
+            raise ValueError("service recovery files require explicit security metadata")
+        for field in ("dependencies", "required_accounts"):
+            rows = guard[field]
+            if not isinstance(rows, list) or len(rows) > 256 or any(
+                not isinstance(row, str) or not row or len(row) > 128 for row in rows
+            ) or len(set(rows)) != len(rows):
+                raise ValueError(f"service recovery {field} is invalid")
+        if any(not SERVICE_NAME.fullmatch(name) for name in guard["dependencies"]):
+            raise ValueError("service recovery dependency name is invalid")
+        validate_action_parameters("validate_service", {"probes": guard["dependency_probes"]})
+        if (not isinstance(guard["boot_id"], str) or guard["boot_id"] in {"", "unknown"}
+            or len(guard["boot_id"]) > 128 or type(guard["sequence"]) is not int or guard["sequence"] < 1
+            or type(guard["observed_at"]) not in {int, float} or not math.isfinite(guard["observed_at"])):
+            raise ValueError("service recovery observation is invalid")
     if action_type == "capture_restore_point":
         files = parameters.get("files")
         if not isinstance(files, list) or not files or len(files) > 256:

@@ -76,6 +76,7 @@ ACTION_RESULT_FIELDS = frozenset(
         "config_validation",
         "probes",
         "probe_attempts",
+        "stable_health",
         "retention_warnings",
         "captured",
         "capture_receipts",
@@ -828,6 +829,10 @@ def validate_action_result(
     for flag in ("dry_run", "rolled_back", "interrupted", "review_required"):
         if flag in payload:
             result[flag] = _boolean(payload[flag], flag)
+    if "stable_health" in payload:
+        if result["action_type"] != "restart_service":
+            raise ValidationError("stable_health is valid only for restart_service results")
+        result["stable_health"] = _boolean(payload["stable_health"], "stable_health")
     if result["completed_at"] < result["started_at"]:
         raise ValidationError("completed_at must not precede started_at")
     if result["success"] and (

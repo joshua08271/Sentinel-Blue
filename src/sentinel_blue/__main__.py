@@ -110,6 +110,11 @@ def parser() -> argparse.ArgumentParser:
         help="automatically queue approved integrity restoration when no change grant is active",
     )
     controller.add_argument(
+        "--auto-recover-services",
+        action="store_true",
+        help="recover explicitly authorized stopped services after two fresh observations and guarded checks",
+    )
+    controller.add_argument(
         "--restore-confirmations",
         type=int,
         default=2,
@@ -168,6 +173,10 @@ def parser() -> argparse.ArgumentParser:
     )
     agent.add_argument("--state-dir", default=str(Path.home() / ".sentinel-blue"))
     agent.add_argument("--allow-containment", action="store_true")
+    agent.add_argument(
+        "--allow-service-recovery", action="store_true",
+        help="permit profile-authorized native service recovery independently of session containment",
+    )
     agent.add_argument(
         "--allow-restoration",
         action="store_true",
@@ -275,6 +284,22 @@ def parser() -> argparse.ArgumentParser:
     )
     native_lab.add_argument("--json", action="store_true")
 
+    windows_native_lab = subcommands.add_parser(
+        "windows-native-lab",
+        help=(
+            "run the owner-gated Windows-native campaign on a disposable "
+            "GitHub-hosted runner"
+        ),
+    )
+    windows_native_lab.add_argument(
+        "--output",
+        help=(
+            "report path; must resolve to "
+            "GITHUB_WORKSPACE/windows-native-live-report.json"
+        ),
+    )
+    windows_native_lab.add_argument("--json", action="store_true")
+
     doctor = subcommands.add_parser("doctor", help="run local readiness and package diagnostics")
     doctor.add_argument("--database")
     doctor.add_argument("--state-dir", default=str(Path.home() / ".sentinel-blue"))
@@ -377,6 +402,8 @@ def main() -> None:
         from .policy_lab import run
     elif args.command == "native-lab":
         from .native_range_lab import run
+    elif args.command == "windows-native-lab":
+        from .windows_native_range_lab import run
     elif args.command == "doctor":
         from .diagnostics import run
     elif args.command.startswith("recovery-"):

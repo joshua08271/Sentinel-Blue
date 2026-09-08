@@ -527,6 +527,7 @@ class LauncherTests(unittest.TestCase):
             self.assertIn("Remove-Item -Force", script)
             self.assertIn("Register-ScheduledTask", script)
             self.assertIn("New-ScheduledTaskSettingsSet -RestartCount 999", script)
+            self.assertRegex(script, r"New-ScheduledTaskSettingsSet[^\n]* -Priority 4(?:\r?\n|$)")
             self.assertIn("Get-ScheduledTaskInfo", script)
             self.assertIn("--expected-package-sha256", script)
             self.assertIn("post-install checksum mismatch", script)

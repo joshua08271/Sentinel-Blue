@@ -9,12 +9,17 @@ import secrets
 import socket
 import ssl
 import struct
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
 from .protocol import ProbeResult
+
+
+class ProbeBatchCancelled(RuntimeError):
+    """A stopped caller must not publish an incomplete probe batch."""
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -444,9 +449,16 @@ def run_probes(
     *,
     authorized_hosts: list[str] | tuple[str, ...] | None = None,
     excluded_hosts: list[str] | tuple[str, ...] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> list[ProbeResult]:
     bounded = list(specs[:256])
+
+    def check_cancelled() -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise ProbeBatchCancelled("probe batch cancelled during shutdown")
+
     def run_scoped(spec: dict[str, Any]) -> ProbeResult:
+        check_cancelled()
         return run_probe(
             spec,
             authorized_networks,
@@ -454,8 +466,15 @@ def run_probes(
             excluded_hosts=excluded_hosts,
         )
 
+    check_cancelled()
     if len(bounded) <= 1:
-        return [run_scoped(spec) for spec in bounded]
-    workers = min(16, len(bounded))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sentinel-probe") as pool:
-        return list(pool.map(run_scoped, bounded))
+        results = [run_scoped(spec) for spec in bounded]
+    else:
+        workers = min(16, len(bounded))
+        # Exiting the pool still joins in-flight probes. Queued work checks the
+        # stop event before opening a socket; cancellation never returns partial
+        # observations or leaves unowned probe threads behind.
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sentinel-probe") as pool:
+            results = list(pool.map(run_scoped, bounded))
+    check_cancelled()
+    return results

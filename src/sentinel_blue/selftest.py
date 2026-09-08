@@ -810,7 +810,7 @@ def self_test(
         ),
         "validation_boundary": [
             "No real CCDC scoring engine or competition portal was available.",
-            "Windows collection and WinRM deployment were syntax- and fixture-tested, not run on Windows.",
+            "This local self-test does not exercise the separate GitHub-hosted Windows-native campaign or WinRM deployment.",
             "Live service changes and real remote hosts were intentionally not touched.",
             "Policy-lab outcomes are synthetic and do not establish competition readiness.",
         ],

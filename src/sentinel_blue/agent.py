@@ -30,6 +30,7 @@ from .auth import ReplayGuard, signature, unwrap_enrollment_token, verify_respon
 from .change_watch import ChangeWatcher
 from .collectors import collect, integrity_watch_paths, machine_identity
 from .event_profile import EventProfile, load_event_profile
+from .service_recovery import validate_automatic_recovery
 from .health import assess_agent_health
 from .json_codec import canonical_json_bytes, strict_json_loads
 from .net_safety import validate_http_origin
@@ -1144,7 +1145,15 @@ def execute_queued_action(
     ):
         raise RuntimeError("action journal claim changed unexpectedly")
     execution_started = time.time()
-    if health["action_safe"]:
+    recovery_error = None
+    if action_type == "restart_service" and envelope["automated"]:
+        try:
+            validate_automatic_recovery(profile, local_agent_id, envelope["parameters"], telemetry)
+        except (KeyError, TypeError, ValueError) as exc:
+            recovery_error = str(exc)
+    if recovery_error is not None:
+        result = {"success": False, "message": f"agent service recovery gate refused action: {recovery_error}"}
+    elif health["action_safe"]:
         result = executor.execute(action_type, envelope["parameters"], telemetry)
     else:
         result = {
@@ -1230,6 +1239,9 @@ def _run_with_windows_state_guard(
     excluded_hosts = list(event_profile.excluded_hosts)
     if args.allow_containment and not event_profile.allows("session_containment"):
         raise ValueError("session containment is not authorized by the event profile")
+    allow_service_recovery = bool(getattr(args, "allow_service_recovery", False))
+    if allow_service_recovery and not event_profile.allows("in_place_repair"):
+        raise ValueError("service recovery is not authorized by the event profile")
     if args.allow_restoration and not event_profile.allows("file_restoration"):
         raise ValueError("file restoration is not authorized by the event profile")
     state_dir = prepare_state_directory(args.state_dir)
@@ -1317,6 +1329,7 @@ def _run_with_windows_state_guard(
         default_probes=probe_specs,
         authorized_hosts=authorized_hosts,
         excluded_hosts=excluded_hosts,
+        allow_service_recovery=allow_service_recovery,
     )
     watcher = ChangeWatcher(
         integrity_watch_paths(integrity_paths),
@@ -1325,12 +1338,14 @@ def _run_with_windows_state_guard(
     if not args.once:
         watcher.start()
     LOG.warning(
-        "agent %s starting; containment=%s restoration=%s",
+        "agent %s starting; containment=%s restoration=%s service_recovery=%s",
         agent_id,
         args.allow_containment,
         args.allow_restoration,
+        allow_service_recovery,
     )
     systemd_notify("READY=1\nSTATUS=Sentinel Blue agent collecting defensive telemetry")
+    accepted_telemetry: dict[str, Any] | None = None
     while True:
         try:
             health = assess_agent_health(
@@ -1340,6 +1355,11 @@ def _run_with_windows_state_guard(
             refresh_windows_state_health(windows_state_guard, health)
             if client.agent_token:
                 deliver_pending_action_results(client, result_outbox)
+            if accepted_telemetry is not None and journal.healthy and sequence.healthy:
+                process_controller_actions(
+                    client, result_outbox, journal, executor,
+                    accepted_telemetry, health, event_profile,
+                )
             collection_started = time.monotonic()
             telemetry = collect(
                 agent_id,
@@ -1368,6 +1388,20 @@ def _run_with_windows_state_guard(
                 executor, health, str(telemetry.get("boot_id", "unknown"))
             )
             telemetry["collector_errors"].extend(health["errors"])
+            # Operator-approved capture can arrive during a slow collection.
+            # Finish work bound to the last accepted sample before replacing it.
+            # Recollect after any action so pre-action state is never published.
+            if (
+                accepted_telemetry is not None
+                and not telemetry["collector_errors"]
+                and all(probe.get("healthy", False) for probe in telemetry.get("probes", []))
+                and process_controller_actions(
+                    client, result_outbox, journal, executor,
+                    accepted_telemetry, health, event_profile,
+                )
+            ):
+                systemd_notify("WATCHDOG=1\nSTATUS=Recollecting after controller action")
+                continue
             telemetry["sequence"] = sequence.next()
             # The controller's observation digest includes the durable queue
             # timestamp.  Keep the exact submitted document in memory so an
@@ -1385,6 +1419,7 @@ def _run_with_windows_state_guard(
                 try:
                     client.telemetry(queued)
                     spool.acknowledge(queued_path)
+                    accepted_telemetry = queued
                 except HTTPError as exc:
                     if exc.code in {400, 403} and getattr(
                         exc, "sentinel_blue_verified", False

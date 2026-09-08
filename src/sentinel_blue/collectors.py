@@ -11,6 +11,8 @@ import socket
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,20 @@ from .protocol import (
 from .process_identity import inspect_process_identity
 
 MAX_WINDOWS_INTEGRITY_FILE_BYTES = 32 * 1024 * 1024
+WINDOWS_INVENTORY_BUDGET_SECONDS = 75.0
+_windows_deadline: ContextVar[float | None] = ContextVar("windows_inventory_deadline", default=None)
+
+
+@contextmanager
+def _windows_inventory_budget():
+    """Share one finite query budget without carrying state into the next cycle."""
+    current = _windows_deadline.get()
+    deadline = current if current is not None else time.monotonic() + WINDOWS_INVENTORY_BUDGET_SECONDS
+    token = _windows_deadline.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _windows_deadline.reset(token)
 
 
 def _run(command: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
@@ -51,7 +67,12 @@ def _run(command: list[str], timeout: float = 8.0) -> subprocess.CompletedProces
         capture_output=True,
         timeout=timeout,
         check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        # Avoid inheriting a background task's below-normal scheduling class.
+        # Normal priority still shares the CPU with the applications we monitor.
+        creationflags=(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0)
+        ),
     )
 
 
@@ -87,7 +108,11 @@ def _linux_accounts() -> list[Account]:
             Account(
                 name=entry.pw_name,
                 account_id=str(entry.pw_uid),
-                privileged=entry.pw_uid == 0 or entry.pw_name in privileged_names,
+                privileged=(
+                    entry.pw_uid == 0
+                    or entry.pw_name in privileged_names
+                    or bool(set(groups) & {"sudo", "wheel", "admin"})
+                ),
                 enabled=not disabled_shell,
                 source="local",
                 groups=groups,
@@ -252,27 +277,50 @@ def _linux_services(errors: list[str]) -> list[Service]:
     return services[:2000]
 
 
-def _windows_json(script: str) -> Any:
-    result = _run(
-        ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-        timeout=20,
-    )
+def _windows_json(script: str, timeout: float = 60.0) -> Any:
+    deadline = _windows_deadline.get()
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Windows inventory query budget exhausted")
+        timeout = min(timeout, remaining)
+    try:
+        result = _run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+             "$ErrorActionPreference = 'Stop'\n" + script],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"PowerShell collector timed out after {timeout:g} seconds") from exc
+    if deadline is not None and time.monotonic() > deadline:
+        raise RuntimeError("Windows inventory query completed after its collection budget")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "PowerShell command failed")
+    if result.stderr.strip():
+        # PowerShell can exit successfully after a non-terminating error and
+        # still emit partial JSON. Never turn that into a complete observation.
+        raise RuntimeError("PowerShell collector reported errors: " + result.stderr.strip())
     if not result.stdout.strip():
         return []
     value = json.loads(result.stdout)
-    return value if isinstance(value, list) else [value]
+    rows = value if isinstance(value, list) else [value]
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError("PowerShell inventory JSON must contain object rows")
+    return rows
 
 
 def _windows_accounts(errors: list[str]) -> list[Account]:
     script = r"""
-$admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object {$_.Name.Split('\\')[-1]})
+$adminGroup = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction Stop
+$admins = @($adminGroup | Get-LocalGroupMember -ErrorAction Stop | ForEach-Object {$_.Name.Split('\')[-1]})
 Get-LocalUser | ForEach-Object {
   [PSCustomObject]@{Name=$_.Name; SID=$_.SID.Value; Enabled=$_.Enabled; Privileged=($admins -contains $_.Name)}
 } | ConvertTo-Json -Compress
 """
     try:
+        rows = _windows_json(script)
+        if not rows:
+            raise ValueError("Windows account inventory returned no records")
         return [
             Account(
                 name=str(item.get("Name", "unknown")),
@@ -282,7 +330,7 @@ Get-LocalUser | ForEach-Object {
                 source="local",
                 groups=["Administrators"] if bool(item.get("Privileged")) else [],
             )
-            for item in _windows_json(script)
+            for item in rows
         ]
     except Exception as exc:
         errors.append(f"Windows account inventory failed: {exc}")
@@ -296,12 +344,15 @@ $since = (Get-Date).AddMinutes(-15)
 Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Service Control Manager';Id=7031,7034;StartTime=$since} -MaxEvents 512 -ErrorAction SilentlyContinue | ForEach-Object {
   if ($_.Properties.Count -gt 0) { $key = [string]$_.Properties[0].Value; $restartFailures[$key] = 1 + [int]$restartFailures[$key] }
 }
-Get-CimInstance Win32_Service | ForEach-Object {
+Get-CimInstance Win32_Service -Property Name,DisplayName,State,StartMode,Status,ExitCode | ForEach-Object {
   $count = [int]$restartFailures[$_.Name] + [int]$restartFailures[$_.DisplayName]
   [PSCustomObject]@{Name=$_.Name;State=$_.State;StartMode=$_.StartMode;Status=$_.Status;ExitCode=$_.ExitCode;RestartCount=$count}
 } | ConvertTo-Json -Compress
 """
     try:
+        rows = _windows_json(script)
+        if not rows:
+            raise ValueError("Windows service inventory returned no records")
         return [
             Service(
                 name=str(item.get("Name", "unknown")),
@@ -316,25 +367,26 @@ Get-CimInstance Win32_Service | ForEach-Object {
                 restart_count=max(0, int(item.get("RestartCount", 0) or 0)),
                 exit_code=max(0, int(item.get("ExitCode", 0) or 0)),
             )
-            for item in _windows_json(script)
+            for item in rows
         ]
     except Exception as exc:
         errors.append(f"Windows service inventory failed: {exc}")
         return []
 
 
-def _windows_sessions(accounts: list[Account], errors: list[str]) -> list[Session]:
+def _windows_sessions(accounts: list[Account], errors: list[str], *, boot_id: str | None = None) -> list[Session]:
     privileged = {account.name.casefold() for account in accounts if account.privileged}
     script = r"""
 $names = @('powershell','pwsh','cmd','WindowsTerminal','ssh','sshd','wsmprovhost')
 Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
-  Where-Object { $names -contains $_.ProcessName } |
+  Where-Object { $_.Id -ne $PID -and $names -contains $_.ProcessName } |
   Select-Object Id,ProcessName,SessionId,UserName |
   ConvertTo-Json -Compress
 """
     try:
         sessions: list[Session] = []
-        boot_id = _boot_id("windows")
+        if boot_id is None:
+            boot_id = _boot_id("windows")
         for item in _windows_json(script):
             raw_user = str(item.get("UserName", ""))
             username = raw_user.split("\\")[-1] if raw_user else "unknown"
@@ -495,10 +547,47 @@ def _linux_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], lis
 
 
 def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], list[Listener]]:
+    # Reuse one PowerShell host and its network module for the related queries.
+    # Each section retains an explicit error so a partial batch cannot look fresh
+    # and complete merely because the enclosing process exited successfully.
+    script = r"""
+$problems = @{}
+try { $routes = @(Get-NetRoute | Select-Object DestinationPrefix,NextHop,InterfaceAlias,RouteMetric) }
+catch { $routes = @(); $problems['Routes'] = [string]$_.Exception.Message }
+try { $neighbors = @(Get-NetNeighbor | Select-Object IPAddress,LinkLayerAddress,InterfaceAlias,State) }
+catch { $neighbors = @(); $problems['Neighbors'] = [string]$_.Exception.Message }
+try { $listeners = @(Get-NetTCPConnection -State Listen | Select-Object LocalAddress,LocalPort,OwningProcess) }
+catch { $listeners = @(); $problems['Listeners'] = [string]$_.Exception.Message }
+[PSCustomObject]@{Schema=1;Routes=$routes;Neighbors=$neighbors;Listeners=$listeners;Errors=$problems} | ConvertTo-Json -Depth 4 -Compress
+"""
     try:
-        route_rows = _windows_json(
-            "Get-NetRoute | Select DestinationPrefix,NextHop,InterfaceAlias,RouteMetric | ConvertTo-Json -Compress"
-        )
+        batch = _windows_json(script)
+        if len(batch) != 1 or not isinstance(batch[0], dict):
+            raise ValueError("incomplete topology batch")
+        state = batch[0]
+        sections = {"Routes", "Neighbors", "Listeners"}
+        if state.get("Schema") != 1 or not sections.issubset(state):
+            raise ValueError("incomplete topology sections")
+        failures = state.get("Errors")
+        if (
+            not isinstance(failures, dict)
+            or not set(failures).issubset(sections)
+            or any(not isinstance(value, str) or not value for value in failures.values())
+        ):
+            raise ValueError("invalid topology error records")
+    except Exception as exc:
+        errors.append(f"Windows topology inventory failed: {exc}")
+        return [], [], []
+
+    def rows_for(section: str) -> list[dict[str, Any]]:
+        if section in failures:
+            raise RuntimeError(failures[section])
+        rows = state[section]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"incomplete topology section: {section}")
+        return rows
+
+    try:
         routes = [
             Route(
                 destination=str(row.get("DestinationPrefix", "")),
@@ -506,15 +595,12 @@ def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], l
                 interface=str(row.get("InterfaceAlias", "")),
                 metric=int(row["RouteMetric"]) if row.get("RouteMetric") is not None else None,
             )
-            for row in route_rows
+            for row in rows_for("Routes")
         ]
     except Exception as exc:
         errors.append(f"Windows route inventory failed: {exc}")
         routes = []
     try:
-        neighbor_rows = _windows_json(
-            "Get-NetNeighbor | Select IPAddress,LinkLayerAddress,InterfaceAlias,State | ConvertTo-Json -Compress"
-        )
         neighbors = [
             Neighbor(
                 address=str(row.get("IPAddress", "")),
@@ -522,15 +608,12 @@ def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], l
                 interface=str(row.get("InterfaceAlias", "")),
                 state=str(row.get("State", "unknown")),
             )
-            for row in neighbor_rows
+            for row in rows_for("Neighbors")
         ]
     except Exception as exc:
         errors.append(f"Windows neighbor inventory failed: {exc}")
         neighbors = []
     try:
-        listener_rows = _windows_json(
-            "Get-NetTCPConnection -State Listen | Select LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress"
-        )
         listeners = [
             Listener(
                 protocol="tcp",
@@ -538,7 +621,7 @@ def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], l
                 port=int(row.get("LocalPort", 0)),
                 process=str(row.get("OwningProcess", "")),
             )
-            for row in listener_rows
+            for row in rows_for("Listeners")
             if row.get("LocalPort")
         ]
     except Exception as exc:
@@ -591,9 +674,21 @@ def _linux_processes(errors: list[str]) -> list[ProcessObservation]:
 def _windows_processes(errors: list[str]) -> list[ProcessObservation]:
     script = r"""
 $admins = @(Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | Get-LocalGroupMember -ErrorAction SilentlyContinue | ForEach-Object {$_.Name.Split('\')[-1]})
-Get-CimInstance Win32_Process | Select-Object -First 4096 | ForEach-Object {
-  $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
-  $user = if ($owner.User) {$owner.User} else {'unknown'}
+# One bulk owner query avoids a CIM round trip for every process. Correlate
+# creation time as well as PID so a reused PID never inherits another owner.
+$owners = @{}
+Get-Process -IncludeUserName -ErrorAction SilentlyContinue | ForEach-Object {
+  try {
+    if ($_.UserName) { $owners[[int]$_.Id] = [PSCustomObject]@{UserName=$_.UserName;Started=$_.StartTime.ToUniversalTime()} }
+  } catch { }
+}
+Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate | Select-Object -First 4096 | ForEach-Object {
+  $owner = $owners[[int]$_.ProcessId]
+  $user = 'unknown'
+  if ($owner -and $_.CreationDate) {
+    $delta = [Math]::Abs(($_.CreationDate.ToUniversalTime() - $owner.Started).TotalMilliseconds)
+    if ($delta -lt 1) { $user = $owner.UserName.Split('\')[-1] }
+  }
   [PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;Name=$_.Name;ExecutablePath=$_.ExecutablePath;UserName=$user;Privileged=($user -eq 'SYSTEM' -or $user -eq 'Administrator' -or $admins -contains $user)}
 } | ConvertTo-Json -Compress
 """
@@ -682,12 +777,30 @@ def _linux_persistence(errors: list[str]) -> list[PersistenceItem]:
 
 def _windows_persistence(errors: list[str]) -> list[PersistenceItem]:
     script = r"""
+$items = [Collections.Generic.List[object]]::new()
 Get-ScheduledTask | ForEach-Object {
   $actionText = ($_.Actions | ConvertTo-Json -Depth 4 -Compress)
   $sha = [Security.Cryptography.SHA256]::Create()
   try { $hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($actionText)))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
-  [PSCustomObject]@{Kind='scheduled-task';Name=($_.TaskPath+$_.TaskName);Owner=$_.Author;Enabled=($_.State -ne 'Disabled');SHA256=$hash}
-} | ConvertTo-Json -Compress
+  $items.Add([PSCustomObject]@{Kind='scheduled-task';Name=($_.TaskPath+$_.TaskName);Owner=$_.Author;Enabled=($_.State -ne 'Disabled');SHA256=$hash})
+}
+$locations = @(
+  [PSCustomObject]@{Path='Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run';Label='HKLM\Software\Microsoft\Windows\CurrentVersion\Run';Owner='SYSTEM'},
+  [PSCustomObject]@{Path='Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run';Label='HKCU\Software\Microsoft\Windows\CurrentVersion\Run';Owner=[Security.Principal.WindowsIdentity]::GetCurrent().Name}
+)
+foreach ($location in $locations) {
+  $key = Get-Item -LiteralPath $location.Path -ErrorAction SilentlyContinue
+  if ($null -eq $key) { continue }
+  foreach ($name in @($key.GetValueNames() | Sort-Object)) {
+    $kind = [string]$key.GetValueKind($name)
+    $value = [string]$key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $actionText = [PSCustomObject]@{Kind=$kind;Value=$value} | ConvertTo-Json -Compress
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($actionText)))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
+    $items.Add([PSCustomObject]@{Kind='registry-run';Name=($location.Label+'\'+$name);Owner=$location.Owner;Enabled=$true;SHA256=$hash})
+  }
+}
+$items | ConvertTo-Json -Compress
 """
     try:
         return [
@@ -740,17 +853,37 @@ def _linux_firewall(errors: list[str]) -> FirewallState:
 
 def _windows_firewall(errors: list[str]) -> FirewallState:
     script = r"""
-$profiles = @(Get-NetFirewallProfile | Select Name,Enabled)
-$rules = @(Get-NetFirewallRule | Sort-Object Name | Select Name,Enabled,Direction,Action,Profile)
-[PSCustomObject]@{Profiles=$profiles;Rules=$rules} | ConvertTo-Json -Depth 4 -Compress
+$ErrorActionPreference = 'Stop'
+$profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Select-Object Name,@{Name='Enabled';Expression={([string]$_.Enabled -eq 'True')}},DefaultInboundAction,DefaultOutboundAction,AllowInboundRules,AllowLocalFirewallRules,AllowLocalIPsecRules,AllowUserApps,AllowUserPorts,AllowUnicastResponseToMulticast,EnableStealthModeForIPsec)
+$rules = @(Get-NetFirewallRule -PolicyStore ActiveStore | Select-Object Name,InstanceID,Enabled,Direction,Action,Profile,EdgeTraversalPolicy,LooseSourceMapping,LocalOnlyMapping,Owner,Platform,PolicyStoreSource,PolicyStoreSourceType)
+# Filter objects hold enforcement conditions absent from Get-NetFirewallRule.
+# Batch retrieval preserves rule/filter identity without one call per rule.
+$filters = [ordered]@{
+  Address = @(Get-NetFirewallAddressFilter -PolicyStore ActiveStore | Select-Object InstanceID,LocalAddress,RemoteAddress)
+  Port = @(Get-NetFirewallPortFilter -PolicyStore ActiveStore | Select-Object InstanceID,Protocol,LocalPort,RemotePort,IcmpType,DynamicTarget)
+  Application = @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore | Select-Object InstanceID,Program,Package)
+  Service = @(Get-NetFirewallServiceFilter -PolicyStore ActiveStore | Select-Object InstanceID,Service)
+  Interface = @(Get-NetFirewallInterfaceFilter -PolicyStore ActiveStore | Select-Object InstanceID,InterfaceAlias)
+  InterfaceType = @(Get-NetFirewallInterfaceTypeFilter -PolicyStore ActiveStore | Select-Object InstanceID,InterfaceType)
+  Security = @(Get-NetFirewallSecurityFilter -PolicyStore ActiveStore | Select-Object InstanceID,Authentication,Encryption,OverrideBlockRules,LocalUser,RemoteUser,RemoteMachine)
+}
+[PSCustomObject]@{Schema=2;Profiles=$profiles;Rules=$rules;Filters=$filters} | ConvertTo-Json -Depth 6 -Compress
 """
     try:
-        rows = _windows_json(script)
-        state = rows[0] if rows and isinstance(rows[0], dict) else {}
+        rows = _windows_json(script, timeout=60.0)
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise ValueError("incomplete firewall inventory")
+        state = rows[0]
+        filters = state.get("Filters")
+        expected_filters = {"Address", "Port", "Application", "Service", "Interface", "InterfaceType", "Security"}
+        if state.get("Schema") != 2 or not isinstance(filters, dict) or set(filters) != expected_filters:
+            raise ValueError("incomplete firewall filter inventory")
+        if not isinstance(state.get("Rules"), list) or any(not isinstance(value, list) for value in filters.values()):
+            raise ValueError("malformed firewall inventory")
         profiles = state.get("Profiles", [])
-        if isinstance(profiles, dict):
-            profiles = [profiles]
-        encoded = json.dumps(state, separators=(",", ":"), sort_keys=True)
+        if not isinstance(profiles, list) or not profiles or any(not isinstance(item, dict) or not isinstance(item.get("Enabled"), bool) for item in profiles):
+            raise ValueError("incomplete firewall profile inventory")
+        encoded = json.dumps(_canonical_firewall_state(state), separators=(",", ":"), sort_keys=True)
         enabled = bool(profiles) and all(bool(item.get("Enabled")) for item in profiles)
         return FirewallState(
             enabled=enabled,
@@ -763,6 +896,16 @@ $rules = @(Get-NetFirewallRule | Sort-Object Name | Select Name,Enabled,Directio
         return FirewallState(False, provider="Windows Defender Firewall", detail="inventory failed")
 
 
+def _canonical_firewall_state(value: Any) -> Any:
+    """NetSecurity inventories and condition arrays are unordered sets."""
+    if isinstance(value, dict):
+        return {key: _canonical_firewall_state(item) for key, item in value.items()}
+    if isinstance(value, list):
+        normalized = [_canonical_firewall_state(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, separators=(",", ":"), sort_keys=True))
+    return value
+
+
 def _boot_id(system: str) -> str:
     if system != "windows":
         try:
@@ -771,7 +914,7 @@ def _boot_id(system: str) -> str:
             return "unknown"
     try:
         rows = _windows_json(
-            "Get-CimInstance Win32_OperatingSystem | Select LastBootUpTime | ConvertTo-Json -Compress"
+            "Get-CimInstance Win32_OperatingSystem -Property LastBootUpTime | Select LastBootUpTime | ConvertTo-Json -Compress"
         )
         return str(rows[0].get("LastBootUpTime", "unknown")) if rows else "unknown"
     except Exception:
@@ -914,7 +1057,7 @@ $events | ForEach-Object {
         return []
 
 
-def _windows_inventory(errors: list[str]) -> tuple[
+def _windows_inventory(errors: list[str], *, boot_id: str | None = None) -> tuple[
     list[Account],
     list[Session],
     list[Service],
@@ -927,12 +1070,12 @@ def _windows_inventory(errors: list[str]) -> tuple[
     list[Interface],
     list[SecurityEvent],
 ]:
-    """Collect independent native inventories concurrently and merge errors in order."""
-    account_errors: list[str] = []
-    accounts = _windows_accounts(account_errors)
+    """Bound native helper contention and merge complete inventory errors in order."""
+    deadline = _windows_deadline.get()
+    if deadline is None:
+        deadline = time.monotonic() + WINDOWS_INVENTORY_BUDGET_SECONDS
     jobs = (
         lambda local: _windows_services(local),
-        lambda local: _windows_sessions(accounts, local),
         lambda local: _windows_topology(local),
         lambda local: _windows_processes(local),
         lambda local: _windows_persistence(local),
@@ -943,10 +1086,25 @@ def _windows_inventory(errors: list[str]) -> tuple[
 
     def execute(job: Any) -> tuple[Any, list[str]]:
         local_errors: list[str] = []
-        return job(local_errors), local_errors
+        token = _windows_deadline.set(deadline)
+        try:
+            return job(local_errors), local_errors
+        finally:
+            _windows_deadline.reset(token)
 
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="sb-win-collect") as pool:
+    accounts, account_errors = execute(_windows_accounts)
+
+    # On a single CPU, overlapping PowerShell/CIM helpers made otherwise valid
+    # inventories time out and held recovery. Keep each query bounded without
+    # dropping a collector or trusting its prior result as a fresh observation.
+    workers = min(2, max(1, os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sb-win-collect") as pool:
         results = list(pool.map(execute, jobs))
+    # A session scan must not observe our short-lived inventory PowerShell
+    # helpers after they exit. Its own PowerShell process is excluded by $PID;
+    # every remaining session still needs the normal exact process identity.
+    results.insert(1, execute(lambda local: _windows_sessions(accounts, local) if boot_id is None
+                             else _windows_sessions(accounts, local, boot_id=boot_id)))
     errors.extend(account_errors)
     for _value, local_errors in results:
         errors.extend(local_errors)
@@ -1007,7 +1165,18 @@ def _integrity_paths(system: str, extra_paths: list[str] | None = None) -> list[
             (Path("/var/named"), "*.zone"),
         ):
             try:
-                candidates.extend(sorted(root.glob(pattern)))
+                for discovered in sorted(root.glob(pattern)):
+                    # Installed service aliases are not writable restore targets.
+                    # Monitor/capture the canonical file; the alias remains in
+                    # persistence telemetry. A new destination is a new path
+                    # requiring manifest and baseline review. Explicit protected
+                    # paths are never silently redirected by this discovery step.
+                    if root == Path("/etc/systemd/system") and discovered.is_symlink():
+                        try:
+                            discovered = discovered.resolve(strict=True)
+                        except (OSError, RuntimeError):
+                            pass
+                    candidates.append(discovered)
             except OSError:
                 pass
     for raw in extra_paths or []:
@@ -1095,22 +1264,29 @@ def collect(
     authorized_hosts: list[str] | tuple[str, ...] | None = None,
     excluded_hosts: list[str] | tuple[str, ...] | None = None,
 ) -> Telemetry:
+    # Date the oldest part of this observation. Dating completion instead would
+    # let a slow inventory refresh the apparent age of already-stale evidence.
+    observed_at = time.time()
     errors: list[str] = []
     system = platform.system().casefold()
     if system == "windows":
-        (
-            accounts,
-            sessions,
-            services,
-            routes,
-            neighbors,
-            listeners,
-            processes,
-            persistence,
-            firewall,
-            interfaces,
-            security_events,
-        ) = _windows_inventory(errors)
+        with _windows_inventory_budget():
+            boot_id = _boot_id(system)
+            if boot_id == "unknown":
+                errors.append("Windows boot identity is unavailable")
+            (
+                accounts,
+                sessions,
+                services,
+                routes,
+                neighbors,
+                listeners,
+                processes,
+                persistence,
+                firewall,
+                interfaces,
+                security_events,
+            ) = _windows_inventory(errors, boot_id=boot_id)
     else:
         accounts = _linux_accounts()
         privileged = {item.name.casefold() for item in accounts if item.privileged}
@@ -1150,7 +1326,7 @@ def collect(
         agent_id=agent_id,
         hostname=socket.gethostname(),
         platform=f"{platform.system()} {platform.release()}",
-        observed_at=time.time(),
+        observed_at=observed_at,
         accounts=accounts,
         sessions=sessions,
         services=services,
@@ -1165,7 +1341,7 @@ def collect(
         security_events=security_events,
         firewall=firewall,
         collector_errors=bounded_errors,
-        boot_id=_boot_id(system),
+        boot_id=boot_id if system == "windows" else _boot_id(system),
     )
 
 
