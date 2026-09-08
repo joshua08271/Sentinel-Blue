@@ -216,6 +216,43 @@ class WindowsNativeRunnerLab:
         self.baseline_digest = ""
         self.baseline_security_digest = ""
         self.sequence = 0
+        self.completed_scenarios: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _action_failure(label: str, result: Mapping[str, Any]) -> WindowsNativeRangeError:
+        """Report fixed diagnostic categories, never raw action output or ACLs."""
+        message = str(result.get('message', ''))
+        categories = (
+            'no approved restore point exists for this exact path and digest',
+            'restore-point security metadata does not match the approved baseline',
+            'target changed again after the monitored observation',
+            'target security metadata changed again after the monitored observation',
+            'post-restoration Windows security descriptor did not match',
+            'post-restoration bytes or security metadata did not match the approved restore point',
+            'Windows restoration file could not be opened',
+            'Windows restoration file could not be read',
+            'Windows restoration file information could not be changed',
+            'Windows restoration file mode could not be read',
+            'Windows restoration target changed before publish',
+            'Windows restoration target name changed before publish',
+            'Windows restoration temporary file did not verify',
+            'Windows file security descriptor could not be restored',
+            'Windows file security descriptor restore was incomplete',
+            'Windows file security descriptor could not be read',
+            'Windows security restore context could not be released',
+            'required Windows privilege is unavailable',
+            'file restoration failed configuration validation and was rolled back',
+            'file restoration failed service validation and was rolled back',
+        )
+        reasons = [category for category in categories if category in message]
+        codes = re.findall(r'\[(?:Errno|WinError) ([0-9]{1,10})\]', message)
+        mismatch = re.search(r'\((owner|group|control|revision|resource manager control|(?:DACL|SACL)(?: (?:presence|invalid|revision|ACE count|ACE order|ACE type|ACE flags|ACE data|encoding))?)\)', message)
+        details = reasons or ['unclassified action failure']
+        if codes:
+            details.append('native_error=' + ','.join(codes[:3]))
+        if mismatch:
+            details.append('descriptor_component=' + mismatch.group(1))
+        return WindowsNativeRangeError(label + ': ' + '; '.join(details))
 
     @staticmethod
     def _command(
@@ -1254,7 +1291,7 @@ New-NetFirewallRule `
         }
         restored = self.executor.execute("restore_integrity", parameters, attacked)
         if restored.get("success") is not True or restored.get("dry_run") is True:
-            raise WindowsNativeRangeError("Windows content-and-ACL restoration failed")
+            raise self._action_failure("Windows content-and-ACL restoration failed", restored)
         approved_data, approved_meta = self.executor.restore_points._read_target(
             self.config_path
         )
@@ -1268,7 +1305,7 @@ New-NetFirewallRule `
             "rollback_integrity", restored["pre_state"], attacked
         )
         if rollback.get("success") is not True or rollback.get("dry_run") is True:
-            raise WindowsNativeRangeError("Windows restoration rollback failed")
+            raise self._action_failure("Windows restoration rollback failed", rollback)
         rolled_data, rolled_meta = self.executor.restore_points._read_target(
             self.config_path
         )
@@ -1439,16 +1476,17 @@ New-NetFirewallRule `
             ),
         )
 
-        scenarios = [
-            self._account_scenario(account, attacked, started, detected, protected_accounts),
-            self._task_scenario(task, attacked, started, detected),
-            self._run_value_scenario(run_value, attacked, started, detected),
-            self._listener_scenario(listener, attacked, started, detected),
-            self._firewall_scenario(
+        scenarios = self.completed_scenarios
+        for operation in (
+            lambda: self._account_scenario(account, attacked, started, detected, protected_accounts),
+            lambda: self._task_scenario(task, attacked, started, detected),
+            lambda: self._run_value_scenario(run_value, attacked, started, detected),
+            lambda: self._listener_scenario(listener, attacked, started, detected),
+            lambda: self._firewall_scenario(
                 firewall, baseline, attacked, started, detected
             ),
-            self._process_scenario(process, attacked, started, detected),
-            self._file_scenario(
+            lambda: self._process_scenario(process, attacked, started, detected),
+            lambda: self._file_scenario(
                 file_change,
                 attacked,
                 tampered_data,
@@ -1456,8 +1494,9 @@ New-NetFirewallRule `
                 started,
                 detected,
             ),
-            self._reparse_scenario(),
-        ]
+            self._reparse_scenario,
+        ):
+            scenarios.append(operation())
         return {
             "schema_version": 1,
             "status": "passed",
@@ -1557,7 +1596,7 @@ New-NetFirewallRule `
             {},
         )
         if result.get("success") is not True:
-            raise WindowsNativeRangeError("cleanup could not restore the protected file")
+            raise self._action_failure("cleanup could not restore the protected file", result)
 
     def cleanup(self) -> dict[str, Any]:
         errors: list[str] = []
@@ -1653,6 +1692,10 @@ def campaign(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
             "mode": "native changes on one disposable GitHub-hosted Windows runner",
             "version": __version__,
             "repository": context.repository,
+            "commit": os.environ.get("GITHUB_SHA", "")[:40],
+            "scenarios": lab.completed_scenarios,
+            "scenario_count": 8,
+            "scenarios_passed": len(lab.completed_scenarios),
             "error": f"{type(exc).__name__}: {str(exc)[:500]}",
         }
     cleanup = lab.cleanup()

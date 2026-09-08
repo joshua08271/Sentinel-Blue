@@ -147,6 +147,16 @@ class WindowsNativeRangeGateTests(unittest.TestCase):
 
 
 class WindowsNativeOwnershipTests(unittest.TestCase):
+    def test_native_action_failure_retains_fixed_reason_and_code_without_raw_material(self):
+        failure = WindowsNativeRunnerLab._action_failure('owned restore', {
+            'message': 'file restoration failed: [Errno 5] Windows restoration file information could not be changed; '
+                       'private credential S-1-5-21-1-2-3-1001 C:\\Users\\private\\file',
+        })
+        self.assertIn('Windows restoration file information could not be changed', str(failure))
+        self.assertIn('native_error=5', str(failure))
+        for raw in ('private', 'S-1-5', 'C:\\Users'):
+            self.assertNotIn(raw, str(failure))
+
     def test_windows_powershell_uses_its_default_modules_without_changing_parent_environment(self):
         inherited = {'PsModulePath': 'incompatible PS7 modules', 'SystemRoot': 'C:\\Windows'}
         for executable in ('powershell.exe', r'C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.EXE', 'icacls.exe'):
