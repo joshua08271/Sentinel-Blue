@@ -1,6 +1,7 @@
 import os
 import hashlib
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -145,6 +146,14 @@ class WindowsNativeRangeGateTests(unittest.TestCase):
 
 
 class WindowsNativeOwnershipTests(unittest.TestCase):
+    def test_partial_powershell_success_cannot_authorize_fixture_mutation(self):
+        with patch.object(WindowsNativeRunnerLab, '_command', return_value=subprocess.CompletedProcess(
+            'powershell', 0, '{"SID":null}', 'owned fixture provider failed'
+        )) as command:
+            with self.assertRaisesRegex(WindowsNativeRangeError, 'error output'):
+                WindowsNativeRunnerLab._powershell('owned fixture command')
+        self.assertIn("$ErrorActionPreference = 'Stop'", command.call_args.args[0][-1])
+
     def test_disable_fixture_refuses_a_replaced_sid_or_unowned_account(self):
         with tempfile.TemporaryDirectory() as directory:
             lab = self._lab(directory)

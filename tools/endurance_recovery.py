@@ -120,6 +120,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
               'runtime_sha256': hashlib.sha256(runtime.read_bytes()).hexdigest() if runtime else None,
               'recoveries': [], 'holds_observed': [], 'scored_samples': 0, 'scored_healthy_samples': 0,
               'outage_held_samples': 0,
+              'request_timings': {},
               'control_samples': 0, 'control_healthy_samples': 0,
               'limitations': ['owned process service adapter; not native systemd or SCM',
                               'fixture inventory; not a full native host agent',
@@ -142,6 +143,20 @@ def campaign(duration: float, runtime: Path | None) -> dict:
         agent_id, service_id = 'endurance-agent', 'owned.service'
         controller_port = 0
         app = None
+
+        def measured_request(label, operation):
+            before = time.monotonic()
+            row = report['request_timings'].setdefault(label, {'count': 0, 'errors': 0, 'maximum_seconds': 0})
+            row['count'] += 1
+            try:
+                return operation()
+            except Exception as exc:
+                row['errors'] += 1
+                report['failed_request'] = label
+                report['failed_request_error_type'] = type(exc).__name__
+                raise
+            finally:
+                row['maximum_seconds'] = round(max(row['maximum_seconds'], time.monotonic() - before), 3)
 
         class FixtureExecutor(ActionExecutor):
             def _service_state(self, service):
@@ -215,7 +230,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
             def operator_request(target, payload=None):
                 body = b'' if payload is None else json.dumps(payload).encode()
                 method = 'GET' if payload is None else 'POST'
-                with urlopen(origin + '/api/v1/operator/auth-info', timeout=5) as response:
+                with urlopen(origin + '/api/v1/operator/auth-info', timeout=12) as response:
                     info = json.loads(response.read())
                 headers = _operator_headers(operator, principal_id=info['principal_id'],
                                             credential_epoch=info['credential_epoch'], method=method,
@@ -223,10 +238,10 @@ def campaign(duration: float, runtime: Path | None) -> dict:
                                             request_timestamp=max(int(time.time()), int(info['request_not_before'])))
                 headers['Content-Type'] = 'application/json'
                 with urlopen(Request(origin + target, data=body if payload is not None else None,
-                                     method=method, headers=headers), timeout=5) as response:
+                                     method=method, headers=headers), timeout=12) as response:
                     return json.loads(response.read())
 
-            client = AgentClient(origin, bootstrap, agent_id, timeout=2,
+            client = AgentClient(origin, bootstrap, agent_id,
                                  profile_id=profile.profile_id, profile_fingerprint=profile.fingerprint)
             credential = client.enroll('owned-fixture', platform.system() + ' fixture')
             journal = ActionJournal(state)
@@ -256,7 +271,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
                 telemetry['integrity'] = [{'path': str(config), 'sha256': hashlib.sha256(data).hexdigest(),
                                           'size': len(data), 'modified_at': config.stat().st_mtime,
                                           'security_descriptor_sha256': executor.restore_points._metadata_security_descriptor_sha256(metadata)}]
-                client.telemetry(telemetry)
+                measured_request('telemetry', lambda: client.telemetry(telemetry))
                 next_observation_at = time.monotonic() + 1.05
                 return telemetry
 
@@ -297,7 +312,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
                     scored.stop()
                     outage_started = time.monotonic()
                 telemetry = observe()
-                for action in client.actions():
+                for action in measured_request('actions', client.actions):
                     if action['action_type'] == 'snapshot':
                         execute(action, telemetry)
                         deliver_pending_action_results(client, outbox)
@@ -318,7 +333,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
                         sequence = SequenceCounter(state)
                         executor = executor_for_state()
                         open_controller()
-                        client = AgentClient(origin, '', agent_id, timeout=2, agent_token=credential,
+                        client = AgentClient(origin, '', agent_id, agent_token=credential,
                                              profile_id=profile.profile_id, profile_fingerprint=profile.fingerprint)
                         count_before = scored.starts
                         retry_deadline = time.monotonic() + 20
@@ -338,7 +353,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
                                                  'attempt': len(report['recoveries']) + 1})
                     outage_started = None
                     observe()  # A genuinely healthy sample closes this outage episode.
-                row = operator_request('/api/v1/dashboard')['controller']['service_recovery_status'][0]
+                row = measured_request('dashboard', lambda: operator_request('/api/v1/dashboard'))['controller']['service_recovery_status'][0]
                 if row['budget']['reason'] and row['budget']['reason'] not in report['holds_observed']:
                     report['holds_observed'].append(row['budget']['reason'])
                 if outage_started is not None and not row['budget']['allowed']:

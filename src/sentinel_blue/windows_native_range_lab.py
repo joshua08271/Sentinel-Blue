@@ -42,7 +42,8 @@ REQUIRED_TOOLS = ("powershell.exe", "icacls.exe")
 APPROVED_CONTENT = b"sentinel-blue-windows-native-approved-v1\n"
 TAMPERED_CONTENT = b"sentinel-blue-windows-native-inert-tamper-v1\n"
 TASK_DESCRIPTION = "Sentinel Blue disposable inert persistence fixture"
-ACCOUNT_DESCRIPTION = "Sentinel Blue disposable inert privileged-account fixture"
+# New-LocalUser accepts at most 48 characters in Description.
+ACCOUNT_DESCRIPTION = "Sentinel Blue owned privileged fixture"
 FIREWALL_DESCRIPTION = "Sentinel Blue disposable disabled loopback-rule fixture"
 RUN_KEY_PATH = r"Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_KEY_LABEL = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -251,20 +252,23 @@ class WindowsNativeRunnerLab:
         check: bool = True,
         label: str = "PowerShell fixture command",
     ) -> subprocess.CompletedProcess[str]:
-        return cls._command(
+        result = cls._command(
             [
                 "powershell.exe",
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                script,
+                "$ErrorActionPreference = 'Stop';\n" + script,
             ],
             timeout=timeout,
             check=check,
             extra_env=extra_env,
             label=label,
         )
+        if check and result.stderr.strip():
+            raise WindowsNativeRangeError(f'{label} returned error output')
+        return result
 
     @classmethod
     def _powershell_json(
@@ -670,16 +674,19 @@ Enable-LocalUser -InputObject $user -ErrorAction Stop
             },
             label="inert privileged-account fixture creation",
         )
-        self.account_sid = str(result.get("SID", ""))
+        observed_sid = result.get('SID')
+        self.account_sid = observed_sid if isinstance(observed_sid, str) else ''
         state = self._account_state()
-        if (
-            not self.account_sid
-            or state.get("SID") != self.account_sid
-            or state.get("Enabled") is not True
-            or state.get("Privileged") is not True
-            or state.get("Description") != ACCOUNT_DESCRIPTION
-        ):
-            raise WindowsNativeRangeError("the privileged-account fixture is incomplete")
+        checks = {
+            'SID returned': bool(self.account_sid),
+            'SID matches': state.get('SID') == self.account_sid,
+            'enabled': state.get('Enabled') is True,
+            'privileged': state.get('Privileged') is True,
+            'marker matches': state.get('Description') == ACCOUNT_DESCRIPTION,
+        }
+        if not all(checks.values()):
+            raise WindowsNativeRangeError('the privileged-account fixture is incomplete: ' +
+                                          ', '.join(name for name, passed in checks.items() if not passed))
 
     def _create_task(self) -> None:
         self.task_created = True
