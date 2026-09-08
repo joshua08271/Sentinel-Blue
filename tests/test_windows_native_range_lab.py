@@ -2,6 +2,7 @@ import os
 import hashlib
 import tempfile
 import subprocess
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -146,6 +147,18 @@ class WindowsNativeRangeGateTests(unittest.TestCase):
 
 
 class WindowsNativeOwnershipTests(unittest.TestCase):
+    def test_native_command_failure_reports_provider_code_without_target_or_secret(self):
+        error = {'command': 'New-LocalUser', 'error_id': 'AccessDenied,Microsoft.PowerShell.Commands.NewLocalUserCommand',
+                 'category': 'PermissionDenied', 'exception': 'InvalidOperationException',
+                 'target': 'private fixture credential', 'message': 'private fixture credential'}
+        with patch('sentinel_blue.windows_native_range_lab.subprocess.run', return_value=subprocess.CompletedProcess(
+            'powershell', 1, '', 'SB_NATIVE_ERROR ' + json.dumps(error)
+        )):
+            with self.assertRaises(WindowsNativeRangeError) as caught:
+                WindowsNativeRunnerLab._command(['owned command'])
+        self.assertIn('AccessDenied', str(caught.exception))
+        self.assertNotIn('private fixture credential', str(caught.exception))
+
     def test_partial_powershell_success_cannot_authorize_fixture_mutation(self):
         with patch.object(WindowsNativeRunnerLab, '_command', return_value=subprocess.CompletedProcess(
             'powershell', 0, '{"SID":null}', 'owned fixture provider failed'

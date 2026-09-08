@@ -12,6 +12,7 @@ import hashlib
 import json
 import ntpath
 import os
+import re
 import platform
 import secrets
 import shutil
@@ -237,8 +238,23 @@ class WindowsNativeRunnerLab:
             env=environment,
         )
         if check and result.returncode != 0:
+            details = []
+            for line in result.stderr.splitlines():
+                if not line.startswith('SB_NATIVE_ERROR '):
+                    continue
+                try:
+                    error = json.loads(line.removeprefix('SB_NATIVE_ERROR '))
+                except ValueError:
+                    continue
+                if not isinstance(error, dict):
+                    continue
+                for name in ('command', 'error_id', 'category', 'exception'):
+                    value = error.get(name)
+                    if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.,:-]{1,160}', value):
+                        details.append(f'{name}={value}')
             raise WindowsNativeRangeError(
-                f"{label} failed with status {result.returncode}"
+                f"{label} failed with status {result.returncode}" +
+                (': ' + '; '.join(details) if details else '')
             )
         return result
 
@@ -259,7 +275,18 @@ class WindowsNativeRunnerLab:
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "$ErrorActionPreference = 'Stop';\n" + script,
+                "$ErrorActionPreference = 'Stop';\ntry {\n" + script + r"""
+} catch {
+  $detail = [PSCustomObject]@{
+    command = [string]$_.InvocationInfo.MyCommand.Name
+    error_id = [string]$_.FullyQualifiedErrorId
+    category = [string]$_.CategoryInfo.Category
+    exception = $_.Exception.GetType().Name
+  }
+  [Console]::Error.WriteLine('SB_NATIVE_ERROR ' + ($detail | ConvertTo-Json -Compress))
+  exit 1
+}
+""",
             ],
             timeout=timeout,
             check=check,
