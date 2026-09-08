@@ -123,7 +123,7 @@ class _FakeWindowsFileOps:
         self.written = {}
         self._directory_handles = iter((10, 11))
 
-    def open_file(self, path, desired_access, share_mode, creation, flags):
+    def open_file(self, path, desired_access, share_mode, creation, flags, *, security_descriptor=None):
         if creation == restoration.WINDOWS_CREATE_NEW:
             handle = 90
         elif str(path).casefold().endswith("target.conf"):
@@ -135,6 +135,8 @@ class _FakeWindowsFileOps:
         self.events.append(
             ("open", handle, str(path), desired_access, share_mode, creation, flags)
         )
+        if security_descriptor is not None:
+            self.events.append(('create_descriptor', handle, security_descriptor))
         return handle
 
     def file_attributes(self, handle):
@@ -841,12 +843,9 @@ class WindowsRestorationTests(unittest.TestCase):
             {"capture_security": False},
         )
 
-    def test_atomic_write_applies_and_verifies_descriptor_before_publish(self):
+    def test_atomic_write_creates_and_verifies_descriptor_before_publish(self):
         native = _FakeWindowsFileOps()
         descriptor = "approved-descriptor"
-
-        def apply(_path, encoded, *, native_handle):
-            native.events.append(("apply_descriptor", native_handle, encoded))
 
         def capture(_path, *, native_handle):
             native.events.append(("capture_descriptor", native_handle))
@@ -856,7 +855,7 @@ class WindowsRestorationTests(unittest.TestCase):
             patch.object(
                 restoration,
                 "_restore_windows_security_descriptor",
-                side_effect=apply,
+                side_effect=AssertionError('creation security must not be rewritten'),
             ),
             patch.object(
                 restoration,
@@ -874,10 +873,10 @@ class WindowsRestorationTests(unittest.TestCase):
             )
         names = [event[0] for event in native.events]
         expected_order = [
+            "create_descriptor",
             "write",
             "flush",
             "mode",
-            "apply_descriptor",
             "capture_descriptor",
             "delete",
             "rename",
@@ -889,7 +888,7 @@ class WindowsRestorationTests(unittest.TestCase):
             positions.append(position)
             start = position + 1
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(native.events[positions[3]], ("apply_descriptor", 90, descriptor))
+        self.assertEqual(native.events[positions[0]], ("create_descriptor", 90, descriptor))
         self.assertEqual(native.events[positions[4]], ("capture_descriptor", 90))
         self.assertEqual(native.events[positions[5]], ("delete", 90, False))
         self.assertEqual(
@@ -1184,9 +1183,9 @@ class WindowsRestorationTests(unittest.TestCase):
                 super().__init__()
                 self.target_opens = 0
 
-            def open_file(self, path, desired_access, share_mode, creation, flags):
+            def open_file(self, path, desired_access, share_mode, creation, flags, *, security_descriptor=None):
                 handle = super().open_file(
-                    path, desired_access, share_mode, creation, flags
+                    path, desired_access, share_mode, creation, flags, security_descriptor=security_descriptor
                 )
                 if str(path).casefold().endswith("target.conf"):
                     self.target_opens += 1
@@ -1505,33 +1504,45 @@ class WindowsRestorationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "outside its accepted size"):
                     restoration._windows_backup_security_stream(invalid)
 
-    def test_protection_restore_preserves_absent_sacl_and_never_replaces_acl_components(self):
-        cases = (
-            (0x2004, 0x0004, restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION),
-            (0x0004, 0x2004, restoration.WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION),
-            (0x1004, 0x0004, restoration.WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION),
-            (0x0004, 0x1004, restoration.WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION),
-            (0x3004, 0x0004, restoration.WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
-             | restoration.WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION),
-        )
-        for expected, observed, information in cases:
-            with self.subTest(expected=expected, observed=observed):
-                calls = []
-                api = SimpleNamespace(SetSecurityInfo=_NativeFunction(lambda *args: calls.append(args) or 0))
-                with patch.object(restoration.ctypes, 'WinDLL', return_value=api, create=True):
-                    restoration._restore_windows_protection_flags(41, expected, observed)
-                self.assertEqual(calls, [(41, 1, information, None, None, None, None)])
-                self.assertFalse(information & restoration.WINDOWS_CORE_SECURITY_INFORMATION)
-        with patch.object(restoration.ctypes, 'WinDLL', side_effect=AssertionError('no change needed'), create=True):
-            restoration._restore_windows_protection_flags(41, 0x2004, 0x2004)
-            # Presence mismatches remain the full-descriptor verifier's job.
-            restoration._restore_windows_protection_flags(41, 0x0004, 0x0014)
+    def test_creation_passes_complete_protected_absent_sacl_without_inheriting_handle(self):
+        encoded = self._encoded_descriptor(control=0xA004)
+        raw = base64.b64decode(encoded)
+        calls = []
+        native = object.__new__(restoration._WindowsNativeFileOps)
 
-    def test_protection_restore_failure_is_not_accepted(self):
-        api = SimpleNamespace(SetSecurityInfo=_NativeFunction(lambda *_args: 5))
-        with patch.object(restoration.ctypes, 'WinDLL', return_value=api, create=True):
-            with self.assertRaisesRegex(OSError, 'protection could not be restored') as caught:
-                restoration._restore_windows_protection_flags(41, 0x2004, 0x0004)
+        def create(path, access, sharing, security, disposition, flags, template):
+            attributes = ctypes.cast(security, ctypes.POINTER(restoration._WindowsSecurityAttributes)).contents
+            calls.append((attributes.nLength, attributes.bInheritHandle,
+                          ctypes.string_at(attributes.lpSecurityDescriptor, len(raw)), disposition))
+            return 41
+
+        native._create_file = create
+        self.assertEqual(native.open_file('owned new file', 0, 0, restoration.WINDOWS_CREATE_NEW, 0,
+                                          security_descriptor=encoded), 41)
+        self.assertEqual(calls, [(ctypes.sizeof(restoration._WindowsSecurityAttributes), 0, raw,
+                                  restoration.WINDOWS_CREATE_NEW)])
+
+    def test_creation_refuses_missing_or_null_dacl_and_existing_file_before_native_call(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        native._create_file = lambda *_args: self.fail('unsafe creation reached the native API')
+        absent = self._encoded_descriptor(control=restoration.WINDOWS_SE_SELF_RELATIVE)
+        null = bytearray(base64.b64decode(self._encoded_descriptor()))
+        null[16:20] = b'\0' * 4
+        for encoded in (absent, base64.b64encode(null).decode('ascii')):
+            with self.subTest(encoded=encoded), self.assertRaisesRegex(ValueError, 'NULL DACL'):
+                native.open_file('owned new file', 0, 0, restoration.WINDOWS_CREATE_NEW, 0,
+                                 security_descriptor=encoded)
+        with self.assertRaisesRegex(ValueError, 'requires a new file'):
+            native.open_file('existing file', 0, 0, restoration.WINDOWS_OPEN_EXISTING, 0,
+                             security_descriptor=self._encoded_descriptor())
+
+    def test_protected_creation_failure_is_not_accepted(self):
+        native = object.__new__(restoration._WindowsNativeFileOps)
+        native._create_file = lambda *_args: ctypes.c_void_p(-1).value
+        with patch.object(restoration.ctypes, 'get_last_error', return_value=5, create=True):
+            with self.assertRaisesRegex(OSError, 'could not be opened') as caught:
+                native.open_file('owned new file', 0, 0, restoration.WINDOWS_CREATE_NEW, 0,
+                                 security_descriptor=self._encoded_descriptor(control=0xA004))
         self.assertEqual(caught.exception.errno, 5)
 
 if __name__ == "__main__":

@@ -240,7 +240,6 @@ class WindowsNativeRunnerLab:
             'Windows file security descriptor restore was incomplete',
             'Windows file security descriptor could not be read',
             'Windows security restore context could not be released',
-            'Windows security descriptor protection could not be restored',
             'required Windows privilege is unavailable',
             'file restoration failed configuration validation and was rolled back',
             'file restoration failed service validation and was rolled back',

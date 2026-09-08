@@ -45,10 +45,6 @@ WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
 WINDOWS_GROUP_SECURITY_INFORMATION = 0x00000002
 WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
 WINDOWS_SACL_SECURITY_INFORMATION = 0x00000008
-WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION = 0x40000000
-WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
-WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
 WINDOWS_CORE_SECURITY_INFORMATION = (
     WINDOWS_OWNER_SECURITY_INFORMATION
     | WINDOWS_GROUP_SECURITY_INFORMATION
@@ -468,6 +464,14 @@ def _windows_privileges(*names: str):
             yield
 
 
+class _WindowsSecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ('nLength', ctypes.c_uint32),
+        ('lpSecurityDescriptor', ctypes.c_void_p),
+        ('bInheritHandle', ctypes.c_int32),
+    ]
+
+
 class _WindowsNativeFileOps:
     """Small injectable Win32 file API surface used by guarded restoration."""
 
@@ -550,12 +554,29 @@ class _WindowsNativeFileOps:
         share_mode: int,
         creation_disposition: int,
         flags_and_attributes: int,
+        *,
+        security_descriptor: str | None = None,
     ):
+        security_attributes = None
+        if security_descriptor is not None:
+            if creation_disposition != WINDOWS_CREATE_NEW:
+                raise ValueError('explicit Windows creation security requires a new file')
+            parts = _windows_security_descriptor_semantics(security_descriptor)
+            if not parts[2] & WINDOWS_SE_DACL_PRESENT or parts[6] is None:
+                raise ValueError('Windows creation security must not have an absent or NULL DACL')
+            raw = base64.b64decode(security_descriptor.encode('ascii'), validate=True)
+            descriptor_buffer = ctypes.create_string_buffer(raw, len(raw))
+            attributes = _WindowsSecurityAttributes(
+                ctypes.sizeof(_WindowsSecurityAttributes),
+                ctypes.cast(descriptor_buffer, ctypes.c_void_p),
+                0,
+            )
+            security_attributes = ctypes.byref(attributes)
         handle = self._create_file(
             path,
             desired_access,
             share_mode,
-            None,
+            security_attributes,
             creation_disposition,
             flags_and_attributes,
             None,
@@ -1324,6 +1345,8 @@ def _windows_atomic_write(
                             | WINDOWS_FILE_FLAG_WRITE_THROUGH
                             | WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
                             | WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+                            **({'security_descriptor': encoded_descriptor}
+                               if encoded_descriptor else {}),
                         )
                         break
                     except OSError as exc:
@@ -1343,11 +1366,10 @@ def _windows_atomic_write(
                 native.flush_file(handle)
                 native.apply_mode(handle, mode & 0o7777 or 0o600)
                 if encoded_descriptor:
-                    _restore_windows_security_descriptor(
-                        destination,
-                        encoded_descriptor,
-                        native_handle=handle,
-                    )
+                    # CreateFile receives the complete approved descriptor.
+                    # Rewriting it through BackupWrite can normalize away
+                    # protection on an absent SACL. Verify the creation result
+                    # on this exclusive handle before allowing publication.
                     observed = _capture_windows_security_descriptor(
                         destination,
                         native_handle=handle,
@@ -2196,33 +2218,6 @@ def _windows_backup_security_stream(raw_descriptor: bytes) -> bytes:
     ) + raw_descriptor
 
 
-def _restore_windows_protection_flags(handle, expected: int, observed: int) -> None:
-    """Restore changed inheritance protection without replacing ACL contents."""
-    information = 0
-    for bit, protected, unprotected in (
-        (WINDOWS_SE_DACL_PROTECTED, WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION,
-         WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION),
-        (WINDOWS_SE_SACL_PROTECTED, WINDOWS_PROTECTED_SACL_SECURITY_INFORMATION,
-         WINDOWS_UNPROTECTED_SACL_SECURITY_INFORMATION),
-    ):
-        if (expected ^ observed) & bit:
-            information |= protected if expected & bit else unprotected
-    if not information:
-        return
-    from ctypes import wintypes
-
-    api = ctypes.WinDLL('Advapi32.dll', use_last_error=True)
-    set_security = api.SetSecurityInfo
-    set_security.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
-                            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-    set_security.restype = wintypes.DWORD
-    # Neither DACL_SECURITY_INFORMATION nor SACL_SECURITY_INFORMATION is set:
-    # NULL component arguments must never replace the approved ACLs.
-    code = set_security(handle, 1, information, None, None, None, None)
-    if code != 0:
-        raise OSError(int(code), 'Windows security descriptor protection could not be restored')
-
-
 def _restore_windows_security_descriptor(
     path: Path,
     encoded_descriptor: str,
@@ -2399,17 +2394,6 @@ def _restore_windows_security_descriptor(
                             ctypes.get_last_error(),
                             "Windows security restore context could not be released",
                         )
-            # BackupWrite can drop SACL protection when the approved SACL is
-            # absent. Presence and inheritance protection are independent.
-            # Restore only changed protection flags on this same held handle;
-            # the caller still requires the entire descriptor to match before
-            # publishing any replacement.
-            observed_descriptor = _capture_windows_security_descriptor(path, native_handle=handle)
-            _restore_windows_protection_flags(
-                handle,
-                _windows_security_descriptor_semantics(encoded_descriptor)[2],
-                _windows_security_descriptor_semantics(observed_descriptor)[2],
-            )
     finally:
         if owns_handle and handle is not None:
             close_handle(handle)
