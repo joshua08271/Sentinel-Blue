@@ -756,6 +756,9 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
             ("named_protection_only", "named", protection),
             ("file_core_protection", "file", security.WINDOWS_CORE_SECURITY_INFORMATION | protection),
             ("file_backup_protection", "file", security.WINDOWS_SECURITY_INFORMATION | protection),
+            ("handle_sacl_protection_delete_pending", "handle", 0x8 | (protection & 0x50000000)),
+            ("named_sacl_protection_delete_pending", "named", 0x8 | (protection & 0x50000000)),
+            ("file_backup_protection_delete_pending", "file", security.WINDOWS_SECURITY_INFORMATION | protection),
         )
         results = []
         native = security._WindowsNativeFileOps()
@@ -783,6 +786,8 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
                             raise WindowsNativeRangeError("security diagnostic path changed")
                         before = security._capture_windows_security_descriptor(path, native_handle=handle)
                         row["before_control"] = f"0x{security._windows_security_descriptor_semantics(before)[2]:04x}"
+                        if name.endswith("delete_pending"):
+                            native.set_delete_disposition(handle, True)
                         if operation == "file":
                             if not set_file(exact_path, information, ctypes.byref(buffer)):
                                 raise OSError(ctypes.get_last_error(), "file security diagnostic failed")
