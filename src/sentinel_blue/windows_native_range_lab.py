@@ -753,7 +753,7 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
         set_kernel.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
         set_kernel.restype = ctypes.c_int32
         cases = (
-            ("backup_only", "backup", 0),
+            ("production_restore", "backup", 0),
             ("handle_sacl_protection", "handle", 0x8 | (protection & 0x50000000)),
             ("handle_backup_protection", "handle", security.WINDOWS_SECURITY_INFORMATION | protection),
             ("named_sacl_protection", "named", 0x8 | (protection & 0x50000000)),

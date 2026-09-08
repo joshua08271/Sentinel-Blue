@@ -843,7 +843,7 @@ class WindowsRestorationTests(unittest.TestCase):
             {"capture_security": False},
         )
 
-    def test_atomic_write_creates_restores_and_verifies_descriptor_before_publish(self):
+    def test_atomic_write_restores_and_verifies_descriptor_before_publish(self):
         native = _FakeWindowsFileOps()
         descriptor = "approved-descriptor"
 
@@ -877,7 +877,6 @@ class WindowsRestorationTests(unittest.TestCase):
             )
         names = [event[0] for event in native.events]
         expected_order = [
-            "create_descriptor",
             "write",
             "flush",
             "mode",
@@ -893,17 +892,17 @@ class WindowsRestorationTests(unittest.TestCase):
             positions.append(position)
             start = position + 1
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(native.events[positions[0]], ("create_descriptor", 90, descriptor))
-        self.assertEqual(native.events[positions[4]], ("restore_descriptor", 90))
-        self.assertEqual(native.events[positions[5]], ("capture_descriptor", 90))
-        self.assertEqual(native.events[positions[6]], ("delete", 90, False))
+        self.assertNotIn("create_descriptor", names)
+        self.assertEqual(native.events[positions[3]], ("restore_descriptor", 90))
+        self.assertEqual(native.events[positions[4]], ("capture_descriptor", 90))
+        self.assertEqual(native.events[positions[5]], ("delete", 90, False))
         self.assertEqual(
-            native.events[positions[7]],
+            native.events[positions[6]],
             ("rename", 90, 11, "target.conf", True),
         )
         self.assertEqual(native.events[-3:], [("close", 90), ("close", 11), ("close", 10)])
 
-    def test_security_stream_failure_keeps_staged_file_unpublished_and_deletable(self):
+    def test_security_restore_failure_keeps_staged_file_unpublished_and_deletable(self):
         native = _FakeWindowsFileOps()
         with (
             patch.object(
@@ -1535,6 +1534,103 @@ class WindowsRestorationTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(ValueError, "outside its accepted size"):
                     restoration._windows_backup_security_stream(invalid)
+
+    def _restore_descriptor_with_native_recorder(self, expected, observed, setter):
+        from ctypes import wintypes
+        raw = base64.b64decode(expected)
+
+        def component(descriptor, output, _defaulted, offset):
+            address = ctypes.cast(descriptor, ctypes.c_void_p).value
+            location = int.from_bytes(raw[offset:offset + 4], "little")
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = address + location if location else None
+            return 1
+
+        def acl(descriptor, present, output, defaulted, offset, flag):
+            ctypes.cast(present, ctypes.POINTER(wintypes.BOOL))[0] = bool(int.from_bytes(raw[2:4], "little") & flag)
+            return component(descriptor, output, defaulted, offset)
+
+        advapi = SimpleNamespace(
+            IsValidSecurityDescriptor=_NativeFunction(lambda *_: 1),
+            GetSecurityDescriptorLength=_NativeFunction(lambda *_: len(raw)),
+            GetSecurityDescriptorOwner=_NativeFunction(lambda *args: component(*args, 4)),
+            GetSecurityDescriptorGroup=_NativeFunction(lambda *args: component(*args, 8)),
+            GetSecurityDescriptorDacl=_NativeFunction(lambda *args: acl(*args, 16, 4)),
+            GetSecurityDescriptorSacl=_NativeFunction(lambda *args: acl(*args, 12, 16)),
+            SetSecurityInfo=_NativeFunction(setter),
+        )
+        kernel = SimpleNamespace(CloseHandle=_NativeFunction(lambda *_: self.fail("borrowed handle closed")))
+        with (
+            patch.object(ctypes, "WinDLL", create=True, side_effect=lambda name, **_: advapi if name.startswith("Advapi") else kernel),
+            patch.object(restoration, "_capture_windows_security_descriptor", return_value=observed) as capture,
+        ):
+            restoration._restore_windows_security_descriptor(Path("owned file"), expected, native_handle=41)
+        capture.assert_called_once_with(Path("owned file"), native_handle=41)
+
+    def test_matching_protected_absent_sacl_is_never_rewritten(self):
+        self._restore_descriptor_with_native_recorder(
+            self._encoded_descriptor(control=0xA004),
+            self._encoded_descriptor(control=0xA004, reordered=True),
+            lambda *_: self.fail("matching descriptor was rewritten"),
+        )
+
+    def test_dacl_restore_preserves_matching_sacl_and_uses_the_same_handle(self):
+        approved = self._encoded_descriptor(control=0xA004, ace_flags=0, access_mask=1)
+        changed = self._encoded_descriptor(control=0xA004, ace_flags=0, access_mask=2)
+        raw = base64.b64decode(approved)
+        offset = int.from_bytes(raw[16:20], "little")
+        calls = []
+
+        def setter(handle, kind, information, owner, group, dacl, sacl):
+            calls.append((handle, kind, information, owner, group, sacl))
+            self.assertEqual(ctypes.string_at(dacl, len(raw) - offset), raw[offset:])
+            return 0
+
+        self._restore_descriptor_with_native_recorder(approved, changed, setter)
+        self.assertEqual(calls, [(41, 1, 0x20000004, None, None, None)])
+
+    def test_component_restore_native_error_is_not_accepted_or_retried(self):
+        with self.assertRaisesRegex(OSError, "could not be restored") as caught:
+            self._restore_descriptor_with_native_recorder(
+                self._encoded_descriptor(control=0xA004, ace_flags=0, access_mask=1),
+                self._encoded_descriptor(control=0xA004, ace_flags=0, access_mask=2),
+                lambda *_: 5,
+            )
+        self.assertEqual(caught.exception.errno, 5)
+
+    def test_owner_and_group_changes_do_not_select_matching_sacl(self):
+        expected = self._encoded_descriptor(control=0xA004)
+        for pointer_offset, expected_flag in ((4, 1), (8, 2)):
+            changed = bytearray(base64.b64decode(expected))
+            location = int.from_bytes(changed[pointer_offset:pointer_offset + 4], "little")
+            changed[location + 8] = 19
+            with self.subTest(pointer_offset=pointer_offset):
+                self.assertEqual(restoration._windows_changed_security_information(
+                    expected, base64.b64encode(changed).decode("ascii")), expected_flag)
+
+    def test_sacl_and_resource_changes_require_the_full_backup_path(self):
+        expected = self._encoded_descriptor(control=0xA004)
+        observed = [self._encoded_descriptor(control=value) for value in (0x8004, 0xA014, 0xE004)]
+        with_sacl = bytearray(base64.b64decode(self._encoded_descriptor(control=0xA014)))
+        with_sacl[12:16] = len(with_sacl).to_bytes(4, "little")
+        with_sacl.extend(b"\x02\0\x08\0\0\0\0\0")
+        observed.append(base64.b64encode(with_sacl).decode("ascii"))
+        for descriptor in observed:
+            with self.subTest(descriptor=descriptor):
+                self.assertIsNone(restoration._windows_changed_security_information(expected, descriptor))
+
+    def test_component_selection_refuses_absent_and_null_dacls(self):
+        absent = self._encoded_descriptor(control=0xA000)
+        null = bytearray(base64.b64decode(self._encoded_descriptor(control=0xA004)))
+        null[16:20] = b"\0" * 4
+        for descriptor in (absent, base64.b64encode(null).decode("ascii")):
+            with self.assertRaisesRegex(ValueError, "absent or NULL DACL"):
+                restoration._windows_changed_security_information(descriptor, descriptor)
+
+    def test_dacl_protection_change_preserves_the_sacl(self):
+        protected = self._encoded_descriptor(control=0xB004)
+        unprotected = self._encoded_descriptor(control=0xA004)
+        self.assertEqual(restoration._windows_changed_security_information(protected, unprotected), 0x80000004)
+        self.assertEqual(restoration._windows_changed_security_information(unprotected, protected), 0x20000004)
 
     def test_creation_passes_complete_protected_absent_sacl_without_inheriting_handle(self):
         encoded = self._encoded_descriptor(control=0xA004)

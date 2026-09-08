@@ -45,6 +45,8 @@ WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
 WINDOWS_GROUP_SECURITY_INFORMATION = 0x00000002
 WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
 WINDOWS_SACL_SECURITY_INFORMATION = 0x00000008
+WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
 WINDOWS_CORE_SECURITY_INFORMATION = (
     WINDOWS_OWNER_SECURITY_INFORMATION
     | WINDOWS_GROUP_SECURITY_INFORMATION
@@ -1155,6 +1157,43 @@ def _windows_security_descriptors_equivalent(expected: str, observed: str) -> bo
     return _windows_security_descriptor_mismatch(expected, observed) is None
 
 
+def _windows_changed_security_information(expected: str, observed: str) -> int | None:
+    """Select changed owner/group/DACL fields without rewriting matching SACLs.
+
+    None requires the complete backup path. Zero means every security-bearing
+    component already matches. The caller still verifies the complete result.
+    """
+    approved = _windows_security_descriptor_semantics(expected)
+    current = _windows_security_descriptor_semantics(observed)
+    if not approved[2] & WINDOWS_SE_DACL_PRESENT or approved[6] is None:
+        raise ValueError("Windows restoration must not apply an absent or NULL DACL")
+    sacl_and_resource_control = (
+        WINDOWS_SE_SACL_PRESENT | WINDOWS_SE_SACL_PROTECTED | WINDOWS_SE_RM_CONTROL_VALID
+    )
+    if (
+        approved[1] != current[1]
+        or (approved[2] ^ current[2]) & sacl_and_resource_control
+        or approved[5] != current[5]
+    ):
+        return None
+    information = 0
+    if approved[3] != current[3]:
+        information |= WINDOWS_OWNER_SECURITY_INFORMATION
+    if approved[4] != current[4]:
+        information |= WINDOWS_GROUP_SECURITY_INFORMATION
+    if (
+        approved[6] != current[6]
+        or (approved[2] ^ current[2]) & (WINDOWS_SE_DACL_PRESENT | WINDOWS_SE_DACL_PROTECTED)
+    ):
+        information |= WINDOWS_DACL_SECURITY_INFORMATION
+        information |= (
+            WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION
+            if approved[2] & WINDOWS_SE_DACL_PROTECTED
+            else WINDOWS_UNPROTECTED_DACL_SECURITY_INFORMATION
+        )
+    return information
+
+
 def _windows_expected_snapshot_mismatch(
     expected_data: bytes,
     expected_metadata: dict[str, Any],
@@ -1345,8 +1384,6 @@ def _windows_atomic_write(
                             | WINDOWS_FILE_FLAG_WRITE_THROUGH
                             | WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
                             | WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
-                            **({'security_descriptor': encoded_descriptor}
-                               if encoded_descriptor else {}),
                         )
                         break
                     except OSError as exc:
@@ -1366,11 +1403,10 @@ def _windows_atomic_write(
                 native.flush_file(handle)
                 native.apply_mode(handle, mode & 0o7777 or 0o600)
                 if encoded_descriptor:
-                    # Creation establishes the approved inheritance protection;
-                    # it can also materialize a NULL SACL for an absent SACL.
-                    # Restore the security stream on that same exclusive handle
-                    # before checking every security-bearing component. Neither
-                    # successful native call alone authorizes publication.
+                    # Keep matching inherited components intact: rewriting a
+                    # protected absent SACL can change its presence/protection.
+                    # Restore differences on this exclusive handle, then verify
+                    # the complete descriptor before authorizing publication.
                     _restore_windows_security_descriptor(
                         destination,
                         encoded_descriptor,
@@ -2323,26 +2359,13 @@ def _restore_windows_security_descriptor(
             "Windows security descriptor has a NULL DACL; refusing unrestricted restoration"
         )
 
-    backup_stream = _windows_backup_security_stream(raw_descriptor)
-    backup_buffer = ctypes.create_string_buffer(backup_stream, len(backup_stream))
-    backup_write = kernel32.BackupWrite
-    backup_write.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.BOOL,
-        wintypes.BOOL,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    backup_write.restype = wintypes.BOOL
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = [wintypes.HANDLE]
     close_handle.restype = wintypes.BOOL
     handle = native_handle
     owns_handle = native_handle is None
     try:
-        privilege_names = ["SeRestorePrivilege", "SeSecurityPrivilege"]
+        privilege_names = ["SeBackupPrivilege", "SeRestorePrivilege", "SeSecurityPrivilege"]
         privilege_scope = (
             _windows_privileges(*privilege_names) if owns_handle else nullcontext()
         )
@@ -2353,12 +2376,42 @@ def _restore_windows_security_descriptor(
                     | WINDOWS_WRITE_OWNER
                     | WINDOWS_FILE_READ_ATTRIBUTES
                     | WINDOWS_ACCESS_SYSTEM_SECURITY
+                    | WINDOWS_READ_CONTROL
                 )
                 handle = _windows_open_security_handle(
                     path,
                     desired_access,
                     file_descriptor,
                 )
+            observed = _capture_windows_security_descriptor(path, native_handle=handle)
+            changed = _windows_changed_security_information(encoded_descriptor, observed)
+            if changed is not None:
+                if changed:
+                    set_security = advapi32.SetSecurityInfo
+                    set_security.argtypes = [
+                        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                    ]
+                    set_security.restype = wintypes.DWORD
+                    result = int(set_security(
+                        handle, 1, changed,
+                        owner if changed & WINDOWS_OWNER_SECURITY_INFORMATION else None,
+                        group if changed & WINDOWS_GROUP_SECURITY_INFORMATION else None,
+                        dacl if changed & WINDOWS_DACL_SECURITY_INFORMATION else None,
+                        None,
+                    ))
+                    if result:
+                        raise OSError(result, "Windows file security descriptor could not be restored")
+                return
+            backup_stream = _windows_backup_security_stream(raw_descriptor)
+            backup_buffer = ctypes.create_string_buffer(backup_stream, len(backup_stream))
+            backup_write = kernel32.BackupWrite
+            backup_write.argtypes = [
+                wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.BOOL, wintypes.BOOL,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            backup_write.restype = wintypes.BOOL
             bytes_written = wintypes.DWORD()
             context = ctypes.c_void_p()
             write_completed = False
