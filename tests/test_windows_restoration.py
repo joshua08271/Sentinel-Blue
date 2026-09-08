@@ -1145,7 +1145,7 @@ class WindowsRestorationTests(unittest.TestCase):
                 expected,
                 changed_control,
             ),
-            "control",
+            "control expected=0x0004 observed=0x1004",
         )
         self.assertEqual(
             restoration._windows_security_descriptor_mismatch(

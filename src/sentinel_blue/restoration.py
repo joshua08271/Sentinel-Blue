@@ -1087,6 +1087,8 @@ def _windows_security_descriptor_mismatch(
             continue
         if label in {"SACL", "DACL"}:
             return _windows_acl_mismatch(label, expected_part, observed_part)
+        if label == "control":
+            return f"control expected=0x{expected_part:04x} observed=0x{observed_part:04x}"
         return label
     return None
 

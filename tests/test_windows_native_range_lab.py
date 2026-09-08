@@ -156,6 +156,13 @@ class WindowsNativeOwnershipTests(unittest.TestCase):
         self.assertIn('native_error=5', str(failure))
         for raw in ('private', 'S-1-5', 'C:\\Users'):
             self.assertNotIn(raw, str(failure))
+        control = WindowsNativeRunnerLab._action_failure('owned restore', {
+            'message': 'post-restoration Windows security descriptor did not match '
+                       '(control expected=0x0004 observed=0x1004) private ACL data',
+        })
+        self.assertIn('descriptor_control_expected=0x0004', str(control))
+        self.assertIn('descriptor_control_observed=0x1004', str(control))
+        self.assertNotIn('private ACL data', str(control))
 
     def test_windows_powershell_uses_its_default_modules_without_changing_parent_environment(self):
         inherited = {'PsModulePath': 'incompatible PS7 modules', 'SystemRoot': 'C:\\Windows'}

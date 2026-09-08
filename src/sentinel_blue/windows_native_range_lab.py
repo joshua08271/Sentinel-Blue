@@ -252,6 +252,10 @@ class WindowsNativeRunnerLab:
             details.append('native_error=' + ','.join(codes[:3]))
         if mismatch:
             details.append('descriptor_component=' + mismatch.group(1))
+        control = re.search(r'\(control expected=(0x[0-9a-f]{4}) observed=(0x[0-9a-f]{4})\)', message)
+        if control:
+            details.append('descriptor_control_expected=' + control.group(1))
+            details.append('descriptor_control_observed=' + control.group(2))
         return WindowsNativeRangeError(label + ': ' + '; '.join(details))
 
     @staticmethod
