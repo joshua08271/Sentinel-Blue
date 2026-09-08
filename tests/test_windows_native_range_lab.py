@@ -24,6 +24,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class WindowsNativeRangeGateTests(unittest.TestCase):
+    def test_security_diagnostics_cannot_run_without_the_native_owner_gate(self):
+        lab = object.__new__(WindowsNativeRunnerLab)
+        with (
+            patch(
+                "sentinel_blue.windows_native_range_lab.validate_runner_environment",
+                side_effect=WindowsNativeRangeError("native owner gate"),
+            ),
+            self.assertRaisesRegex(WindowsNativeRangeError, "native owner gate"),
+        ):
+            lab._security_roundtrip_diagnostics()
+
     def _environment(self, workspace: str) -> dict[str, str]:
         # The runner's TEMP may use an 8.3 alias. Supply the actual fixture
         # directory to the unchanged production no-alias/no-reparse gate.

@@ -707,6 +707,106 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
         if capture.get("success") is not True or capture.get("dry_run") is True:
             raise WindowsNativeRangeError("the Windows restore point was not captured")
 
+    def _security_roundtrip_diagnostics(self) -> list[dict[str, Any]]:
+        """Compare documented APIs on empty, owned files after a native failure."""
+        validate_runner_environment()
+        import base64
+        import ctypes
+        from . import restoration as security
+
+        current = self.root.stat(follow_symlinks=False)
+        if (
+            _is_reparse(self.root)
+            or (current.st_dev, current.st_ino) != self.root_identity
+            or not _same_path(self.root.parent, self.context.runner_temp)
+            or self.baseline_metadata is None
+        ):
+            raise WindowsNativeRangeError("security diagnostic root is not owned")
+        encoded = self.baseline_metadata["windows_security_descriptor"]
+        parts = security._windows_security_descriptor_semantics(encoded)
+        if not parts[2] & security.WINDOWS_SE_DACL_PRESENT or parts[6] is None:
+            raise WindowsNativeRangeError("security diagnostic requires a non-NULL DACL")
+        raw = base64.b64decode(encoded, validate=True)
+        buffer = ctypes.create_string_buffer(raw, len(raw))
+        pointers = [
+            ctypes.c_void_p(ctypes.addressof(buffer) + offset) if offset else None
+            for offset in (
+                int.from_bytes(raw[start:start + 4], "little")
+                for start in (4, 8, 16, 12)
+            )
+        ]
+        protection = (
+            (0x80000000 if parts[2] & security.WINDOWS_SE_DACL_PROTECTED else 0x20000000)
+            | (0x40000000 if parts[2] & security.WINDOWS_SE_SACL_PROTECTED else 0x10000000)
+        )
+        advapi = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+        set_info = advapi.SetSecurityInfo
+        set_info.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32] + [ctypes.c_void_p] * 4
+        set_info.restype = ctypes.c_uint32
+        set_named = advapi.SetNamedSecurityInfoW
+        set_named.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32] + [ctypes.c_void_p] * 4
+        set_named.restype = ctypes.c_uint32
+        set_file = advapi.SetFileSecurityW
+        set_file.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p]
+        set_file.restype = ctypes.c_int32
+        cases = (
+            ("handle_sacl_protection", "handle", 0x8 | (protection & 0x50000000)),
+            ("handle_backup_protection", "handle", security.WINDOWS_SECURITY_INFORMATION | protection),
+            ("named_sacl_protection", "named", 0x8 | (protection & 0x50000000)),
+            ("named_protection_only", "named", protection),
+            ("file_core_protection", "file", security.WINDOWS_CORE_SECURITY_INFORMATION | protection),
+            ("file_backup_protection", "file", security.WINDOWS_SECURITY_INFORMATION | protection),
+        )
+        results = []
+        native = security._WindowsNativeFileOps()
+        with security._windows_privileges("SeBackupPrivilege", "SeRestorePrivilege", "SeSecurityPrivilege"):
+            for name, operation, information in cases:
+                path = self.root / ("security-diagnostic-" + name + ".tmp")
+                row: dict[str, Any] = {"case": name, "expected_control": f"0x{parts[2]:04x}"}
+                with security._windows_pinned_parent(path, native) as (_parent, parent_path, leaf):
+                    exact_path = security._windows_child_path(parent_path, leaf)
+                    handle = native.open_file(
+                        exact_path,
+                        security.WINDOWS_GENERIC_WRITE | security.WINDOWS_DELETE
+                        | security.WINDOWS_READ_CONTROL | security.WINDOWS_WRITE_DAC
+                        | security.WINDOWS_WRITE_OWNER | security.WINDOWS_ACCESS_SYSTEM_SECURITY
+                        | security.WINDOWS_FILE_READ_ATTRIBUTES | security.WINDOWS_SYNCHRONIZE,
+                        0,
+                        security.WINDOWS_CREATE_NEW,
+                        security.WINDOWS_FILE_ATTRIBUTE_NORMAL
+                        | security.WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                        | security.WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+                        security_descriptor=encoded,
+                    )
+                    try:
+                        if native.final_path(handle).casefold() != exact_path.casefold():
+                            raise WindowsNativeRangeError("security diagnostic path changed")
+                        before = security._capture_windows_security_descriptor(path, native_handle=handle)
+                        row["before_control"] = f"0x{security._windows_security_descriptor_semantics(before)[2]:04x}"
+                        if operation == "file":
+                            if not set_file(exact_path, information, ctypes.byref(buffer)):
+                                raise OSError(ctypes.get_last_error(), "file security diagnostic failed")
+                        else:
+                            result = (set_info if operation == "handle" else set_named)(
+                                handle if operation == "handle" else exact_path,
+                                1, information, *pointers,
+                            )
+                            if result:
+                                raise OSError(int(result), "component security diagnostic failed")
+                        after = security._capture_windows_security_descriptor(path, native_handle=handle)
+                        row["after_control"] = f"0x{security._windows_security_descriptor_semantics(after)[2]:04x}"
+                        row["equivalent"] = security._windows_security_descriptors_equivalent(encoded, after)
+                    except OSError as exc:
+                        row["error_code"] = int(getattr(exc, "winerror", None) or exc.errno or 0)
+                    finally:
+                        try:
+                            native.set_delete_disposition(handle, True)
+                        finally:
+                            native.close(handle)
+                row["cleanup_verified"] = not path.exists() and not _is_reparse(path)
+                results.append(row)
+        return results
+
     def _collect_payload(self) -> dict[str, Any]:
         payload = collect(
             f"windows-native-{self.context.suffix}",
@@ -1702,6 +1802,11 @@ def campaign(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
             "scenarios_passed": len(lab.completed_scenarios),
             "error": f"{type(exc).__name__}: {str(exc)[:500]}",
         }
+        if "post-restoration Windows security descriptor did not match" in str(exc):
+            try:
+                report["security_diagnostics"] = lab._security_roundtrip_diagnostics()
+            except Exception as diagnostic_error:
+                report["security_diagnostics"] = {"error_type": type(diagnostic_error).__name__}
     cleanup = lab.cleanup()
     report["cleanup"] = cleanup
     if not cleanup["verified"]:
