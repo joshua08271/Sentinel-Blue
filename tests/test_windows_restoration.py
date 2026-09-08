@@ -843,9 +843,13 @@ class WindowsRestorationTests(unittest.TestCase):
             {"capture_security": False},
         )
 
-    def test_atomic_write_creates_and_verifies_descriptor_before_publish(self):
+    def test_atomic_write_creates_restores_and_verifies_descriptor_before_publish(self):
         native = _FakeWindowsFileOps()
         descriptor = "approved-descriptor"
+
+        def restore(_path, encoded, *, native_handle):
+            self.assertEqual(encoded, descriptor)
+            native.events.append(("restore_descriptor", native_handle))
 
         def capture(_path, *, native_handle):
             native.events.append(("capture_descriptor", native_handle))
@@ -855,7 +859,7 @@ class WindowsRestorationTests(unittest.TestCase):
             patch.object(
                 restoration,
                 "_restore_windows_security_descriptor",
-                side_effect=AssertionError('creation security must not be rewritten'),
+                side_effect=restore,
             ),
             patch.object(
                 restoration,
@@ -877,6 +881,7 @@ class WindowsRestorationTests(unittest.TestCase):
             "write",
             "flush",
             "mode",
+            "restore_descriptor",
             "capture_descriptor",
             "delete",
             "rename",
@@ -889,12 +894,39 @@ class WindowsRestorationTests(unittest.TestCase):
             start = position + 1
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(native.events[positions[0]], ("create_descriptor", 90, descriptor))
-        self.assertEqual(native.events[positions[4]], ("capture_descriptor", 90))
-        self.assertEqual(native.events[positions[5]], ("delete", 90, False))
+        self.assertEqual(native.events[positions[4]], ("restore_descriptor", 90))
+        self.assertEqual(native.events[positions[5]], ("capture_descriptor", 90))
+        self.assertEqual(native.events[positions[6]], ("delete", 90, False))
         self.assertEqual(
-            native.events[positions[6]],
+            native.events[positions[7]],
             ("rename", 90, 11, "target.conf", True),
         )
+        self.assertEqual(native.events[-3:], [("close", 90), ("close", 11), ("close", 10)])
+
+    def test_security_stream_failure_keeps_staged_file_unpublished_and_deletable(self):
+        native = _FakeWindowsFileOps()
+        with (
+            patch.object(
+                restoration,
+                "_restore_windows_security_descriptor",
+                side_effect=OSError(5, "security stream denied"),
+            ),
+            patch.object(restoration, "_capture_windows_security_descriptor") as capture,
+            self.assertRaisesRegex(OSError, "security stream denied"),
+        ):
+            restoration._windows_atomic_write(
+                Path(r"C:\safe\target.conf"),
+                b"trusted bytes",
+                0o600,
+                {"windows_security_descriptor": "approved-descriptor"},
+                native=native,
+            )
+        capture.assert_not_called()
+        self.assertEqual(
+            [event for event in native.events if event[0] == "delete"],
+            [("delete", 90, True)],
+        )
+        self.assertFalse(any(event[0] == "rename" for event in native.events))
         self.assertEqual(native.events[-3:], [("close", 90), ("close", 11), ("close", 10)])
 
     def test_atomic_write_rearms_delete_disposition_if_publish_fails(self):

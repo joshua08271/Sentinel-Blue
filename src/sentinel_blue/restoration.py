@@ -1366,10 +1366,16 @@ def _windows_atomic_write(
                 native.flush_file(handle)
                 native.apply_mode(handle, mode & 0o7777 or 0o600)
                 if encoded_descriptor:
-                    # CreateFile receives the complete approved descriptor.
-                    # Rewriting it through BackupWrite can normalize away
-                    # protection on an absent SACL. Verify the creation result
-                    # on this exclusive handle before allowing publication.
+                    # Creation establishes the approved inheritance protection;
+                    # it can also materialize a NULL SACL for an absent SACL.
+                    # Restore the security stream on that same exclusive handle
+                    # before checking every security-bearing component. Neither
+                    # successful native call alone authorizes publication.
+                    _restore_windows_security_descriptor(
+                        destination,
+                        encoded_descriptor,
+                        native_handle=handle,
+                    )
                     observed = _capture_windows_security_descriptor(
                         destination,
                         native_handle=handle,
