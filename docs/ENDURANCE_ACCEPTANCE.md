@@ -40,8 +40,9 @@ gates. They also check real privileged account observations with the account
 present in the baseline, and on Windows after disabling the owned account.
 
 Reports distinguish action completion, result acknowledgement, hold reasons,
-sampled scored uptime, authenticated control-endpoint uptime, and verified
-cleanup. A successful durability check can coexist with poor scored uptime:
+health-check success rates, elapsed recovery wait, and verified cleanup. Probe
+intervals include response latency, so check-count percentages are not a
+time-weighted uptime estimate. A successful durability check can coexist with poor scored uptime:
 an immediate repeated outage deliberately spends most of the exercise waiting
 for the cooldown. That is an operational limitation requiring a recovery plan,
 not evidence that the cooldown should be removed.

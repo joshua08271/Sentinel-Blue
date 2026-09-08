@@ -229,6 +229,12 @@ class WindowsNativeRunnerLab:
         environment = os.environ.copy()
         if extra_env:
             environment.update(extra_env)
+        if arguments and ntpath.basename(arguments[0]).casefold() == 'powershell.exe':
+            # pwsh -> Python -> Windows PowerShell retains the PS7 module path.
+            # Let Windows PowerShell construct its own default module paths so
+            # native fixture cmdlets cannot resolve incompatible PS7 modules.
+            environment = {key: value for key, value in environment.items()
+                           if key.upper() != 'PSMODULEPATH'}
         result = subprocess.run(
             arguments,
             text=True,

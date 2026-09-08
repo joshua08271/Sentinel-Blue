@@ -115,12 +115,14 @@ def campaign(duration: float, runtime: Path | None) -> dict:
     from smoke_release import _operator_headers
 
     started = time.monotonic()
-    report = {'schema_version': 1, 'version': __version__, 'status': 'failed',
+    report = {'schema_version': 2, 'version': __version__, 'status': 'failed',
               'requested_duration_seconds': duration,
               'runtime_sha256': hashlib.sha256(runtime.read_bytes()).hexdigest() if runtime else None,
               'recoveries': [], 'holds_observed': [], 'scored_samples': 0, 'scored_healthy_samples': 0,
               'outage_held_samples': 0,
               'request_timings': {},
+              'measurement_notes': ['check success percentages use counts, not elapsed time; intervals include response latency',
+                                    'recovery wait runs from the stopped service to validated transaction recovery'],
               'control_samples': 0, 'control_healthy_samples': 0,
               'limitations': ['owned process service adapter; not native systemd or SCM',
                               'fixture inventory; not a full native host agent',
@@ -304,6 +306,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
 
             sampler_thread = threading.Thread(target=sampler, daemon=True)
             sampler_thread.start()
+            measured_started = time.monotonic()
             outage_started = None
             end = time.monotonic() + duration
             disconnected = False
@@ -363,6 +366,10 @@ def campaign(duration: float, runtime: Path | None) -> dict:
             report['automatic_recoveries'] = len(report['recoveries'])
             report['real_service_starts'] = scored.starts
             report['duration_seconds'] = round(time.monotonic() - started, 3)
+            report['measured_window_seconds'] = round(time.monotonic() - measured_started, 3)
+            report['validated_recovery_wait_seconds'] = round(
+                sum(item['outage_seconds'] for item in report['recoveries'])
+                + (time.monotonic() - outage_started if outage_started is not None else 0), 3)
             expected_recoveries = 2 if duration >= 330 else 1
             report['status'] = 'passed' if (len(report['recoveries']) >= expected_recoveries and not outbox.has_unacknowledged()
                                           and scored.starts == 1 + len(report['recoveries'])
@@ -391,7 +398,7 @@ def campaign(duration: float, runtime: Path | None) -> dict:
                 report['status'] = 'failed'
     for name in ('scored', 'control'):
         count = report[name + '_samples']
-        report[name + '_sampled_uptime_percent'] = round(100 * report[name + '_healthy_samples'] / count, 3) if count else None
+        report[name + '_check_success_percent'] = round(100 * report[name + '_healthy_samples'] / count, 3) if count else None
     report['full_competition_milestone_complete'] = False
     return report
 

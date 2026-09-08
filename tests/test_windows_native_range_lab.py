@@ -147,6 +147,23 @@ class WindowsNativeRangeGateTests(unittest.TestCase):
 
 
 class WindowsNativeOwnershipTests(unittest.TestCase):
+    def test_windows_powershell_uses_its_default_modules_without_changing_parent_environment(self):
+        inherited = {'PsModulePath': 'incompatible PS7 modules', 'SystemRoot': 'C:\\Windows'}
+        for executable in ('powershell.exe', r'C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.EXE', 'icacls.exe'):
+            with self.subTest(executable=executable), patch.dict(os.environ, inherited, clear=True), patch(
+                'sentinel_blue.windows_native_range_lab.subprocess.run',
+                return_value=subprocess.CompletedProcess(executable, 0, '', ''),
+            ) as run:
+                WindowsNativeRunnerLab._command(
+                    [executable], extra_env={'SENTINEL_BLUE_FIXTURE_ACCOUNT': 'owned fixture'},
+                )
+                environment = run.call_args.kwargs['env']
+                module_paths = [value for key, value in environment.items() if key.upper() == 'PSMODULEPATH']
+                self.assertEqual(module_paths, ['incompatible PS7 modules'] if executable == 'icacls.exe' else [])
+                self.assertEqual(environment.get('SystemRoot', environment.get('SYSTEMROOT')), 'C:\\Windows')
+                self.assertEqual(environment['SENTINEL_BLUE_FIXTURE_ACCOUNT'], 'owned fixture')
+                self.assertEqual(os.environ['PsModulePath'], 'incompatible PS7 modules')
+
     def test_native_command_failure_reports_provider_code_without_target_or_secret(self):
         error = {'command': 'New-LocalUser', 'error_id': 'AccessDenied,Microsoft.PowerShell.Commands.NewLocalUserCommand',
                  'category': 'PermissionDenied', 'exception': 'InvalidOperationException',
