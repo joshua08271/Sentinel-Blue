@@ -749,6 +749,9 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
         set_file = advapi.SetFileSecurityW
         set_file.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p]
         set_file.restype = ctypes.c_int32
+        set_kernel = advapi.SetKernelObjectSecurity
+        set_kernel.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        set_kernel.restype = ctypes.c_int32
         cases = (
             ("backup_only", "backup", 0),
             ("handle_sacl_protection", "handle", 0x8 | (protection & 0x50000000)),
@@ -760,6 +763,10 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
             ("handle_sacl_protection_delete_pending", "handle", 0x8 | (protection & 0x50000000)),
             ("named_sacl_protection_delete_pending", "named", 0x8 | (protection & 0x50000000)),
             ("file_backup_protection_delete_pending", "file", security.WINDOWS_SECURITY_INFORMATION | protection),
+            ("kernel_core_protection", "kernel", security.WINDOWS_CORE_SECURITY_INFORMATION | protection),
+            ("kernel_backup_protection", "kernel", security.WINDOWS_SECURITY_INFORMATION | protection),
+            ("kernel_core_protection_delete_pending", "kernel", security.WINDOWS_CORE_SECURITY_INFORMATION | protection),
+            ("kernel_backup_protection_delete_pending", "kernel", security.WINDOWS_SECURITY_INFORMATION | protection),
         )
         results = []
         native = security._WindowsNativeFileOps()
@@ -794,8 +801,11 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
                             native.set_delete_disposition(handle, True)
                         if operation == "backup":
                             security._restore_windows_security_descriptor(path, encoded, native_handle=handle)
-                        elif operation == "file":
-                            if not set_file(exact_path, information, ctypes.byref(buffer)):
+                        elif operation in {"file", "kernel"}:
+                            if not (set_file if operation == "file" else set_kernel)(
+                                exact_path if operation == "file" else handle,
+                                information, ctypes.byref(buffer),
+                            ):
                                 raise OSError(ctypes.get_last_error(), "file security diagnostic failed")
                         else:
                             result = (set_info if operation == "handle" else set_named)(
