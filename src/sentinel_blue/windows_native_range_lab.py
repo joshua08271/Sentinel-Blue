@@ -765,7 +765,7 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
         native = security._WindowsNativeFileOps()
         with security._windows_privileges("SeBackupPrivilege", "SeRestorePrivilege", "SeSecurityPrivilege"):
             for creation, (name, operation, information) in (
-                (creation, case) for creation in ("explicit", "inherited") for case in cases
+                (creation, case) for creation in ("explicit", "inherited", "ordinary") for case in cases
             ):
                 path = self.root / ("security-diagnostic-" + creation + "-" + name + ".tmp")
                 row: dict[str, Any] = {"case": name, "creation": creation, "expected_control": f"0x{parts[2]:04x}"}
@@ -780,7 +780,7 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
                         0,
                         security.WINDOWS_CREATE_NEW,
                         security.WINDOWS_FILE_ATTRIBUTE_NORMAL
-                        | security.WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                        | (security.WINDOWS_FILE_FLAG_BACKUP_SEMANTICS if creation != "ordinary" else 0)
                         | security.WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
                         **({"security_descriptor": encoded} if creation == "explicit" else {}),
                     )
@@ -789,6 +789,7 @@ Remove-ItemProperty -LiteralPath $env:SENTINEL_BLUE_FIXTURE_RUN_KEY -Name $env:S
                             raise WindowsNativeRangeError("security diagnostic path changed")
                         before = security._capture_windows_security_descriptor(path, native_handle=handle)
                         row["before_control"] = f"0x{security._windows_security_descriptor_semantics(before)[2]:04x}"
+                        row["before_equivalent"] = security._windows_security_descriptors_equivalent(encoded, before)
                         if name.endswith("delete_pending"):
                             native.set_delete_disposition(handle, True)
                         if operation == "backup":
