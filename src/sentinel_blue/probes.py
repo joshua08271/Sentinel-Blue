@@ -110,7 +110,82 @@ def _receive_until(
     raise RuntimeError("transaction response did not match within the receive limit")
 
 
-def _dns_query(host: str, port: int, name: str, record_type: str, timeout: float) -> str:
+def _dns_name(packet: bytes, offset: int) -> tuple[str, int]:
+    labels = []
+    end = None
+    visited = set()
+    for _ in range(128):
+        if offset in visited or offset >= len(packet):
+            raise RuntimeError("invalid DNS name compression")
+        visited.add(offset)
+        size = packet[offset]
+        if size & 0xC0 == 0xC0:
+            if offset + 1 >= len(packet):
+                raise RuntimeError("truncated DNS name pointer")
+            if end is None:
+                end = offset + 2
+            offset = ((size & 0x3F) << 8) | packet[offset + 1]
+            continue
+        if size & 0xC0 or offset + size + 1 > len(packet):
+            raise RuntimeError("invalid DNS label")
+        offset += 1
+        if size == 0:
+            name = ".".join(labels).casefold()
+            if len(name) > 253:
+                raise RuntimeError("DNS name exceeds its length limit")
+            return name, end if end is not None else offset
+        labels.append(packet[offset:offset + size].decode("ascii", errors="strict"))
+        offset += size
+    raise RuntimeError("DNS name compression exceeds its traversal budget")
+
+
+def _dns_exact_answers(packet: bytes, name: str, qtype: int, count: int, expected: list[str]) -> None:
+    if (qtype not in {1, 28} or not isinstance(expected, list) or not 1 <= len(expected) <= 32 or
+            any(not isinstance(value, str) for value in expected)):
+        raise ValueError("expected_answers supports 1 to 32 exact A/AAAA addresses")
+    approved = {str(ipaddress.ip_address(value)) for value in expected}
+    if any(ipaddress.ip_address(value).version != (4 if qtype == 1 else 6) for value in approved):
+        raise ValueError("expected DNS answer address family does not match the query")
+    question, position = _dns_name(packet, 12)
+    canonical = name.rstrip(".").encode("idna").decode("ascii").casefold()
+    if position + 4 > len(packet) or question != canonical or struct.unpack("!HH", packet[position:position + 4]) != (qtype, 1):
+        raise RuntimeError("DNS response question does not match the request")
+    position += 4
+    records = []
+    if count > 128:
+        raise RuntimeError("DNS answer count exceeds its verification budget")
+    for _ in range(count):
+        owner, position = _dns_name(packet, position)
+        if position + 10 > len(packet):
+            raise RuntimeError("truncated DNS answer header")
+        kind, record_class, _ttl, length = struct.unpack("!HHIH", packet[position:position + 10])
+        position += 10
+        end = position + length
+        if end > len(packet):
+            raise RuntimeError("truncated DNS answer data")
+        if record_class == 1 and kind == 5:
+            alias, alias_end = _dns_name(packet, position)
+            if alias_end != end:
+                raise RuntimeError("invalid DNS alias data")
+            records.append((owner, kind, alias))
+        elif record_class == 1 and kind == qtype:
+            if length != (4 if qtype == 1 else 16):
+                raise RuntimeError("invalid DNS address length")
+            records.append((owner, kind, str(ipaddress.ip_address(packet[position:end]))))
+        position = end
+    reachable = {canonical}
+    for _ in range(len(records)):
+        additions = {value for owner, kind, value in records if kind == 5 and owner in reachable}
+        if additions <= reachable:
+            break
+        reachable.update(additions)
+    observed = {value for owner, kind, value in records if kind == qtype and owner in reachable}
+    if observed != approved:
+        raise RuntimeError("DNS answers do not match the approved addresses")
+
+
+def _dns_query(host: str, port: int, name: str, record_type: str, timeout: float,
+               expected_answers: list[str] | None = None) -> str:
     transaction = secrets.randbelow(65536)
     labels = name.rstrip(".").split(".")
     if (
@@ -148,6 +223,8 @@ def _dns_query(host: str, port: int, name: str, record_type: str, timeout: float
         raise RuntimeError(f"DNS response code {rcode}")
     if answers < int(1):
         raise RuntimeError("DNS response had no answers")
+    if expected_answers is not None:
+        _dns_exact_answers(response, name, qtype, answers, expected_answers)
     return f"DNS {record_type.upper()} returned {answers} answer(s)"
 
 
@@ -408,6 +485,7 @@ def run_probe(
                 _text(spec.get("query", "localhost"), "query", 253),
                 _text(spec.get("record_type", "A"), "record_type", 16),
                 timeout,
+                spec.get("expected_answers"),
             )
         elif kind in {"banner", "smtp"}:
             host = _text(spec.get("host", target), "host", 253)

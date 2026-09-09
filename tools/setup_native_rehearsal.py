@@ -182,7 +182,7 @@ pasv_address=127.0.0.1
     ])
     services = [
         manifest(units["web"], "http", ports["web"], [{"kind": "http", "target": f"http://127.0.0.1:{ports['web']}/index.txt", "expected_body": marker, "expected_status": [200]}]),
-        manifest(units["dns"], "dns", ports["dns"], [{"kind": "dns", "target": "127.0.0.1", "port": ports["dns"], "query": "www.setup.test", "record_type": "A"}]),
+        manifest(units["dns"], "dns", ports["dns"], [{"kind": "dns", "target": "127.0.0.1", "port": ports["dns"], "query": "www.setup.test", "record_type": "A", "expected_answers": ["127.0.0.1"]}]),
         manifest(units["db"], "postgresql", ports["db"], [{"kind": "tcp", "target": "127.0.0.1", "port": ports["db"]}]),
         manifest(units["ftp"], "ftp", ports["ftp"], [{"kind": "ftp", "target": "127.0.0.1", "port": ports["ftp"], "path": "download.txt", "expected_sha256": hashlib.sha256(marker.encode()).hexdigest()}]),
     ]
@@ -217,10 +217,11 @@ def windows_inputs(root: Path, suffix: str):
     port = free_port()
     zone = "sentinel-setup-" + suffix + ".test"
     ps = shutil.which("powershell.exe") or shutil.which("pwsh")
+    from sentinel_blue.setup_transport import powershell_environment
 
     def command(code):
         return subprocess.run([ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", code],
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=120, env=powershell_environment(ps))
 
     initial_result = command("Import-Module ServerManager; Get-WindowsFeature Web-Server,DNS | Select-Object Name,Installed | ConvertTo-Json -Compress")
     initial = json.loads(initial_result.stdout) if initial_result.returncode == 0 else []
@@ -245,6 +246,8 @@ Set-Content -LiteralPath '{base}\\index.txt' -Value '{marker}' -Encoding Ascii
 $acl = Get-Acl -LiteralPath '{base}'
 $rule = New-Object System.Security.AccessControl.FileSystemAccessRule('IIS_IUSRS','ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
 $acl.AddAccessRule($rule)
+$anonymousRule = New-Object System.Security.AccessControl.FileSystemAccessRule('IUSR','ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
+$acl.AddAccessRule($anonymousRule)
 Set-Acl -LiteralPath '{base}' -AclObject $acl
 New-WebAppPool -Name '{site}' | Out-Null
 New-Website -Name '{site}' -Port {port} -IPAddress '127.0.0.1' -PhysicalPath '{base}' -ApplicationPool '{site}' | Out-Null
@@ -266,7 +269,7 @@ exit 0
     tasks.append(runbook(root, "zone", dns_check, dns_apply, requires=["dns-service"], service="DNS"))
     services = [
         manifest("W3SVC", "http", port, [{"kind": "http", "target": f"http://127.0.0.1:{port}/index.txt", "expected_body": marker, "expected_status": [200]}]),
-        manifest("DNS", "dns", 53, [{"kind": "dns", "target": "127.0.0.1", "query": "www." + zone, "record_type": "A"}]),
+        manifest("DNS", "dns", 53, [{"kind": "dns", "target": "127.0.0.1", "query": "www." + zone, "record_type": "A", "expected_answers": ["127.0.0.1"]}]),
     ]
 
     def identities():

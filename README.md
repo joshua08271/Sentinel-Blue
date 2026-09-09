@@ -13,9 +13,9 @@ Sentinel Blue is a Python controller and host agent for authorized blue-team env
 The downloadable `.pyz` runtime requires Python 3.11 or newer. The complete ZIP includes that runtime, source, tests, examples, and deployment tools.
 
 ```console
-python sentinel-blue-1.9.24.pyz --help
-python sentinel-blue-1.9.24.pyz doctor
-python sentinel-blue-1.9.24.pyz self-test --json
+python sentinel-blue-1.9.25.pyz --help
+python sentinel-blue-1.9.25.pyz doctor
+python sentinel-blue-1.9.25.pyz self-test --json
 ```
 
 Use `launcher --help` to prepare an inventory-based deployment. The launcher needs a reachable controller, an exact release checksum, an event profile, and the approved deployment credentials and routes. Browser access to a VM console alone does not provide SSH access.

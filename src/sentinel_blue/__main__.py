@@ -248,6 +248,7 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--approve-plan", help="exact SHA-256 printed by the planning command")
     setup.add_argument("--state-dir", help="private persistent setup journal directory")
     setup.add_argument("--resume", action="store_true", help="resume without resetting the original deadline")
+    setup.add_argument("--started-at", type=float, help="optional original event/setup start as a Unix timestamp; cannot be in the future")
     setup.add_argument("--range-deployment", action="store_true")
     setup.add_argument("--output", help="write a sanitized setup readiness report")
 

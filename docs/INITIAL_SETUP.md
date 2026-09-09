@@ -54,6 +54,8 @@ hashes. They do not contain command output or configuration contents. Raw
 command output is retained separately under the private setup state directory
 for operator troubleshooting; each command log is limited to 16 MiB. Treat
 those logs as potentially containing credentials and do not publish them.
+WinRM currently returns only the remote script's exit code, so remote script
+diagnostics must also be retained by the reviewed runbook on the target.
 
 ## Inventory setup section
 
@@ -128,6 +130,9 @@ Runbooks use `options.check`, `options.apply`, and optionally `options.rollback`
 each `{ "path": "private-script.sh", "sha256": "exact digest" }`. Windows scripts
 are PowerShell. Checks must be non-mutating and return zero only for the desired
 state. Apply scripts should be idempotent and contain explicit error handling.
+Windows PowerShell children construct their own module search path to avoid
+inheriting incompatible PowerShell 7 modules. Import custom modules by their
+reviewed absolute path when a runbook needs a nonstandard module location.
 Scripts execute with the target credentials' privileges; transport scoping
 does not sandbox an administrator-written script's internal commands. Review
 them as privileged code. Return code 30 means a reboot is required. Setup never
@@ -142,6 +147,10 @@ download checksum. FTP verification files are limited to 64 KiB; passive data
 connections remain pinned to the scoped server. TCP connectivity by itself is
 not proof of database authentication or query correctness: add a meaningful
 native/application check in the service runbook.
+For A/AAAA DNS records, set `expected_answers` to the exact approved address
+list. This verifies the queried name and its CNAME chain; an unrelated or wrong
+address cannot satisfy that check. Without this field, a DNS probe only checks
+for a successful response containing answers.
 
 Setup endpoints use literal scoped IPs so verification works before DNS is
 configured. DNS queries may contain the required event domain. TLS verification
@@ -157,6 +166,10 @@ review are not currently included automatically in `setup` completion.
 Use the same command and state directory with `--resume`. The original start
 time and deadline remain in force; completed tasks are rechecked. A file lock
 prevents two controllers from using the same setup journal concurrently.
+The optional `--started-at` Unix timestamp includes time spent before invoking
+the command. It cannot be in the future or change an existing journal's start.
+The [network acceptance helper](AZURE_SETUP_ACCEPTANCE.md) uses this to include
+initial controller probes in the same 30-minute window.
 
 An interrupted in-flight mutation becomes `uncertain`. It is not replayed, even
 if a later probe looks healthy. Further mutations on that host are held, as are
@@ -181,7 +194,11 @@ cover concurrency, dependency ordering, crash recovery, and budget exhaustion.
 Neither establishes multi-VM Azure performance, real event deployment access,
 Active Directory recovery, router reconstruction, or arbitrary scored services.
 Use the private Azure lab for the separate full-network acceptance rehearsal.
+The exact procedure and measurement command are in
+[Azure setup acceptance](AZURE_SETUP_ACCEPTANCE.md).
 
 Implementation references: [Ubuntu package management](https://ubuntu.com/server/docs/how-to/software/package-management/),
 [Windows feature installation](https://learn.microsoft.com/en-us/powershell/module/servermanager/install-windowsfeature),
 and [PowerShell remoting sessions](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/new-pssession).
+The Windows child-process compatibility fix follows Microsoft's
+[module path guidance](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-7.5).

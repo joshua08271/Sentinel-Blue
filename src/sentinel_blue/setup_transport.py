@@ -38,7 +38,16 @@ def _ps(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def run_process(argv: list[str], script: str, seconds: float, *, log_dir: Path | None = None) -> CommandResult:
+def powershell_environment(executable: str) -> dict[str, str] | None:
+    # Python launched from pwsh inherits its PS7 module paths. Windows
+    # PowerShell cannot load those modules: let it construct its own defaults.
+    if Path(executable).name.casefold() == "powershell.exe":
+        return {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+    return None
+
+
+def run_process(argv: list[str], script: str, seconds: float, *, log_dir: Path | None = None,
+                env: dict[str, str] | None = None) -> CommandResult:
     """Bound a process group without buffering unbounded or sensitive output."""
     if not math.isfinite(seconds) or seconds <= 0:
         return CommandResult(None, 0, True)
@@ -48,7 +57,7 @@ def run_process(argv: list[str], script: str, seconds: float, *, log_dir: Path |
         incoming.write(script.encode("utf-8"))
         incoming.seek(0)
         proc = subprocess.Popen(
-            argv, stdin=incoming, stdout=outgoing, stderr=subprocess.STDOUT,
+            argv, stdin=incoming, stdout=outgoing, stderr=subprocess.STDOUT, env=env,
             start_new_session=os.name == "posix",
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
@@ -195,7 +204,8 @@ class SetupTransport:
             if os.name == "posix":
                 path.chmod(0o600)
             return run_process([executable, "-NoLogo", "-NoProfile", "-NonInteractive",
-                                "-File", str(path)], "", seconds, log_dir=self.log_dir)
+                                "-File", str(path)], "", seconds, log_dir=self.log_dir,
+                               env=powershell_environment(executable))
 
     def preflight(self, host: dict[str, Any], seconds: float) -> CommandResult:
         if host["platform"] == "linux":

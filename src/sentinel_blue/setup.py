@@ -323,7 +323,8 @@ class SetupRunner:
                          "seconds": time.monotonic() - started, "checks": checks,
                          "reason": "required health checks did not stabilize"}
 
-    def execute(self, state_dir: Path, approved_digest: str, *, resume: bool = False) -> dict:
+    def execute(self, state_dir: Path, approved_digest: str, *, resume: bool = False,
+                started_at: float | None = None) -> dict:
         digest = plan_digest(self.plan)
         if digest != approved_digest or self.plan["profile_fingerprint"] != self.profile.fingerprint:
             raise ValueError("setup plan changed or does not match the approved profile/digest")
@@ -333,12 +334,17 @@ class SetupRunner:
             if isinstance(self.transport, SetupTransport):
                 self.transport.log_dir = state_path.parent / "private-command-output"
             now = time.time()
+            if started_at is not None and (type(started_at) not in {int, float} or
+                                          not math.isfinite(started_at) or not 0 < started_at <= now):
+                raise ValueError("setup start time must be a finite timestamp no later than now")
             if state_path.exists():
                 if not resume:
                     raise ValueError("setup state already exists; use --resume to retain its original deadline")
                 state = read_private_json(state_path)
                 if state.get("plan_sha256") != digest:
                     raise ValueError("existing setup state belongs to another plan")
+                if started_at is not None and started_at != state.get("started_at"):
+                    raise ValueError("resume cannot change the original start time")
                 if set(state.get("tasks", {})) != {t["id"] for t in self.plan["tasks"]}:
                     raise ValueError("setup state task inventory is inconsistent")
                 if type(state.get("last_wall_time")) not in {int, float} or now < state["last_wall_time"] - 0.5:
@@ -358,8 +364,9 @@ class SetupRunner:
             else:
                 if resume:
                     raise ValueError("no setup state exists to resume")
-                state = {"plan_sha256": digest, "started_at": now,
-                         "deadline_at": now + self.plan["budget_seconds"], "last_wall_time": now,
+                initial_time = now if started_at is None else started_at
+                state = {"plan_sha256": digest, "started_at": initial_time,
+                         "deadline_at": initial_time + self.plan["budget_seconds"], "last_wall_time": now,
                          "tasks": {t["id"]: {"status": "pending"} for t in self.plan["tasks"]}}
             self.remaining_at_start = max(0, state["deadline_at"] - now)
             self.started_monotonic = time.monotonic()
@@ -454,7 +461,7 @@ class SetupRunner:
                     row["final_checks"] = checks
                     if not healthy:
                         row["status"] = "deadline" if self.remaining() <= 0 else "changed"
-            elapsed = self.plan["budget_seconds"] - self.remaining_at_start + (time.monotonic() - self.started_monotonic)
+            elapsed = now - state["started_at"] + (time.monotonic() - self.started_monotonic)
             all_ready = all(row["status"] == "ready" for row in state["tasks"].values())
             complete = all_ready and not self.plan["uncovered_services"] and elapsed < self.plan["budget_seconds"]
             report = {
@@ -490,7 +497,8 @@ def run(args: argparse.Namespace) -> int:
     if not args.approve_plan or not args.state_dir:
         raise ValueError("--execute requires --approve-plan SHA256 and --state-dir")
     runner = SetupRunner(plan, profile, progress=lambda row: print(json.dumps(row), file=sys.stderr, flush=True))
-    report = runner.execute(Path(args.state_dir), args.approve_plan, resume=args.resume)
+    report = runner.execute(Path(args.state_dir), args.approve_plan, resume=args.resume,
+                            started_at=args.started_at)
     if args.output:
         write_private_json(args.output, report)
     print(json.dumps(report, indent=2))

@@ -13,7 +13,7 @@ from sentinel_blue.event_profile import EventProfile
 from sentinel_blue.protocol import ProbeResult
 from sentinel_blue.setup import SetupRunner, compile_plan, plan_digest, summarize_plan
 from sentinel_blue.setup_recipes import compile_recipe
-from sentinel_blue.setup_transport import CommandResult, SetupTransport, run_process
+from sentinel_blue.setup_transport import CommandResult, SetupTransport, powershell_environment, run_process
 from sentinel_blue.state import read_private_json, write_private_json
 
 
@@ -193,6 +193,39 @@ class SetupTests(unittest.TestCase):
         self.execute(transport, resume=True)
         self.assertEqual(read_private_json(path)["deadline_at"], deadline)
 
+    def test_event_clock_includes_time_before_command_and_exhaustion_prevents_mutation(self):
+        transport = FixtureTransport()
+        plan = self.plan()
+        started_at = time.time() - 30
+        report = SetupRunner(plan, self.profile, transport=transport).execute(
+            self.root / "state", plan_digest(plan), started_at=started_at)
+        self.assertEqual(transport.applies, [])
+        self.assertGreaterEqual(report["elapsed_seconds"], 30)
+        self.assertFalse(report["under_30_minutes"])
+
+    def test_future_or_changed_event_start_is_rejected(self):
+        transport = FixtureTransport()
+        plan = self.plan()
+        runner = SetupRunner(plan, self.profile, transport=transport, probe=healthy_probe)
+        with self.assertRaisesRegex(ValueError, "timestamp"):
+            runner.execute(self.root / "state", plan_digest(plan), started_at=time.time() + 30)
+        started_at = time.time() - 1
+        runner.execute(self.root / "state", plan_digest(plan), started_at=started_at)
+        with self.assertRaisesRegex(ValueError, "original start"):
+            runner.execute(self.root / "state", plan_digest(plan), resume=True, started_at=started_at + 0.1)
+
+    def test_uncertain_mutation_holds_even_independent_tasks_on_same_host(self):
+        later = copy.deepcopy(self.inventory["setup"]["tasks"][0])
+        later["id"] = "later"
+        later.pop("service_id")
+        self.inventory["setup"]["tasks"].append(later)
+        transport = FixtureTransport()
+        transport.uncertain.add("host-0")
+        report = self.execute(transport)
+        self.assertEqual(report["tasks"]["later"]["status"], "blocked")
+        self.assertEqual(transport.applies.count("host-0"), 1)
+        self.assertEqual(report["tasks"]["host-1"]["status"], "ready")
+
     def test_current_service_drift_prevents_resumed_success(self):
         transport = FixtureTransport()
         self.execute(transport)
@@ -278,6 +311,26 @@ class SetupTests(unittest.TestCase):
 
 
 class RecipeTests(unittest.TestCase):
+    def test_windows_powershell_uses_compatible_module_environment_only_in_child(self):
+        with patch.dict(os.environ, {"PSModulePath": "PS7-incompatible", "SENTINEL_TEST_ENV": "preserved"}):
+            env = powershell_environment("powershell.exe")
+            self.assertFalse(any(key.upper() == "PSMODULEPATH" for key in env))
+            self.assertEqual(env["SENTINEL_TEST_ENV"], "preserved")
+            self.assertEqual(os.environ["PSModulePath"], "PS7-incompatible")
+            self.assertIsNone(powershell_environment("pwsh"))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX private command diagnostics")
+    def test_command_output_is_private_and_only_hash_and_name_enter_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "logs"
+            result = run_process(["bash", "-se"], "printf fixture-secret", 2, log_dir=root)
+            output = root / result.output_log
+            self.assertEqual(output.read_text(), "fixture-secret")
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertNotIn("fixture-secret", repr(result))
+            self.assertEqual(result.output_sha256, hashlib.sha256(output.read_bytes()).hexdigest())
+
     def test_package_names_cannot_inject_options_or_shell_syntax(self):
         for name in ["--allow-unauthenticated", "nginx;id", "nginx\nwhoami"]:
             with self.assertRaises(ValueError):
