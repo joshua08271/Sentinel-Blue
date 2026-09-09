@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,13 +31,14 @@ class CommandResult:
     seconds: float
     uncertain: bool = False
     output_sha256: str = ""
+    output_log: str | None = None
 
 
 def _ps(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def run_process(argv: list[str], script: str, seconds: float) -> CommandResult:
+def run_process(argv: list[str], script: str, seconds: float, *, log_dir: Path | None = None) -> CommandResult:
     """Bound a process group without buffering unbounded or sensitive output."""
     if not math.isfinite(seconds) or seconds <= 0:
         return CommandResult(None, 0, True)
@@ -80,13 +82,35 @@ def run_process(argv: list[str], script: str, seconds: float) -> CommandResult:
                 proc.wait(timeout=3)
         outgoing.seek(0)
         digest = hashlib.sha256()
-        for block in iter(lambda: outgoing.read(65536), b""):
-            digest.update(block)
-        return CommandResult(proc.returncode, time.monotonic() - started, uncertain, digest.hexdigest())
+        log_name = None
+        log = None
+        remaining_log_bytes = 16 * 1024 * 1024
+        if log_dir is not None:
+            if log_dir.is_symlink():
+                raise ValueError("private setup log directory cannot be a symlink")
+            log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            log_name = uuid.uuid4().hex + ".log"
+            descriptor = os.open(log_dir / log_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                 getattr(os, "O_NOFOLLOW", 0), 0o600)
+            log = os.fdopen(descriptor, "wb")
+        try:
+            for block in iter(lambda: outgoing.read(65536), b""):
+                digest.update(block)
+                if log is not None and remaining_log_bytes:
+                    captured = block[:remaining_log_bytes]
+                    log.write(captured)
+                    remaining_log_bytes -= len(captured)
+        finally:
+            if log is not None:
+                log.close()
+        return CommandResult(proc.returncode, time.monotonic() - started, uncertain, digest.hexdigest(), log_name)
 
 
 class SetupTransport:
     """One command per host at a time; the scheduler owns concurrency."""
+
+    def __init__(self, log_dir: Path | None = None):
+        self.log_dir = log_dir
 
     def execute(self, host: dict[str, Any], script: str, seconds: float) -> CommandResult:
         if seconds <= 0:
@@ -99,7 +123,7 @@ class SetupTransport:
             if platform != ("windows" if os.name == "nt" else "linux"):
                 raise ValueError("local setup platform does not match this machine")
             if platform == "linux":
-                return run_process(["bash", "-se"], script, seconds)
+                return run_process(["bash", "-se"], script, seconds, log_dir=self.log_dir)
             return self._powershell(script, seconds)
         if route == "ssh":
             if platform != "linux":
@@ -116,10 +140,10 @@ class SetupTransport:
                 remote = "sudo -n -- " + remote
             result = run_process(
                 ["ssh", *options, "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5",
-                 "-o", "ServerAliveCountMax=2", target, remote], script, seconds,
+                 "-o", "ServerAliveCountMax=2", target, remote], script, seconds, log_dir=self.log_dir,
             )
             if result.returncode in {124, 137, 143, 255}:
-                return CommandResult(result.returncode, result.seconds, True, result.output_sha256)
+                return CommandResult(result.returncode, result.seconds, True, result.output_sha256, result.output_log)
             return result
         if route == "winrm":
             payload = base64.b64encode(script.encode()).decode()
@@ -135,7 +159,7 @@ class SetupTransport:
             if type(port) is not int or not 1 <= port <= 65535:
                 raise ValueError("invalid WinRM port")
             remote = (
-                "$ErrorActionPreference = 'Stop'\n" + credential +
+                "$ErrorActionPreference = 'Stop'\ntry {\n" + credential +
                 f"$session = New-PSSession -ComputerName {_ps(host['address'])} -Port {port} "
                 "-UseSSL -Authentication Negotiate" + credential_argument + "\n"
                 "try {\n"
@@ -151,17 +175,17 @@ class SetupTransport:
                 "  if (@($code).Count -ne 1) { exit 255 }\n"
                 "  exit ([int]$code)\n"
                 "} finally { Remove-PSSession -Session $session }\n"
+                "} catch { exit 255 }\n"
             )
             result = self._powershell(remote, seconds)
             # Transport exceptions may occur after a mutation; a nonzero wrapper
             # exit cannot safely authorize an automatic replay.
             return CommandResult(result.returncode, result.seconds,
                                  result.uncertain or result.returncode == 255,
-                                 result.output_sha256)
+                                 result.output_sha256, result.output_log)
         raise ValueError(f"setup adapter unavailable: {route}")
 
-    @staticmethod
-    def _powershell(script: str, seconds: float) -> CommandResult:
+    def _powershell(self, script: str, seconds: float) -> CommandResult:
         executable = (shutil.which("powershell.exe") if os.name == "nt" else None) or _powershell_executable()
         # -File gives reliable exit semantics; -Command - with redirected stdin
         # can report success even when an earlier statement failed.
@@ -171,7 +195,7 @@ class SetupTransport:
             if os.name == "posix":
                 path.chmod(0o600)
             return run_process([executable, "-NoLogo", "-NoProfile", "-NonInteractive",
-                                "-File", str(path)], "", seconds)
+                                "-File", str(path)], "", seconds, log_dir=self.log_dir)
 
     def preflight(self, host: dict[str, Any], seconds: float) -> CommandResult:
         if host["platform"] == "linux":

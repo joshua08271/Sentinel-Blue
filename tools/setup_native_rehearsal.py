@@ -89,6 +89,9 @@ def linux_inputs(root: Path, suffix: str):
     if len(set(ports.values())) != len(ports):
         raise RuntimeError("fixture port collision")
     packages = ["nginx", "bind9", "bind9-utils", "postgresql-16", "vsftpd"]
+    dns_config = Path("/etc/bind") / ("sentinel-" + suffix + ".conf")
+    dns_zone = Path("/etc/bind") / ("sentinel-" + suffix + ".zone")
+    dns_cache = Path("/var/cache/bind") / ("sentinel-" + suffix)
     initial = {name: subprocess.run(["dpkg-query", "-W", "-f=${Status}", name], capture_output=True,
                                    text=True).stdout == "install ok installed" for name in packages}
     tasks = [{"id": "packages", "host": "target", "recipe": "linux-packages", "requires": [],
@@ -97,6 +100,7 @@ def linux_inputs(root: Path, suffix: str):
     layout = f"""set -eu
 test ! -e {base}
 install -d -m 0755 {base} {base}/web {base}/dns {base}/ftp
+install -d -o bind -g bind -m 0750 {dns_cache}
 install -d -o postgres -g postgres -m 0700 {base}/pgdata
 install -d -o postgres -g postgres -m 0750 {base}/pgsocket
 runuser -u postgres -- /usr/lib/postgresql/16/bin/initdb -D {base}/pgdata --auth-local=peer --auth-host=scram-sha-256
@@ -133,16 +137,16 @@ http {{ access_log off; server {{ listen 127.0.0.1:{ports['web']}; root {base}/w
                  unit_header + f"ExecStart=/usr/sbin/nginx -c {base}/web/nginx.conf -g 'daemon off;'" + unit_footer),
     ], ["/usr/sbin/nginx", "-t", "-c", str(base / "web/nginx.conf")], requires=["database", "dns"])
 
-    dns_conf = f"""options {{ directory \"/var/cache/bind\"; listen-on port {ports['dns']} {{ 127.0.0.1; }}; listen-on-v6 {{ none; }}; recursion no; pid-file \"/run/{units['dns']}/named.pid\"; }};
-zone \"setup.test\" {{ type primary; file \"{base}/dns/setup.zone\"; }};
+    dns_conf = f"""options {{ directory \"{dns_cache}\"; listen-on port {ports['dns']} {{ 127.0.0.1; }}; listen-on-v6 {{ none; }}; recursion no; pid-file \"/run/named/sentinel-{suffix}/named.pid\"; }};
+zone \"setup.test\" {{ type primary; file \"{dns_zone}\"; }};
 """
     zone = "$TTL 60\n@ IN SOA ns.setup.test. hostmaster.setup.test. (1 60 60 60 60)\n@ IN NS ns.setup.test.\nns IN A 127.0.0.1\nwww IN A 127.0.0.1\n"
     service_task("dns", [
-        file_row("named.conf", base / "dns/named.conf", dns_conf),
-        file_row("setup.zone", base / "dns/setup.zone", zone),
+        file_row("named.conf", dns_config, dns_conf),
+        file_row("setup.zone", dns_zone, zone),
         file_row("dns.service", Path("/etc/systemd/system") / (units["dns"] + ".service"),
-                 unit_header + f"User=bind\nRuntimeDirectory={units['dns']}\nExecStart=/usr/sbin/named -g -c {base}/dns/named.conf" + unit_footer),
-    ], ["/usr/sbin/named-checkconf", "-z", str(base / "dns/named.conf")])
+                 unit_header + f"User=bind\nRuntimeDirectory=named/sentinel-{suffix}\nExecStart=/usr/sbin/named -g -c {dns_config}" + unit_footer),
+    ], ["/usr/bin/env", "named-checkconf", "-z", str(dns_config)])
     pg_command = f"/usr/lib/postgresql/16/bin/postgres -D {base}/pgdata -h 127.0.0.1 -p {ports['db']} -k {base}/pgsocket"
     service_task("db", [file_row("db.service", Path("/etc/systemd/system") / (units["db"] + ".service"),
                                 unit_header + "User=postgres\nExecStart=" + pg_command + unit_footer)], covers=False)
@@ -198,7 +202,10 @@ pasv_address=127.0.0.1
         subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=20)
         if stopped:
             shutil.rmtree(base, ignore_errors=True)
-        return {"verified": stopped and not base.exists(), "owned_service_instances_removed": stopped,
+            dns_config.unlink(missing_ok=True)
+            dns_zone.unlink(missing_ok=True)
+            shutil.rmtree(dns_cache, ignore_errors=True)
+        return {"verified": stopped and not base.exists() and not dns_config.exists() and not dns_zone.exists() and not dns_cache.exists(), "owned_service_instances_removed": stopped,
                 "distro_packages_retained_until_runner_disposal": True}
 
     return tasks, services, initial, identities, cleanup, [password]
@@ -313,15 +320,15 @@ def main():
         tasks, services, initial, identities, cleanup, secrets = builder(root, suffix)
         report["initial_packages_or_features"] = initial
         report["initial_scored_service_state"] = "owned instances absent; Windows base services stopped if present"
-        inventory = profile_inventory(args.runtime, tasks, services)
-        inventory_path = root / "inventory.json"
-        write_private_json(inventory_path, inventory)
-        profile = EventProfile.from_dict(inventory["event_profile"])
-        plan = compile_plan(inventory, profile, root)
-        command = [sys.executable, str(args.runtime.absolute()), "setup", "--inventory", str(inventory_path),
-                   "--execute", "--approve-plan", plan_digest(plan), "--state-dir", str(root / "state"),
-                   "--range-deployment", "--output", str(root / "result.json")]
         try:
+            inventory = profile_inventory(args.runtime, tasks, services)
+            inventory_path = root / "inventory.json"
+            write_private_json(inventory_path, inventory)
+            profile = EventProfile.from_dict(inventory["event_profile"])
+            plan = compile_plan(inventory, profile, root)
+            command = [sys.executable, str(args.runtime.absolute()), "setup", "--inventory", str(inventory_path),
+                       "--execute", "--approve-plan", plan_digest(plan), "--state-dir", str(root / "state"),
+                       "--range-deployment", "--output", str(root / "result.json")]
             started = time.monotonic()
             result = subprocess.run(command, capture_output=True, text=True, timeout=1845)
             report["timed_command_seconds"] = round(time.monotonic() - started, 3)
@@ -338,12 +345,21 @@ def main():
                 diagnostics = {}
                 for task in plan["tasks"]:
                     if report.get("setup", {}).get("tasks", {}).get(task["id"], {}).get("status") in {"failed", "uncertain", "changed"}:
+                        record = report["setup"]["tasks"][task["id"]]
+                        log_name = record.get("apply", {}).get("output_log")
+                        if log_name:
+                            private_log = root / "state/private-command-output" / log_name
+                            if private_log.is_file():
+                                text = private_log.read_text(errors="replace")[-4000:]
+                                for secret in secrets:
+                                    text = text.replace(secret, "[redacted]")
+                                diagnostics[task["id"]] = {"apply_output": text}
                         if os.name == "posix":
                             check = subprocess.run(["bash", "-se"], input=task["check"], capture_output=True, text=True, timeout=30)
                             text = (check.stdout + check.stderr)[-2000:]
                             for secret in secrets:
                                 text = text.replace(secret, "[redacted]")
-                            diagnostics[task["id"]] = {"code": check.returncode, "output": text}
+                            diagnostics.setdefault(task["id"], {}).update(code=check.returncode, output=text)
                 report["diagnostics"] = diagnostics
                 raise RuntimeError("packaged native setup did not complete")
             before = identities()
@@ -354,10 +370,17 @@ def main():
         except Exception as exc:
             report.setdefault("error", type(exc).__name__ + ": " + str(exc))
         finally:
-            report["cleanup"] = cleanup()
+            try:
+                report["cleanup"] = cleanup()
+            except Exception as exc:
+                report["cleanup"] = {"verified": False, "error": type(exc).__name__}
             if not report["cleanup"].get("verified"):
                 report["status"] = "failed"
             write_private_json(args.output, report)
+            if os.name == "posix":
+                # This one sanitized report is read by the unprivileged artifact
+                # uploader. Inventories, scripts, and raw logs remain private.
+                args.output.chmod(0o644)
     print(json.dumps(report, indent=2))
     return 0 if report["status"] == "passed" else 2
 

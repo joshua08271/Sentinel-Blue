@@ -50,7 +50,10 @@ range/live approval gates. Any change to the scripts, configuration bytes,
 hosts, probes, dependencies, or profile changes the plan digest. The full plan
 contains scripts and may contain secrets; it is written privately. Console
 progress and result reports contain timings, statuses, return codes, and output
-hashes. They do not contain command output or configuration contents.
+hashes. They do not contain command output or configuration contents. Raw
+command output is retained separately under the private setup state directory
+for operator troubleshooting; each command log is limited to 16 MiB. Treat
+those logs as potentially containing credentials and do not publish them.
 
 ## Inventory setup section
 

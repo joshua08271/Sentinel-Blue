@@ -330,6 +330,8 @@ class SetupRunner:
         if not self.profile.allows("initial_provisioning"):
             raise ValueError("event profile must explicitly permit initial_provisioning")
         with _locked_state(state_dir) as state_path:
+            if isinstance(self.transport, SetupTransport):
+                self.transport.log_dir = state_path.parent / "private-command-output"
             now = time.time()
             if state_path.exists():
                 if not resume:
