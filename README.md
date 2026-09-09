@@ -1,4 +1,12 @@
-# Sentinel Blue 1.9.24
+# Sentinel Blue 1.9.25
+
+Version 1.9.25 adds initial provisioning with an explicit 30-minute execution
+budget: install packages/Windows features, apply reviewed configuration, start
+services in dependency order, and verify application transactions. Independent
+hosts run concurrently. A persistent journal prevents a restart from resetting
+the deadline or replaying an uncertain mutation. See [initial setup](docs/INITIAL_SETUP.md)
+for inputs, supported recipes, and the distinction between a native rehearsal
+and full competition readiness.
 
 Sentinel Blue is a Python controller and host agent for authorized blue-team environments. It collects host state, detects changes, preserves evidence, and performs explicitly authorized recovery actions on Linux and Windows.
 

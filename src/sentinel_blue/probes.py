@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ipaddress
+import ftplib
+import hashlib
 import http.client
 import math
 import secrets
@@ -352,6 +354,45 @@ def run_probe(
                 detail = f"HTTP {status}"
             finally:
                 connection.close()
+        elif kind == "ftp":
+            host = _text(spec.get("host", target), "host", 253)
+            port = _port(spec.get("port", 21))
+            address = scoped_addresses(
+                host, authorized_networks, authorized_hosts=authorized_hosts,
+                excluded_hosts=excluded_hosts,
+            )[0]
+            username = _text(spec.get("username", "anonymous"), "username", 256)
+            password = _text(spec.get("password", "sentinel-probe@example.invalid"), "password", 1024, empty=True)
+            path = _text(spec.get("path", ""), "path", 1024)
+            if any("\r" in value or "\n" in value for value in (username, password, path)):
+                raise ValueError("FTP fields cannot contain command delimiters")
+            expected = _text(spec.get("expected_sha256", ""), "expected_sha256", 64)
+            if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+                raise ValueError("FTP download requires an exact SHA-256")
+
+            class PinnedFTP(ftplib.FTP):
+                def makepasv(self):
+                    _announced_host, data_port = super().makepasv()
+                    return address, _port(data_port)
+
+            digest = hashlib.sha256()
+            received = 0
+            def receive(block):
+                nonlocal received
+                received += len(block)
+                if received > 65536:
+                    raise RuntimeError("FTP verification file exceeds 64 KiB")
+                digest.update(block)
+            ftp = PinnedFTP(timeout=timeout)
+            try:
+                ftp.connect(address, port, timeout=timeout)
+                ftp.login(username, password)
+                ftp.retrbinary("RETR " + path, receive, blocksize=4096)
+                if digest.hexdigest() != expected:
+                    raise RuntimeError("FTP verification file checksum mismatch")
+                detail = "FTP login and exact file download succeeded"
+            finally:
+                ftp.close()
         elif kind == "dns":
             host = _text(spec.get("host", target), "host", 253)
             port = _port(spec.get("port", 53))
@@ -438,7 +479,7 @@ def run_probe(
             raise ValueError(f"unsupported probe kind: {kind}")
         latency = round((time.perf_counter() - started) * 1000, 2)
         return ProbeResult(name=name, target=target, healthy=True, latency_ms=latency, detail=detail)
-    except (KeyError, TypeError, OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+    except (KeyError, TypeError, OSError, ValueError, RuntimeError, http.client.HTTPException, ftplib.Error) as exc:
         latency = round((time.perf_counter() - started) * 1000, 2)
         return ProbeResult(name=name, target=target, healthy=False, latency_ms=latency, detail=str(exc))
 

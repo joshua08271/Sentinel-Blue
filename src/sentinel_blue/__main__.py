@@ -240,6 +240,17 @@ def parser() -> argparse.ArgumentParser:
     launcher.add_argument("--execute", action="store_true")
     launcher.add_argument("--yes", action="store_true", help="confirm execution against the inventory")
 
+    setup = subcommands.add_parser("setup", help="plan or execute initial service provisioning within a fixed deadline")
+    setup.add_argument("--inventory", required=True)
+    setup.add_argument("--event-profile")
+    setup.add_argument("--plan-out", help="write the full private plan for review")
+    setup.add_argument("--execute", action="store_true")
+    setup.add_argument("--approve-plan", help="exact SHA-256 printed by the planning command")
+    setup.add_argument("--state-dir", help="private persistent setup journal directory")
+    setup.add_argument("--resume", action="store_true", help="resume without resetting the original deadline")
+    setup.add_argument("--range-deployment", action="store_true")
+    setup.add_argument("--output", help="write a sanitized setup readiness report")
+
     learner = subcommands.add_parser("learn", help="train a regression-gated candidate from recorded decisions")
     learner.add_argument("--database", required=True)
     learner.add_argument("--base-model")
@@ -406,6 +417,8 @@ def main() -> None:
         from .windows_native_range_lab import run
     elif args.command == "doctor":
         from .diagnostics import run
+    elif args.command == "setup":
+        from .setup import run
     elif args.command.startswith("recovery-"):
         from .recovery_ops import run
     elif args.command == "self-test":
