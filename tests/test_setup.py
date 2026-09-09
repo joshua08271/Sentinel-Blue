@@ -44,7 +44,9 @@ def fixture(root, *, hosts=2, services=True, budget=10):
         for phase in ["check", "apply"]:
             path = root / f"{name}-{phase}.sh"
             content = f"# {phase} {name}\nexit 0\n"
-            path.write_text(content, encoding="utf-8")
+            # Hash and write the same bytes on Windows and Linux. Text mode
+            # would insert CRLF on Windows after the LF-only hash was computed.
+            path.write_bytes(content.encode("utf-8"))
             options[phase] = {"path": path.name, "sha256": hashlib.sha256(content.encode()).hexdigest()}
         task = {"id": name, "host": name, "recipe": "runbook", "options": options,
                 "timeout_seconds": 5, "health_wait_seconds": 2, "estimate_seconds": 1}
