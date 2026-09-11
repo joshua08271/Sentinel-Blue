@@ -302,6 +302,17 @@ def _require_success_result_contract(
             or pre_state.get("desired_state") not in {"running", "stopped"}
         ):
             raise ValueError("service action success lacks prior-state attestation")
+        if action_type == "restart_service" and "recovery_guard" in parameters:
+            probes = result.get("probes")
+            expected = parameters.get("probes", [])
+            if (result.get("stable_health") is not True or not expected
+                or type(result.get("probe_attempts")) is not int or result["probe_attempts"] < 3
+                or not isinstance(probes, list) or len(probes) != len(expected)
+                or any(not isinstance(row, dict) or row.get("healthy") is not True
+                       or row.get("target") != spec.get("target")
+                       or row.get("name") != spec.get("name", spec.get("target"))
+                       for row, spec in zip(probes, expected))):
+                raise ValueError("automatic service recovery lacks stable manifest probe attestations")
     elif action_type == "validate_service":
         probes = result.get("probes")
         if not isinstance(probes, list) or not probes or any(
@@ -2019,6 +2030,11 @@ class Store:
         freshness_seconds: float = 90.0,
         validate_current_telemetry: bool = False,
     ) -> dict[str, Any] | None:
+        # Local relay observations never carry remote-agent authority. Their
+        # intentionally unbound row must not quarantine the entire controller.
+        # HTTP enrollment and authentication reject this reserved identity.
+        if agent_id == "sentinel-relay-probes":
+            return None
         with self._lock:
             row = self._connection.execute(
                 """
@@ -6815,7 +6831,7 @@ class Store:
                     """
                     SELECT alert_id FROM alerts
                     WHERE agent_id=? AND fingerprint=? AND decided_at IS NOT NULL AND decided_at>?
-                      AND COALESCE(decision, '')!='automatic_restore'
+                      AND COALESCE(decision, '') NOT IN ('automatic_restore','automatic_service_recovery')
                     ORDER BY decided_at DESC LIMIT 1
                     """,
                     (agent_id, fingerprint, now - 900),
@@ -7911,6 +7927,68 @@ class Store:
             self._connection.commit()
             return changed
 
+    def _service_recovery_budget_locked(self, agent_id: str, service: str, now: float) -> str | None:
+        return self._service_recovery_budget_status_locked(agent_id, service, now)["reason"]
+
+    def service_recovery_budget_status(self, agent_id: str, service: str) -> dict[str, Any]:
+        """Describe the same durable admission gate used when queueing a restart."""
+        with self._lock:
+            return self._service_recovery_budget_status_locked(agent_id, service, time.time())
+
+    def _service_recovery_budget_status_locked(self, agent_id: str, service: str, now: float) -> dict[str, Any]:
+        from .service_recovery import (
+            RECOVERY_COOLDOWN_SECONDS, RECOVERY_WINDOW_SECONDS, RECOVERY_MAX_ATTEMPTS,
+        )
+
+        attempts: list[float] = []
+
+        def result(reason: str | None, retry_at: float | None = None) -> dict[str, Any]:
+            return {
+                "allowed": reason is None,
+                "reason": reason,
+                "attempts_in_window": len(attempts),
+                "maximum_attempts": RECOVERY_MAX_ATTEMPTS,
+                "window_seconds": RECOVERY_WINDOW_SECONDS,
+                "cooldown_seconds": RECOVERY_COOLDOWN_SECONDS,
+                "retry_at": retry_at,
+            }
+
+        rows = self._connection.execute(
+            """
+            SELECT action_id, action_type, parameters_json, status, created_at
+            FROM actions WHERE agent_id=?
+              AND action_type IN ('restart_service','rollback_service')
+              AND (created_at>? OR status IN ('queued','dispatched','outcome_unknown'))
+            ORDER BY created_at DESC LIMIT 1025
+            """, (agent_id, now - RECOVERY_WINDOW_SECONDS),
+        ).fetchall()
+        if len(rows) > 1024:
+            return result("service_recovery_history_budget_exceeded")
+        for row in rows:
+            parameters = self._decode_stored_json(
+                row["parameters_json"], table_name="actions", row_key=str(row["action_id"]),
+                column_name="parameters_json", expected_type=dict,
+            )
+            if parameters is None:
+                return result("service_recovery_history_unreadable")
+            if str(parameters.get("service", "")).casefold() != service.casefold():
+                continue
+            if row["status"] in {"queued", "dispatched", "outcome_unknown"}:
+                return result("service_recovery_prior_outcome_unresolved")
+            if row["action_type"] == "restart_service":
+                attempts.append(float(row["created_at"]))
+        if len(attempts) >= RECOVERY_MAX_ATTEMPTS:
+            # More than the automatic allowance may exist after manual work.
+            # Wait until enough entries expire, not merely the oldest entry.
+            retry_at = max(
+                sorted(attempts)[-RECOVERY_MAX_ATTEMPTS] + RECOVERY_WINDOW_SECONDS,
+                max(attempts) + RECOVERY_COOLDOWN_SECONDS,
+            )
+            return result("service_recovery_hourly_budget_exhausted", retry_at)
+        if attempts and now - max(attempts) < RECOVERY_COOLDOWN_SECONDS:
+            return result("service_recovery_cooldown", max(attempts) + RECOVERY_COOLDOWN_SECONDS)
+        return result(None)
+
     def queue_action(
         self,
         agent_id: str,
@@ -8122,7 +8200,9 @@ class Store:
                 ).fetchone()
                 if existing:
                     existing_id = str(existing["action_id"])
-            if existing_id is None:
+            if existing_id is None and automated and action_type == "restart_service":
+                quota_reason = self._service_recovery_budget_locked(agent_id, parameters["service"], now)
+            if existing_id is None and quota_reason is None:
                 counts = self._connection.execute(
                     """
                     SELECT COUNT(*) AS total,
@@ -9310,13 +9390,17 @@ class Store:
                 success_restore = (
                     normalized_result["success"] is True
                     and normalized_result.get("dry_run") is not True
-                    and row["action_type"] == "restore_integrity"
+                    and (row["action_type"] == "restore_integrity" or (
+                        row["action_type"] == "restart_service" and row["automated"] == 1
+                        and "recovery_guard" in parameters
+                    ))
                     and bool(row["alert_id"])
                     and binding_current
                 )
                 if success_restore:
                     clauses = ""
-                    values: list[Any] = [now, row["alert_id"], row["agent_id"]]
+                    decision = "automatic_service_recovery" if row["action_type"] == "restart_service" else "automatic_restore"
+                    values: list[Any] = [decision, now, row["alert_id"], row["agent_id"]]
                     if bound:
                         clauses = (
                             " AND credential_epoch=? AND profile_id=? "
@@ -9333,7 +9417,7 @@ class Store:
                     self._connection.execute(
                         """
                         UPDATE alerts SET status='decided',
-                          decision='automatic_restore', decided_at=?
+                          decision=?, decided_at=?
                         WHERE alert_id=? AND agent_id=? AND status='open'
                         """
                         + clauses,

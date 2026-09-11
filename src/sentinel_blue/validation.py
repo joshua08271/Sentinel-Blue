@@ -75,6 +75,8 @@ ACTION_RESULT_FIELDS = frozenset(
         "errors",
         "config_validation",
         "probes",
+        "probe_attempts",
+        "stable_health",
         "retention_warnings",
         "captured",
         "capture_receipts",
@@ -827,6 +829,10 @@ def validate_action_result(
     for flag in ("dry_run", "rolled_back", "interrupted", "review_required"):
         if flag in payload:
             result[flag] = _boolean(payload[flag], flag)
+    if "stable_health" in payload:
+        if result["action_type"] != "restart_service":
+            raise ValidationError("stable_health is valid only for restart_service results")
+        result["stable_health"] = _boolean(payload["stable_health"], "stable_health")
     if result["completed_at"] < result["started_at"]:
         raise ValidationError("completed_at must not precede started_at")
     if result["success"] and (
@@ -1053,6 +1059,14 @@ def validate_action_result(
                 )
             normalized_probes.append(_probe(row, index))
         result["probes"] = normalized_probes
+    if "probe_attempts" in payload:
+        if result["action_type"] != "restart_service":
+            raise ValidationError(
+                "probe_attempts is valid only for restart_service results"
+            )
+        result["probe_attempts"] = _integer(
+            payload["probe_attempts"], "probe_attempts", 0, 64
+        )
     try:
         encoded = json.dumps(
             result,

@@ -1,4 +1,5 @@
 import hashlib
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,9 @@ from sentinel_blue.collectors import (
     _linux_services,
     _integrity,
     _stable_firewall_digest,
+    _windows_accounts,
+    _windows_firewall,
+    _windows_persistence,
     _windows_security_events,
     _windows_inventory,
     collect,
@@ -21,6 +25,105 @@ from sentinel_blue.protocol import FirewallState
 
 
 class CollectorTests(unittest.TestCase):
+    def _firewall_snapshot(self):
+        return {
+            "Schema": 2,
+            "Profiles": [{"Name": "Domain", "Enabled": True, "DefaultInboundAction": "Block"}],
+            "Rules": [{"InstanceID": "one", "Enabled": True}, {"InstanceID": "two", "Enabled": True}],
+            "Filters": {
+                "Address": [{"InstanceID": "one", "RemoteAddress": ["127.0.0.1", "::1"]}, {"InstanceID": "two", "RemoteAddress": ["192.0.2.1"]}],
+                "Port": [{"InstanceID": "one", "RemotePort": ["9"]}],
+                "Application": [{"InstanceID": "one", "Program": "example.exe"}],
+                "Service": [], "Interface": [], "InterfaceType": [], "Security": [],
+            },
+        }
+
+    def _read_firewall_snapshot(self, state):
+        errors = []
+        with patch("sentinel_blue.collectors._windows_json", return_value=[state]):
+            result = _windows_firewall(errors)
+        return result, errors
+
+    def test_windows_firewall_digest_covers_filters_and_profile_defaults(self):
+        original = self._firewall_snapshot()
+        baseline, errors = self._read_firewall_snapshot(original)
+        self.assertFalse(errors)
+        for kind, field, value in (("Address", "RemoteAddress", ["127.0.0.0/8"]), ("Port", "RemotePort", ["10"]), ("Application", "Program", "changed.exe")):
+            with self.subTest(kind=kind):
+                state = copy.deepcopy(original)
+                state["Filters"][kind][0][field] = value
+                observed, errors = self._read_firewall_snapshot(state)
+                self.assertFalse(errors)
+                self.assertNotEqual(baseline.rules_sha256, observed.rules_sha256)
+        state = copy.deepcopy(original)
+        state["Profiles"][0]["DefaultInboundAction"] = "Allow"
+        observed, errors = self._read_firewall_snapshot(state)
+        self.assertFalse(errors)
+        self.assertNotEqual(baseline.rules_sha256, observed.rules_sha256)
+
+    def test_windows_firewall_digest_ignores_order_but_preserves_filter_binding(self):
+        state = self._firewall_snapshot()
+        baseline, _ = self._read_firewall_snapshot(state)
+        state["Rules"].reverse()
+        state["Filters"]["Address"][0]["RemoteAddress"].reverse()
+        state["Filters"]["Address"].reverse()
+        observed, errors = self._read_firewall_snapshot(state)
+        self.assertFalse(errors)
+        self.assertEqual(baseline.rules_sha256, observed.rules_sha256)
+        first, second = state["Filters"]["Address"]
+        first["InstanceID"], second["InstanceID"] = second["InstanceID"], first["InstanceID"]
+        rebound, _ = self._read_firewall_snapshot(state)
+        self.assertNotEqual(baseline.rules_sha256, rebound.rules_sha256)
+
+    def test_windows_firewall_incomplete_collection_cannot_look_successful(self):
+        state = self._firewall_snapshot()
+        del state["Filters"]["Address"]
+        observed, errors = self._read_firewall_snapshot(state)
+        self.assertFalse(observed.enabled)
+        self.assertEqual(observed.rules_sha256, "")
+        self.assertTrue(errors)
+
+    def test_windows_administrator_inventory_is_locale_independent(self):
+        rows = [
+            {
+                "Name": "runneradmin",
+                "SID": "S-1-5-21-1-2-3-1001",
+                "Enabled": True,
+                "Privileged": True,
+            }
+        ]
+        with patch(
+            "sentinel_blue.collectors._windows_json", return_value=rows
+        ) as invoke:
+            accounts = _windows_accounts([])
+        script = invoke.call_args.args[0]
+        self.assertIn("Get-LocalGroup -SID 'S-1-5-32-544'", script)
+        self.assertNotIn("Get-LocalGroupMember -Group 'Administrators'", script)
+        self.assertTrue(accounts[0].privileged)
+        self.assertEqual(accounts[0].groups, ["Administrators"])
+
+    def test_windows_persistence_inventory_includes_registry_run_values(self):
+        rows = [
+            {
+                "Kind": "registry-run",
+                "Name": r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run\Fixture",
+                "Owner": "SYSTEM",
+                "Enabled": True,
+                "SHA256": "a" * 64,
+            }
+        ]
+        with patch(
+            "sentinel_blue.collectors._windows_json", return_value=rows
+        ) as invoke:
+            persistence = _windows_persistence([])
+        script = invoke.call_args.args[0]
+        self.assertEqual(persistence[0].kind, "registry-run")
+        self.assertEqual(persistence[0].owner, "SYSTEM")
+        self.assertEqual(persistence[0].sha256, "a" * 64)
+        self.assertIn("HKEY_LOCAL_MACHINE\\Software\\Microsoft", script)
+        self.assertIn("HKEY_CURRENT_USER\\Software\\Microsoft", script)
+        self.assertIn("DoNotExpandEnvironmentNames", script)
+
     def test_windows_integrity_hashes_only_the_descriptor_from_the_open_file(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "protected.conf"
@@ -123,7 +226,7 @@ class CollectorTests(unittest.TestCase):
             patch("sentinel_blue.collectors.platform.system", return_value="Windows"),
             patch(
                 "sentinel_blue.collectors._windows_inventory",
-                side_effect=lambda errors: (
+                side_effect=lambda errors, **_kwargs: (
                     errors.append(hostile)
                     or ([], [], [], [], [], [], [], [], FirewallState(False), [], [])
                 ),
@@ -210,8 +313,12 @@ class CollectorTests(unittest.TestCase):
             "Id=web.service\nActiveState=active\nSubState=running\nUnitFileState=enabled\nNRestarts=2\nResult=success\nExecMainStatus=0\n\n",
             "",
         )
-        with patch("sentinel_blue.collectors._run", side_effect=[units, files, details]):
+        with patch(
+            "sentinel_blue.collectors._run", side_effect=[units, files, details]
+        ) as runner:
             services = _linux_services([])
+        self.assertIn("--full", runner.call_args_list[0].args[0])
+        self.assertIn("--full", runner.call_args_list[1].args[0])
         self.assertEqual(services[0].state, "running")
         self.assertEqual(services[0].start_mode, "enabled")
         self.assertEqual(services[0].restart_count, 2)
@@ -234,6 +341,22 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(service.start_mode, "unknown")
         self.assertEqual(service.substate, "dead")
         self.assertEqual(service.result, "success")
+
+    def test_linux_stopped_unloaded_unit_file_remains_in_inventory(self):
+        units = CompletedProcess([], 0, "", "")
+        files = CompletedProcess(
+            [], 0, "sentinel-example.service static -\n", ""
+        )
+        with patch(
+            "sentinel_blue.collectors._run", side_effect=[units, files]
+        ) as runner:
+            services = _linux_services([])
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(len(services), 1)
+        self.assertEqual(services[0].name, "sentinel-example.service")
+        self.assertEqual(services[0].state, "inactive")
+        self.assertEqual(services[0].substate, "dead")
+        self.assertEqual(services[0].start_mode, "static")
 
     def test_firewall_packet_counters_do_not_change_rules_fingerprint(self):
         first = "ip saddr 198.51.100.1 counter packets 2 bytes 100 accept"

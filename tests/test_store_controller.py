@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -83,8 +84,8 @@ class ControllerTests(unittest.TestCase):
         app.excluded_hosts = ["203.0.113.99"]
         app.event_profile.profile_id = "profile"
         app.event_profile.fingerprint = "a" * 64
-        stop = MagicMock()
-        stop.is_set.side_effect = [False, True]
+        stop = threading.Event()
+        app.ingest.side_effect = lambda _payload: stop.set()
         healthy = ProbeResult("web", "203.0.113.7", True)
         with patch("sentinel_blue.probes.run_probes", return_value=[healthy]) as runner:
             relay_probe_loop(app, [{"name": "web"}], 5.0, stop)
@@ -93,6 +94,7 @@ class ControllerTests(unittest.TestCase):
             ["203.0.113.0/24"],
             authorized_hosts=["203.0.113.7"],
             excluded_hosts=["203.0.113.99"],
+            stop_event=stop,
         )
         app.ingest.assert_called_once()
 
@@ -147,7 +149,7 @@ class ControllerTests(unittest.TestCase):
             "hostname": "host-1",
             "platform": "Linux",
             "observed_at": time.time(),
-            "accounts": [{"name": "root", "privileged": True, "enabled": True}],
+            "accounts": [{"name": "root", "account_id": "0", "privileged": True, "enabled": True}],
             "sessions": [],
             "services": [{"name": "web", "state": "running"}],
             "interfaces": [],

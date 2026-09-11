@@ -350,7 +350,10 @@ const vector={json.dumps(vector, separators=(',', ':'))};
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            # Windows hosted runners can take longer to initialize Node and its
+            # WebCrypto provider while the parallel matrix is under load. Keep a
+            # firm bound, but do not turn ordinary startup variance into a failure.
+            timeout=30,
         )
         self.assertEqual(completed.stdout, EXPECTED_SIGNATURE)
 

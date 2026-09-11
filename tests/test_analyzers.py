@@ -1,10 +1,25 @@
 import unittest
 
-from sentinel_blue.analyzers import analyze_all, analyze_security_events, analyze_services
+from sentinel_blue.analyzers import analyze_all, analyze_persistence, analyze_security_events, analyze_services
 from sentinel_blue.risk import RiskModel
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_persistence_enable_disable_and_owner_changes_are_not_hidden_by_same_content(self):
+        old = {"kind": "scheduled-task", "name": "\\Fixture", "owner": "SYSTEM", "enabled": False, "sha256": "a" * 64}
+        for change in ({"enabled": True}, {"owner": "other"}, {"sha256": "b" * 64}):
+            with self.subTest(change=change):
+                current = {**old, **change}
+                alerts = analyze_persistence({"persistence": [current]}, {"persistence": [old]}, RiskModel())
+                self.assertEqual([x.kind for x in alerts], ["persistence_changed"])
+                self.assertEqual(alerts[0].recommended_action, "snapshot")
+        alerts = analyze_persistence({"persistence": [old]}, {"persistence": [{**old, "enabled": True}]}, RiskModel())
+        self.assertEqual([x.kind for x in alerts], ["persistence_changed"])
+
+    def test_persistence_unchanged_configuration_does_not_alert(self):
+        item = {"kind": "scheduled-task", "name": "\\Fixture", "owner": "SYSTEM", "enabled": False, "sha256": "a" * 64}
+        self.assertEqual(analyze_persistence({"persistence": [dict(item)]}, {"persistence": [item]}, RiskModel()), [])
+
     def test_post_baseline_account_creation_and_failure_burst_are_flagged(self):
         baseline = {"observed_at": 100.0, "accounts": []}
         events = [

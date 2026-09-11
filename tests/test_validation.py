@@ -175,6 +175,27 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result["errors"], payload["errors"])
         self.assertEqual(result["config_validation"], payload["config_validation"])
 
+    def test_restart_result_accepts_only_bounded_probe_attempt_evidence(self):
+        payload = {
+            "action_id": "a",
+            "action_type": "restart_service",
+            "success": True,
+            "message": "recovered",
+            "started_at": time.time(),
+            "completed_at": time.time(),
+            "probe_attempts": 2,
+        }
+        self.assertEqual(validate_action_result(payload)["probe_attempts"], 2)
+        for invalid in (True, -1, 65, 1.5, "2"):
+            with self.subTest(invalid=invalid):
+                changed = dict(payload)
+                changed["probe_attempts"] = invalid
+                with self.assertRaises(ValidationError):
+                    validate_action_result(changed)
+        wrong_action = {**payload, "action_type": "snapshot"}
+        with self.assertRaisesRegex(ValidationError, "restart_service"):
+            validate_action_result(wrong_action)
+
     def test_successful_restore_point_capture_requires_explicit_non_dry_run(self):
         receipt = {
             "path": "/etc/example.conf",

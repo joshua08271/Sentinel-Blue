@@ -67,6 +67,7 @@ CAPABILITIES = frozenset(
         "database_restoration",
         "network_forks",
         "session_containment",
+        "initial_provisioning",
     }
 )
 COMMON_LIVE_PROHIBITIONS = frozenset(

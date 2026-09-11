@@ -7,7 +7,7 @@ from sentinel_blue.risk import RiskModel
 class DetectionTests(unittest.TestCase):
     def setUp(self):
         self.baseline = {
-            "accounts": [{"name": "root", "privileged": True, "enabled": True}],
+            "accounts": [{"name": "root", "account_id": "0", "privileged": True, "enabled": True}],
             "sessions": [],
             "services": [{"name": "web", "state": "running"}],
         }
