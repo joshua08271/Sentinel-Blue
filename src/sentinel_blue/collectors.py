@@ -648,6 +648,8 @@ def _linux_processes(errors: list[str]) -> list[ProcessObservation]:
     except OSError as exc:
         errors.append(f"process inventory unavailable: {exc}")
         return []
+    if len(entries) > 4096:
+        errors.append("Linux process inventory exceeded its 4096-entry limit; coverage is incomplete")
     for entry in entries[:4096]:
         try:
             values: dict[str, str] = {}
@@ -684,6 +686,9 @@ def _linux_processes(errors: list[str]) -> list[ProcessObservation]:
 def _windows_processes(errors: list[str]) -> list[ProcessObservation]:
     script = WINDOWS_QUERIES["PROCESSES"]
     try:
+        rows = _windows_json(script)
+        if len(rows) > 4096:
+            errors.append("Windows process inventory exceeded its 4096-entry limit; coverage is incomplete")
         return [
             ProcessObservation(
                 name=str(item.get("Name", "unknown")),
@@ -693,9 +698,9 @@ def _windows_processes(errors: list[str]) -> list[ProcessObservation]:
                 parent_id=int(item.get("ParentProcessId", 0)),
                 privileged=bool(item.get("Privileged", False)),
             )
-            for item in _windows_json(script)
+            for item in rows[:4096]
             if int(item.get("ProcessId", 0)) > 0
-        ][:4096]
+        ]
     except Exception as exc:
         errors.append(f"Windows process inventory failed: {exc}")
         return []

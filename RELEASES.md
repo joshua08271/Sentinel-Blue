@@ -1,16 +1,9 @@
-# Sentinel Blue defender releases
+# Public defender releases
 
-## 1.9.42
+The latest runtime candidate is **1.9.43**, in [releases/sentinel-blue-1.9.43.pyz](releases/sentinel-blue-1.9.43.pyz). Source at this branch matches it. Runtime SHA-256: `80a67e8a8eefe6e3033879b839c2eefa2c3dca796953cea5c6f441abafcc92aa`.
 
-[Download the runnable defender bundle](releases/sentinel-blue-defender-1.9.42.zip).
-The bundle includes the Python zip application, matching source, regression tests, and local validation evidence.
+Local validation: 218 tests run, 216 passed, two Windows-only tests skipped on Linux. Windows CI and live Azure acceptance are in progress; see [current validation](docs/DEFENSIVE_VALIDATION_1.9.43.md). A complete 1.9.43 bundle will follow the acceptance results.
 
-Bundle SHA-256: `220a25adcd3da6056ef8381e1970e6b9b0b9bda1299f669d7fc3041ed3f721ef`
+The previous [1.9.42 complete bundle](releases/sentinel-blue-defender-1.9.42.zip) remains available unchanged. Its [Linux and Windows CI](https://github.com/joshua08271/Sentinel-Blue/actions/runs/34658160560) passed after the user explicitly authorized public publication on 11 September 2026. The publication-blocked text inside that historical bundle predates this authorization.
 
-Runtime SHA-256: `d410e4b1312fde354f60f756d1cbd18b8eaebaf5ab3b81c686e000d549789238`
-
-The source tree on this branch is the expanded 1.9.42 defender source. The new `defender-validation` workflow runs the complete supplied POSIX suite, packaged local controller/agent continuity and deadline tests, and focused native Windows integrity tests.
-
-The bundled validation report is a snapshot from before publication authorization. Its statement that publication was blocked is historical; publication was explicitly authorized on 11 September 2026. Its local test results and limits remain applicable. Later CI and Azure results must identify the exact runtime tested.
-
-1.9.41 Azure setup, SMB timing and Windows collection-load failures remain open until new evidence resolves them. Local tests do not establish complete competition readiness.
+The public maintenance branch retains its original `maintenance/defender-1.9.42` name while subsequent versions are developed. See [pull request #3](https://github.com/joshua08271/Sentinel-Blue/pull/3).

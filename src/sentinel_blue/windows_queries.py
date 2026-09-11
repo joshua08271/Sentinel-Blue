@@ -52,7 +52,8 @@ Get-Process -IncludeUserName -ErrorAction SilentlyContinue | ForEach-Object {
     if ($_.UserName) { $owners[[int]$_.Id] = [PSCustomObject]@{UserName=$_.UserName;Started=$_.StartTime.ToUniversalTime()} }
   } catch { }
 }
-Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate | Select-Object -First 4096 | ForEach-Object {
+# Return one overflow record so the collector can report incomplete coverage.
+Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate | Select-Object -First 4097 | ForEach-Object {
   $owner = $owners[[int]$_.ProcessId]
   $user = 'unknown'
   if ($owner -and $_.CreationDate) {

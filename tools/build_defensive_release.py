@@ -26,7 +26,7 @@ DEFENSIVE_TOOLS = [
 DEFENSIVE_TESTS = [
     'test_defensive_distribution.py', 'test_defensive_azure_payload.py',
     'test_posix_integrity_budget.py', 'test_azure_setup_guest.py',
-    'test_integrity_coverage.py', 'test_windows_integrity_budget.py',
+    'test_integrity_coverage.py', 'test_windows_integrity_budget.py', 'test_process_coverage.py',
     'test_windows_inventory_host.py', 'test_windows_query_batch.py',
     'test_service_repair.py', 'test_service_recovery_regressions.py',
     'test_autonomous_service_recovery.py', 'test_service_manifest_policy.py',
@@ -40,6 +40,7 @@ DEFENSIVE_DOCS = [
     'CONTROLLER_CONTINUITY.md', 'INITIAL_SETUP.md', 'WINDOWS_COLLECTION.md',
     'DEFENSIVE_VALIDATION_2026-09-11.md', 'AZURE_DEFENSIVE_ACCEPTANCE_1.9.41.md',
     'DEFENSIVE_VALIDATION_1.9.42.md',
+    'DEFENSIVE_VALIDATION_1.9.43.md',
     'validation-1.9.42/lifecycle.json', 'validation-1.9.42/transport.json',
     'validation-1.9.42/probe-timing.json', 'validation-1.9.42/local-tests.json',
 ]
@@ -95,7 +96,7 @@ def build_bundle(output: Path):
             raise ValueError('Runtime does not exactly match the supplied defender source')
     files = [(runtime.name, runtime.read_bytes()), (source.name, source.read_bytes()),
              ('README.md', (ROOT/'README.md').read_bytes()),
-             ('VALIDATION.md', (ROOT/'docs/DEFENSIVE_VALIDATION_1.9.42.md').read_bytes()),
+             ('VALIDATION.md', (ROOT/f'docs/DEFENSIVE_VALIDATION_{VERSION}.md').read_bytes()),
              ('AZURE_ACCEPTANCE_1.9.41.md', (ROOT/'docs/AZURE_DEFENSIVE_ACCEPTANCE_1.9.41.md').read_bytes())]
     checksums = ''.join(hashlib.sha256(data).hexdigest()+'  '+name+'\n' for name, data in files).encode()
     bundle = output/f'sentinel-blue-defender-{VERSION}.zip'

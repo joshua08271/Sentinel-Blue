@@ -70,6 +70,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Validate native file handles, inventory lifetime, and coverage
-        run: python -m unittest tests.test_windows_integrity_budget tests.test_windows_inventory_host tests.test_windows_query_batch tests.test_integrity_coverage tests.test_defensive_distribution -v
+        run: python -m unittest tests.test_windows_integrity_budget tests.test_windows_inventory_host tests.test_windows_query_batch tests.test_integrity_coverage tests.test_process_coverage tests.test_defensive_distribution -v
       - name: Build the Windows defender distribution
         run: python -m tools.build_defensive_release --output dist --bundle
