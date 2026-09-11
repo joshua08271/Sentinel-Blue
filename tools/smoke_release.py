@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import signal
 import socket
@@ -22,6 +23,21 @@ def _port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def _stop_controller(controller: subprocess.Popen[str]) -> None:
+    """Stop the smoke controller without assuming POSIX signal semantics."""
+    if controller.poll() is not None:
+        return
+    if os.name == "nt":
+        controller.terminate()
+    else:
+        controller.send_signal(signal.SIGINT)
+    try:
+        controller.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        controller.kill()
+        controller.wait(timeout=3)
 
 
 def _operator_headers(
@@ -136,7 +152,10 @@ def smoke(runtime: Path) -> dict[str, object]:
     runtime_version = version_result.stdout.strip().removeprefix(prefix)
     expected_runtime = hashlib.sha256(runtime.read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix="sentinel-blue-release-smoke-") as directory:
-        root = Path(directory)
+        # Windows CI can expose its temporary directory through an 8.3 alias.
+        # Resolve it before handing a privileged state path to the agent; the
+        # runtime correctly rejects aliases at its trust boundary.
+        root = Path(os.path.realpath(directory))
         token = secrets.token_urlsafe(48)
         controller_token = root / "controller-token.json"
         controller_token.write_text(json.dumps({"token": token}), encoding="utf-8")
@@ -428,8 +447,7 @@ def smoke(runtime: Path) -> dict[str, object]:
                     f"controller_reason={rejection}, stderr={agent.stderr[-4000:]}"
                 )
             telemetry = dashboard["agents"][0]
-            controller.send_signal(signal.SIGINT)
-            controller.wait(timeout=5)
+            _stop_controller(controller)
             backup = subprocess.run(
                 [
                     sys.executable,
@@ -490,13 +508,7 @@ def smoke(runtime: Path) -> dict[str, object]:
                 "authenticated_recovery_verified": True,
             }
         finally:
-            if controller.poll() is None:
-                controller.send_signal(signal.SIGINT)
-                try:
-                    controller.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    controller.kill()
-                    controller.wait(timeout=3)
+            _stop_controller(controller)
 
 
 def main() -> None:

@@ -6,6 +6,7 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
 import stat
 import tomllib
@@ -128,10 +129,10 @@ def check_source(expected: str | None = None) -> str:
         raise ValueError("portal extension does not derive its release version from the manifest")
     required_labels = {
         "portal-extension/README.md": f"Sentinel Blue {portal_version} is the",
-    }
-    optional_labels = {
         "README.md": f"# Sentinel Blue {version}",
         "SECURITY.md": f"Sentinel Blue {version} is defensive software",
+    }
+    optional_labels = {
         "docs/ARCHITECTURE.md": f"# Sentinel Blue {version} architecture",
         "docs/MONITORED_RESTORATION.md": f"Sentinel Blue {version} implements",
         "docs/COMPETITION_REQUIREMENTS.md": f"to Sentinel Blue {version}.",
@@ -191,6 +192,8 @@ def check_bundle(bundle: Path, version: str) -> None:
         source_entries = _safe_archive(source, source_name)
         source_members = {name: source.read(name) for name in source_entries}
         for required in (
+            "README.md",
+            "SECURITY.md",
             "pyproject.toml",
             "src/sentinel_blue/__init__.py",
         ):
@@ -220,6 +223,19 @@ def check_bundle(bundle: Path, version: str) -> None:
     if runtime_members["__main__.py"] != GENERATED_RUNTIME_MAIN:
         raise ValueError("generated runtime __main__.py does not match the release entrypoint")
 
+def _expected_release(explicit: str | None) -> str | None:
+    """Bind GitHub tag builds to their exact source version without shell interpolation."""
+
+    if explicit is not None:
+        return explicit
+    if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("GITHUB_REF_TYPE") != "tag":
+        return None
+    ref_name = os.environ.get("GITHUB_REF_NAME", "")
+    if not ref_name:
+        raise ValueError("GitHub tag release is missing GITHUB_REF_NAME")
+    return ref_name
+
+
 class _BytesPath:
     """Minimal seekable wrapper accepted by ZipFile without temporary artifacts."""
 
@@ -246,7 +262,7 @@ def main() -> None:
     parser.add_argument("--expected")
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
-    version = check_source(args.expected)
+    version = check_source(_expected_release(args.expected))
     if args.bundle is not None:
         check_bundle(args.bundle, version)
     print(json.dumps({"passed": True, "version": version, "bundle": str(args.bundle or "")}))

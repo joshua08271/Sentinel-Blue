@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import socket
 import ssl
 import tempfile
@@ -55,6 +56,20 @@ def _p95(values: list[float]) -> float:
         return 0.0
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1))]
+
+
+def _windows_security_descriptor_sha256(path: Path, expected: bytes) -> str:
+    if os.name != "nt":
+        return ""
+    from .restoration import _windows_read_file_snapshot
+
+    data, metadata = _windows_read_file_snapshot(path, len(expected))
+    if data != expected:
+        raise ValueError("disposable certification fixture changed during ACL capture")
+    descriptor = metadata.get("windows_security_descriptor")
+    if not isinstance(descriptor, str) or not descriptor:
+        raise ValueError("disposable certification fixture lacks a security descriptor")
+    return hashlib.sha256(descriptor.encode("ascii")).hexdigest()
 
 
 class _CertificationHealthHandler(BaseHTTPRequestHandler):
@@ -584,23 +599,42 @@ def self_test(
         checks.append(_check("safe-action-defaults", dry_run_ok, action_results))
 
         protected_file = root / "disposable-protected.conf"
-        protected_file.write_text("approved-state\n", encoding="utf-8")
-        approved_digest = hashlib.sha256(protected_file.read_bytes()).hexdigest()
+        approved_bytes = b"approved-state\n"
+        protected_file.write_bytes(approved_bytes)
+        approved_digest = hashlib.sha256(approved_bytes).hexdigest()
+        baseline_security = _windows_security_descriptor_sha256(
+            protected_file, approved_bytes
+        )
         restore_executor = ActionExecutor(root / "restoration", allow_restoration=True)
+        capture_item = {"path": str(protected_file), "sha256": approved_digest}
+        if baseline_security:
+            capture_item["security_descriptor_sha256"] = baseline_security
         captured = restore_executor.execute(
             "capture_restore_point",
-            {"files": [{"path": str(protected_file), "sha256": approved_digest}]},
+            {"files": [capture_item]},
             telemetry,
         )
-        protected_file.write_text("simulated-tamper\n", encoding="utf-8")
-        observed_digest = hashlib.sha256(protected_file.read_bytes()).hexdigest()
+        observed_bytes = b"simulated-tamper\n"
+        protected_file.write_bytes(observed_bytes)
+        observed_digest = hashlib.sha256(observed_bytes).hexdigest()
+        observed_security = _windows_security_descriptor_sha256(
+            protected_file, observed_bytes
+        )
+        restore_parameters = {
+            "path": str(protected_file),
+            "baseline_sha256": approved_digest,
+            "observed_sha256": observed_digest,
+        }
+        if baseline_security:
+            restore_parameters["baseline_security_descriptor_sha256"] = (
+                baseline_security
+            )
+            restore_parameters["observed_security_descriptor_sha256"] = (
+                observed_security
+            )
         restored = restore_executor.execute(
             "restore_integrity",
-            {
-                "path": str(protected_file),
-                "baseline_sha256": approved_digest,
-                "observed_sha256": observed_digest,
-            },
+            restore_parameters,
             telemetry,
         )
         undone = restore_executor.execute(

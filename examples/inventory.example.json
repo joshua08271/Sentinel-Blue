@@ -144,11 +144,11 @@
       "approved_by": ""
     },
     "release": {
-      "version": "1.9.12",
+      "version": "1.9.13",
       "approved": false,
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "controller_ca_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "public_url": "https://replace-with-public-equal-access-release.example/sentinel-blue-1.9.12.pyz",
+      "public_url": "https://replace-with-public-equal-access-release.example/sentinel-blue-1.9.13.pyz",
       "frozen": false,
       "submitted_to_officials": false,
       "submission_approved": false,

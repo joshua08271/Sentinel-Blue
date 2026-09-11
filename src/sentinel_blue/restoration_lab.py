@@ -32,6 +32,20 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _windows_security_descriptor_sha256(path: Path, expected: bytes) -> str:
+    if os.name != "nt":
+        return ""
+    from .restoration import _windows_read_file_snapshot
+
+    data, metadata = _windows_read_file_snapshot(path, len(expected))
+    if data != expected:
+        raise ValueError("disposable restoration fixture changed during ACL capture")
+    descriptor = metadata.get("windows_security_descriptor")
+    if not isinstance(descriptor, str) or not descriptor:
+        raise ValueError("disposable restoration fixture lacks a security descriptor")
+    return hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
+
+
 def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict[str, object]:
     """Exercise expected allow/refuse/rollback outcomes without touching real services."""
     total = max(len(CASES), min(int(iterations), 5000))
@@ -48,28 +62,51 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
             scenario = root / str(index)
             scenario.mkdir()
             target = scenario / "protected.conf"
-            target.write_text("approved\n", encoding="utf-8")
+            approved_bytes = b"approved\n"
+            target.write_bytes(approved_bytes)
             approved = _sha256(target)
+            descriptor_sha256 = _windows_security_descriptor_sha256(
+                target, approved_bytes
+            )
             executor = ActionExecutor(scenario / "state", allow_restoration=True)
+            capture_item = {"path": str(target), "sha256": approved}
+            if descriptor_sha256:
+                capture_item["security_descriptor_sha256"] = descriptor_sha256
             captured = executor.execute(
                 "capture_restore_point",
-                {"files": [{"path": str(target), "sha256": approved}]},
+                {"files": [capture_item]},
                 {},
             )
             if not captured.get("success"):
                 failures.append({"case": case, "reason": "restore-point capture failed"})
                 continue
 
+            def restore_parameters(
+                *,
+                observed_sha256: str | None = None,
+            ) -> dict[str, object]:
+                parameters: dict[str, object] = {
+                    "path": str(target),
+                    "baseline_sha256": approved,
+                }
+                if observed_sha256 is not None:
+                    parameters["observed_sha256"] = observed_sha256
+                if descriptor_sha256:
+                    parameters["baseline_security_descriptor_sha256"] = (
+                        descriptor_sha256
+                    )
+                    if observed_sha256 is not None:
+                        parameters["observed_security_descriptor_sha256"] = (
+                            descriptor_sha256
+                        )
+                return parameters
+
             passed = False
             if case == "confirmed-tamper":
                 target.write_text("tampered\n", encoding="utf-8")
                 result = executor.execute(
                     "restore_integrity",
-                    {
-                        "path": str(target),
-                        "baseline_sha256": approved,
-                        "observed_sha256": _sha256(target),
-                    },
+                    restore_parameters(observed_sha256=_sha256(target)),
                     {},
                 )
                 passed = bool(result.get("success")) and target.read_text() == "approved\n"
@@ -77,11 +114,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 target.write_text("newer-change\n", encoding="utf-8")
                 result = executor.execute(
                     "restore_integrity",
-                    {
-                        "path": str(target),
-                        "baseline_sha256": approved,
-                        "observed_sha256": "a" * 64,
-                    },
+                    restore_parameters(observed_sha256="a" * 64),
                     {},
                 )
                 passed = not result.get("success") and target.read_text() == "newer-change\n"
@@ -89,7 +122,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 target.unlink()
                 result = executor.execute(
                     "restore_integrity",
-                    {"path": str(target), "baseline_sha256": approved},
+                    restore_parameters(),
                     {},
                 )
                 passed = bool(result.get("success")) and target.read_text() == "approved\n"
@@ -100,9 +133,9 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                     result = executor.execute(
                         "restore_integrity",
                         {
-                            "path": str(target),
-                            "baseline_sha256": approved,
-                            "observed_sha256": _sha256(target),
+                            **restore_parameters(
+                                observed_sha256=_sha256(target)
+                            ),
                             "probes": [{"name": "service-monitor-example"}],
                         },
                         {},
@@ -116,11 +149,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 target.write_text("tampered\n", encoding="utf-8")
                 restored = executor.execute(
                     "restore_integrity",
-                    {
-                        "path": str(target),
-                        "baseline_sha256": approved,
-                        "observed_sha256": _sha256(target),
-                    },
+                    restore_parameters(observed_sha256=_sha256(target)),
                     {},
                 )
                 result = executor.execute(
@@ -133,7 +162,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 target.write_text("tampered\n", encoding="utf-8")
                 result = executor.execute(
                     "restore_integrity",
-                    {"path": str(target), "baseline_sha256": approved},
+                    restore_parameters(),
                     {},
                 )
                 passed = not result.get("success") and target.read_text() == "tampered\n"
@@ -142,7 +171,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 target.write_text("tampered\n", encoding="utf-8")
                 result = executor.execute(
                     "restore_integrity",
-                    {"path": str(target), "baseline_sha256": approved},
+                    restore_parameters(),
                     {},
                 )
                 passed = (
@@ -165,7 +194,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 ):
                     result = executor.execute(
                         "restore_integrity",
-                        {"path": str(target), "baseline_sha256": approved},
+                        restore_parameters(),
                         {},
                     )
                 passed = (
@@ -192,7 +221,7 @@ def restoration_policy_campaign(iterations: int = 120, seed: int = 1212) -> dict
                 ):
                     result = executor.execute(
                         "restore_integrity",
-                        {"path": str(target), "baseline_sha256": approved},
+                        restore_parameters(),
                         {},
                     )
                 passed = not result.get("success") and target.read_text() == "prechange\n"
