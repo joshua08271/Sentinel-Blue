@@ -127,6 +127,8 @@ class SecurityEvent:
     remote_address: str = "unknown"
     occurred_at: float = 0.0
     detail: str = ""
+    account_id: str = ""
+    account_domain: str = ""
 
 
 @dataclass(slots=True)

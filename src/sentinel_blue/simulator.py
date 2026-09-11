@@ -157,11 +157,13 @@ def _telemetry_scenarios(
     scenarios = [
         ("normal baseline", telemetry(), baseline, {"student"}, False),
         (
-            "protected black-team login",
+            "protected-name login without identity/source verification",
             telemetry(sessions=[{"username": "protected-admin-example", "source": "198.51.100.5", "privileged": True, "interactive": True, "process_id": 2001}]),
             baseline,
             {"student", "protected-admin-example"},
-            False,
+            # A protected name with no matching native identity or approved
+            # source is a review event, not a legitimate-access control case.
+            True,
         ),
         ("rogue UID-0 account", telemetry(accounts=rogue_accounts), baseline, {"student"}, True),
         (

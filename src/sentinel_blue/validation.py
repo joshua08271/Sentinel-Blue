@@ -75,6 +75,8 @@ ACTION_RESULT_FIELDS = frozenset(
         "errors",
         "config_validation",
         "probes",
+        "probe_attempts",
+        "stable_health",
         "retention_warnings",
         "captured",
         "capture_receipts",
@@ -565,7 +567,9 @@ def _service(row: dict[str, Any], index: int) -> dict[str, Any]:
         "exit_code": (
             None
             if exit_code is None
-            else _integer(exit_code, f"{label}.exit_code", 0, 2**31 - 1)
+            # Win32_Service.ExitCode is a uint32; native failure codes can set
+            # the high bit. Preserve them without rejecting all host telemetry.
+            else _integer(exit_code, f"{label}.exit_code", 0, 2**32 - 1)
         ),
     }
 
@@ -679,6 +683,8 @@ def _security_event(row: dict[str, Any], index: int) -> dict[str, Any]:
         "category": _text(row.get("category"), f"{label}.category", 64),
         "outcome": _text(row.get("outcome", "observed"), f"{label}.outcome", 64),
         "account": _text(row.get("account", "unknown"), f"{label}.account", 128),
+        "account_id": _text(row.get("account_id", ""), f"{label}.account_id", 256, empty=True),
+        "account_domain": _text(row.get("account_domain", ""), f"{label}.account_domain", 256, empty=True),
         "actor": _text(row.get("actor", "unknown"), f"{label}.actor", 128),
         "remote_address": _text(
             row.get("remote_address", "unknown"), f"{label}.remote_address", 256
@@ -827,6 +833,10 @@ def validate_action_result(
     for flag in ("dry_run", "rolled_back", "interrupted", "review_required"):
         if flag in payload:
             result[flag] = _boolean(payload[flag], flag)
+    if "stable_health" in payload:
+        if result["action_type"] not in {"restart_service", "repair_service"}:
+            raise ValidationError("stable_health is valid only for restart_service or repair_service results")
+        result["stable_health"] = _boolean(payload["stable_health"], "stable_health")
     if result["completed_at"] < result["started_at"]:
         raise ValidationError("completed_at must not precede started_at")
     if result["success"] and (
@@ -1053,6 +1063,14 @@ def validate_action_result(
                 )
             normalized_probes.append(_probe(row, index))
         result["probes"] = normalized_probes
+    if "probe_attempts" in payload:
+        if result["action_type"] not in {"restart_service", "repair_service"}:
+            raise ValidationError(
+                "probe_attempts is valid only for restart_service or repair_service results"
+            )
+        result["probe_attempts"] = _integer(
+            payload["probe_attempts"], "probe_attempts", 0, 64
+        )
     try:
         encoded = json.dumps(
             result,

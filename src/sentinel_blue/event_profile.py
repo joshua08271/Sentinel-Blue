@@ -67,6 +67,9 @@ CAPABILITIES = frozenset(
         "database_restoration",
         "network_forks",
         "session_containment",
+        "initial_provisioning",
+        "persistence_removal",
+        "scoring_access_control",
     }
 )
 COMMON_LIVE_PROHIBITIONS = frozenset(
@@ -87,6 +90,8 @@ ACTION_CAPABILITIES = {
     "release_quarantine": "session_containment",
     "restart_service": "in_place_repair",
     "rollback_service": "structured_rollback",
+    "repair_service": "in_place_repair",
+    "rollback_service_repair": "structured_rollback",
 }
 HOST_CHANGING_ACTIONS = frozenset(
     {
@@ -96,10 +101,12 @@ HOST_CHANGING_ACTIONS = frozenset(
         "release_quarantine",
         "restart_service",
         "rollback_service",
+        "repair_service",
+        "rollback_service_repair",
     }
 )
 EMERGENCY_ALLOWED_ACTIONS = frozenset(
-    {"rollback_integrity", "rollback_service", "release_quarantine"}
+    {"rollback_integrity", "rollback_service", "rollback_service_repair", "release_quarantine"}
 )
 GUARDED_ACTIONS = frozenset(
     {
@@ -109,6 +116,8 @@ GUARDED_ACTIONS = frozenset(
         "restore_integrity",
         "quarantine_session",
         "restart_service",
+        "repair_service",
+        "rollback_service_repair",
         "rollback_integrity",
         "rollback_service",
         "release_quarantine",
@@ -197,7 +206,12 @@ def _service_manifest(value: Any, index: int) -> dict[str, Any]:
         raise ValueError(
             f"services[{index}] contains unsupported actions: {', '.join(sorted(unknown_actions))}"
         )
+    repair_policy = {}
+    if "repair_policy" in service:
+        from .service_repair import normalize_repair_policy
+        repair_policy = {"repair_policy": normalize_repair_policy(service["repair_policy"], service)}
     return {
+        **repair_policy,
         "service_id": _text(service["service_id"], f"services[{index}].service_id", 128),
         "host": _text(service["host"], f"services[{index}].host", 128),
         "protocol": _text(service["protocol"], f"services[{index}].protocol", 32),
@@ -386,6 +400,10 @@ class EventProfile:
             raise ValueError("guarded-autonomous mode requires guarded_autonomy capability")
 
         identity_rows = root.get("official_identities")
+        from .identity_guard import validate_guards
+        validate_guards(root.get("identity_guards", []))
+        from .persistence_security import validate_persistence_policy
+        validate_persistence_policy(root.get("persistence_policy"))
         if not isinstance(identity_rows, list) or len(identity_rows) > 2048:
             raise ValueError("official_identities must be a bounded array")
         identities: list[dict[str, str]] = []
@@ -422,6 +440,11 @@ class EventProfile:
             raise ValueError("services_confirmed requires at least one service manifest")
 
         recovery = _object(root.get("recovery"), "recovery")
+        crash_resume = recovery.get("resume_after_controller_crash", False)
+        if type(crash_resume) is not bool:
+            raise ValueError("recovery.resume_after_controller_crash must be a boolean")
+        if crash_resume and autonomy_mode not in {"guarded-autonomous", "range-autonomous"}:
+            raise ValueError("controller crash resume requires guarded or range autonomy")
         delay = recovery.get("baseline_promotion_delay_seconds", 60)
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not 0 <= float(delay) <= 3600:
             raise ValueError("recovery baseline promotion delay must be from 0 to 3600 seconds")
@@ -704,6 +727,11 @@ class EventProfile:
             return False
         capability = ACTION_CAPABILITIES[action_type]
         if capability is not None and not self.capabilities[capability]:
+            return False
+        if action_type in {"repair_service", "rollback_service_repair"} and not (
+            self.capabilities["file_restoration"] and self.capabilities["structured_rollback"]
+            and self.capabilities["in_place_repair"]
+        ):
             return False
         if emergency_stopped:
             return action_type in EMERGENCY_ALLOWED_ACTIONS

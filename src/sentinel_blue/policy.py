@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Any
 
 from .process_identity import validate_process_identity
@@ -24,6 +25,8 @@ ACTION_RISK = {
     "release_quarantine": "medium",
     "restart_service": "high",
     "rollback_service": "high",
+    "repair_service": "high",
+    "rollback_service_repair": "high",
 }
 ALLOWED_ACTIONS = frozenset(ACTION_RISK)
 AUTOMATIC_ACTIONS = frozenset({"snapshot", "validate_service", "capture_restore_point"})
@@ -111,12 +114,42 @@ def validate_action_parameters(
                 raise ValueError(
                     "session process identity does not match the observation boot"
                 )
-    if action_type in {"restart_service", "rollback_service"}:
+    if action_type in {"restart_service", "rollback_service", "repair_service", "rollback_service_repair"}:
         service = parameters.get("service")
         if not isinstance(service, str) or not SERVICE_NAME.fullmatch(service):
             raise ValueError(f"{action_type} requires a service name")
     if action_type == "rollback_service" and parameters.get("desired_state") not in {"running", "stopped"}:
         raise ValueError("rollback_service requires a running or stopped desired_state")
+    if action_type == "rollback_service_repair":
+        identifier = parameters.get("transaction_id")
+        if not isinstance(identifier, str) or not TRANSACTION_ID.fullmatch(identifier):
+            raise ValueError("service repair rollback requires a transaction_id")
+    if action_type == "repair_service":
+        if parameters["service"].startswith("-"):
+            raise ValueError("service repair cannot target a native command option")
+        from .service_repair import validate_repair_shape
+        validate_repair_shape(parameters)
+    if action_type in {"restart_service", "repair_service"} and "recovery_guard" in parameters:
+        guard = parameters["recovery_guard"]
+        fields = {"files", "dependencies", "dependency_probes", "required_accounts", "boot_id", "sequence", "observed_at"}
+        if not isinstance(guard, dict) or set(guard) != fields:
+            raise ValueError("service recovery requires a complete guard")
+        validate_action_parameters("capture_restore_point", {"files": guard["files"]})
+        if any(not isinstance(item.get("security_descriptor_sha256"), str) for item in guard["files"]):
+            raise ValueError("service recovery files require explicit security metadata")
+        for field in ("dependencies", "required_accounts"):
+            rows = guard[field]
+            if not isinstance(rows, list) or len(rows) > 256 or any(
+                not isinstance(row, str) or not row or len(row) > 128 for row in rows
+            ) or len(set(rows)) != len(rows):
+                raise ValueError(f"service recovery {field} is invalid")
+        if any(not SERVICE_NAME.fullmatch(name) for name in guard["dependencies"]):
+            raise ValueError("service recovery dependency name is invalid")
+        validate_action_parameters("validate_service", {"probes": guard["dependency_probes"]})
+        if (not isinstance(guard["boot_id"], str) or guard["boot_id"] in {"", "unknown"}
+            or len(guard["boot_id"]) > 128 or type(guard["sequence"]) is not int or guard["sequence"] < 1
+            or type(guard["observed_at"]) not in {int, float} or not math.isfinite(guard["observed_at"])):
+            raise ValueError("service recovery observation is invalid")
     if action_type == "capture_restore_point":
         files = parameters.get("files")
         if not isinstance(files, list) or not files or len(files) > 256:

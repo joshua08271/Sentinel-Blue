@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
 from .protocol import AlertCandidate
@@ -11,7 +12,18 @@ from .risk import RiskModel
 from .validation import ModelBoundAlertCandidate
 
 
-BUILTIN_PRIVILEGED = {"root", "administrator"}
+def _is_builtin_privileged(account: dict[str, Any], platform_name: str) -> bool:
+    """Recognize built-ins by identity; a familiar spelling is not evidence."""
+    name = str(account.get("name", ""))
+    identity = str(account.get("account_id", ""))
+    system = platform_name.casefold()
+    if name == "root" and identity == "0" and not system.startswith("windows"):
+        return True
+    return (
+        name.casefold() == "administrator"
+        and not system.startswith("linux")
+        and re.fullmatch(r"S-1-5-21-\d+-\d+-\d+-500", identity, flags=re.IGNORECASE) is not None
+    )
 
 
 def _confidence(model: RiskModel, features: dict[str, float], floor: float = 0.5) -> float:
@@ -23,9 +35,16 @@ def detect(
     baseline: dict[str, Any] | None,
     protected_accounts: set[str],
     model: RiskModel | None = None,
+    *,
+    identity_guards: list[dict] | None = None,
+    persistence_policy: dict | None = None,
 ) -> list[AlertCandidate]:
     model = model or RiskModel()
     candidates: list[AlertCandidate] = []
+    from .identity_guard import analyze_protected_access
+    candidates.extend(analyze_protected_access(telemetry, protected_accounts, identity_guards or [], model))
+    from .persistence_security import analyze_persistence_trust
+    candidates.extend(analyze_persistence_trust(telemetry, persistence_policy, model))
     from .analyzers import analyze_all
     baseline_accounts = {
         account.get("name", "").casefold(): account
@@ -35,17 +54,43 @@ def detect(
         account.get("name", "").casefold(): account for account in telemetry.get("accounts", [])
     }
 
-    for normalized, account in current_accounts.items():
-        if not account.get("privileged") or not account.get("enabled", True):
+    platform_name = str(telemetry.get("platform", ""))
+    variants: dict[str, set[tuple[str, str]]] = {}
+    for account in telemetry.get("accounts", []):
+        name = str(account.get("name", ""))
+        variants.setdefault(name.casefold(), set()).add((name, str(account.get("account_id", ""))))
+
+    # Retain every row. Linux names that differ only by case must not overwrite
+    # one another or inherit a protected-name exemption through case folding.
+    for account in telemetry.get("accounts", []):
+        normalized = str(account.get("name", "")).casefold()
+        ambiguous_identity = len(variants.get(normalized, ())) > 1
+        if not account.get("privileged"):
+            identifier = str(account.get("account_id", ""))
+            login_candidate = bool(account.get("enabled") and account.get("source", "local") == "local" and
+                                   (platform_name.lower().startswith("windows") or
+                                    (identifier.isdigit() and int(identifier) > 0)))
+            if login_candidate and (normalized not in protected_accounts or ambiguous_identity):
+                features = {"protected_identity": float(ambiguous_identity)}
+                candidates.append(ModelBoundAlertCandidate(
+                    kind="unverified_login_account", title="Login-capable account requires identity review",
+                    summary=f"{account.get('name', 'unknown')} is not bound to the approved account inventory.",
+                    severity="high" if ambiguous_identity else "medium", confidence=0.7,
+                    model_features=features,
+                    evidence={"account": account, "baseline_independent": True,
+                              "new_since_baseline": normalized not in baseline_accounts,
+                              "identity_ambiguous": ambiguous_identity},
+                    recommendation="Check the event account roster and native UID/SID. An unfamiliar account is not by itself evidence of red-team ownership; preserve required service identities.",
+                    recommended_action="snapshot"))
             continue
-        if normalized in protected_accounts:
+        if normalized in protected_accounts and not ambiguous_identity:
             continue
-        is_builtin = normalized in BUILTIN_PRIVILEGED
+        is_builtin = _is_builtin_privileged(account, platform_name)
         is_new = normalized not in baseline_accounts
         # Built-in root/Administrator accounts are expected to exist. Their
         # interactive use is reviewed separately, where source and session
         # evidence are available.
-        if is_builtin:
+        if is_builtin and not ambiguous_identity:
             continue
         features = {
             "unknown_privileged_account": 1.0,
@@ -59,14 +104,24 @@ def detect(
                 title="Unverified privileged account",
                 summary=(
                     f"{account.get('name', 'unknown')} has root/Administrator-equivalent "
-                    "access but is not in the protected competition manifest."
+                    "access and requires identity verification."
                 ),
                 severity="high",
                 confidence=confidence,
                 model_features=features,
-                evidence={"account": account, "new_since_baseline": is_new},
+                evidence={
+                    "account": account,
+                    "new_since_baseline": is_new,
+                    "identity_ambiguous": ambiguous_identity,
+                    "identity_variants": [
+                        {"name": name, "account_id": identity}
+                        for name, identity in sorted(variants[normalized])
+                    ] if ambiguous_identity else [],
+                    "reported_enabled": account.get("enabled", True),
+                },
                 recommendation=(
-                    "Verify the identity against the event account list. Until verified, "
+                    "Verify the identity against the event account list. Existing baseline "
+                    "membership and a disabled login do not establish trust. Until verified, "
                     "observe or quarantine only its interactive session; do not disable "
                     "service processes or the account itself."
                 ),
@@ -86,7 +141,7 @@ def detect(
         if external:
             indicators.append("external_interactive_origin")
         account = current_accounts.get(normalized, {})
-        if account and normalized not in baseline_accounts and normalized not in BUILTIN_PRIVILEGED:
+        if account and normalized not in baseline_accounts and not _is_builtin_privileged(account, platform_name):
             indicators.append("new_unverified_privileged_account")
         for event in telemetry.get("security_events", []):
             category = str(event.get("category", "")).casefold()

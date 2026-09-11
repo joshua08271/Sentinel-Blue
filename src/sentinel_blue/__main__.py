@@ -8,10 +8,12 @@ from pathlib import Path
 from . import __version__
 
 
-def parser() -> argparse.ArgumentParser:
+def parser(*, include_labs: bool = False) -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="sentinel-blue")
     root.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subcommands = root.add_subparsers(dest="command", required=True)
+    from .security_workflow import add_cli
+    add_cli(subcommands)
 
     controller = subcommands.add_parser("controller", help="run the controller and dashboard")
     controller.add_argument("--bind", default="127.0.0.1")
@@ -110,6 +112,11 @@ def parser() -> argparse.ArgumentParser:
         help="automatically queue approved integrity restoration when no change grant is active",
     )
     controller.add_argument(
+        "--auto-recover-services",
+        action="store_true",
+        help="recover explicitly authorized stopped services after two fresh observations and guarded checks",
+    )
+    controller.add_argument(
         "--restore-confirmations",
         type=int,
         default=2,
@@ -169,6 +176,10 @@ def parser() -> argparse.ArgumentParser:
     agent.add_argument("--state-dir", default=str(Path.home() / ".sentinel-blue"))
     agent.add_argument("--allow-containment", action="store_true")
     agent.add_argument(
+        "--allow-service-recovery", action="store_true",
+        help="permit profile-authorized native service recovery independently of session containment",
+    )
+    agent.add_argument(
         "--allow-restoration",
         action="store_true",
         help="permit live restoration from agent-local approved restore points",
@@ -196,10 +207,11 @@ def parser() -> argparse.ArgumentParser:
     agent.add_argument("--log-max-bytes", type=int, default=5 * 1024 * 1024)
     agent.add_argument("--log-backups", type=int, default=3)
 
-    simulator = subcommands.add_parser("simulate", help="train and evaluate in the local simulated range")
-    simulator.add_argument("--epochs", type=int, default=250)
-    simulator.add_argument("--model-output", default="sentinel-blue-model.json")
-    simulator.add_argument("--json", action="store_true")
+    if include_labs:
+        simulator = subcommands.add_parser("simulate", help="train and evaluate in the local simulated range")
+        simulator.add_argument("--epochs", type=int, default=250)
+        simulator.add_argument("--model-output", default="sentinel-blue-model.json")
+        simulator.add_argument("--json", action="store_true")
 
     launcher = subcommands.add_parser("launcher", help="produce an authorized deployment plan")
     launcher.add_argument("--inventory", required=True)
@@ -230,6 +242,34 @@ def parser() -> argparse.ArgumentParser:
     )
     launcher.add_argument("--execute", action="store_true")
     launcher.add_argument("--yes", action="store_true", help="confirm execution against the inventory")
+    launcher.add_argument("--max-parallel-hosts", type=int, default=4)
+    launcher.add_argument("--budget-seconds", type=float, default=180, help="shared deadline including all uploads and enrollment")
+
+    setup = subcommands.add_parser("setup", help="plan or execute initial service provisioning within a fixed deadline")
+    setup.add_argument("--inventory", required=True)
+    setup.add_argument("--event-profile")
+    setup.add_argument("--plan-out", help="write the full private plan for review")
+    setup.add_argument("--execute", action="store_true")
+    setup.add_argument("--approve-plan", help="exact SHA-256 printed by the planning command")
+    setup.add_argument("--state-dir", help="private persistent setup journal directory")
+    setup.add_argument("--resume", action="store_true", help="resume without resetting the original deadline")
+    setup.add_argument("--started-at", type=float, help="optional original event/setup start as a Unix timestamp; cannot be in the future")
+    setup.add_argument("--range-deployment", action="store_true")
+    setup.add_argument("--output", help="write a sanitized setup readiness report")
+
+    opening = subcommands.add_parser("opening", help="time complete scored-service and defender setup from the first upload")
+    opening.add_argument("--catalog", choices=["ncae", "gddc-ualbany"], help="print the exact screenshot score columns")
+    opening.add_argument("--inventory")
+    opening.add_argument("--event-profile")
+    opening.add_argument("--runtime", help="exact approved pyz to upload to the targets")
+    opening.add_argument("--plan-out")
+    opening.add_argument("--execute", action="store_true")
+    opening.add_argument("--approve-plan")
+    opening.add_argument("--state-dir")
+    opening.add_argument("--started-at", type=float, help="original upload start, including transfer to this controller")
+    opening.add_argument("--range-deployment", action="store_true")
+    opening.add_argument("--output")
+    opening.add_argument("--security-vault-dir", help="operator-side encrypted credential vault for the optional security stage")
 
     learner = subcommands.add_parser("learn", help="train a regression-gated candidate from recorded decisions")
     learner.add_argument("--database", required=True)
@@ -242,25 +282,55 @@ def parser() -> argparse.ArgumentParser:
     learner.add_argument("--agent-version", required=True)
     learner.add_argument("--model-fingerprint", required=True)
 
-    range_command = subcommands.add_parser(
-        "range", help="run an end-to-end disposable defensive range campaign"
-    )
-    range_command.add_argument("--runs", type=int, default=200)
-    range_command.add_argument("--json", action="store_true")
+    if include_labs:
+        range_command = subcommands.add_parser(
+            "range", help="run an end-to-end disposable defensive range campaign"
+        )
+        range_command.add_argument("--runs", type=int, default=200)
+        range_command.add_argument("--json", action="store_true")
 
-    restoration_lab = subcommands.add_parser(
-        "restoration-lab",
-        help="run the disposable restoration and rollback attack campaign",
-    )
-    restoration_lab.add_argument("--runs", type=int, default=120)
-    restoration_lab.add_argument("--json", action="store_true")
+        restoration_lab = subcommands.add_parser(
+            "restoration-lab",
+            help="run the disposable restoration and rollback attack campaign",
+        )
+        restoration_lab.add_argument("--runs", type=int, default=120)
+        restoration_lab.add_argument("--json", action="store_true")
 
-    policy_lab = subcommands.add_parser(
-        "policy-lab",
-        help="run the disposable competition-legality adversarial policy campaign",
-    )
-    policy_lab.add_argument("--runs", type=int, default=200)
-    policy_lab.add_argument("--json", action="store_true")
+        policy_lab = subcommands.add_parser(
+            "policy-lab",
+            help="run the disposable competition-legality adversarial policy campaign",
+        )
+        policy_lab.add_argument("--runs", type=int, default=200)
+        policy_lab.add_argument("--json", action="store_true")
+
+        native_lab = subcommands.add_parser(
+            "native-lab",
+            help="run the owner-gated native campaign on a disposable GitHub-hosted runner",
+        )
+        native_lab.add_argument(
+            "--output",
+            help=(
+                "report path; must resolve to "
+                "GITHUB_WORKSPACE/native-live-report.json"
+            ),
+        )
+        native_lab.add_argument("--json", action="store_true")
+
+        windows_native_lab = subcommands.add_parser(
+            "windows-native-lab",
+            help=(
+                "run the owner-gated Windows-native campaign on a disposable "
+                "GitHub-hosted runner"
+            ),
+        )
+        windows_native_lab.add_argument(
+            "--output",
+            help=(
+                "report path; must resolve to "
+                "GITHUB_WORKSPACE/windows-native-live-report.json"
+            ),
+        )
+        windows_native_lab.add_argument("--json", action="store_true")
 
     doctor = subcommands.add_parser("doctor", help="run local readiness and package diagnostics")
     doctor.add_argument("--database")
@@ -306,24 +376,25 @@ def parser() -> argparse.ArgumentParser:
     recovery_verify.add_argument("--recovery-key-file", required=True)
     recovery_verify.add_argument("--recovery-anchor", required=True)
 
-    selftest = subcommands.add_parser(
-        "self-test", help="run the packaged disposable range and recovery certification"
-    )
-    selftest.add_argument("--scenarios", type=int, default=300)
-    selftest.add_argument("--fuzz-iterations", type=int, default=1500)
-    selftest.add_argument("--load-events", type=int, default=750)
-    selftest.add_argument(
-        "--full",
-        action="store_true",
-        help="use the maximum 5,000 scenarios, 50,000 hostile inputs, and 50,000 load events",
-    )
-    selftest.add_argument("--json", action="store_true")
+    if include_labs:
+        selftest = subcommands.add_parser(
+            "self-test", help="run the packaged disposable range and recovery certification"
+        )
+        selftest.add_argument("--scenarios", type=int, default=300)
+        selftest.add_argument("--fuzz-iterations", type=int, default=1500)
+        selftest.add_argument("--load-events", type=int, default=750)
+        selftest.add_argument(
+            "--full",
+            action="store_true",
+            help="use the maximum 5,000 scenarios, 50,000 hostile inputs, and 50,000 load events",
+        )
+        selftest.add_argument("--json", action="store_true")
 
     return root
 
 
-def main() -> None:
-    args = parser().parse_args()
+def main(*, include_labs: bool = False) -> None:
+    args = parser(include_labs=include_labs).parse_args()
     if args.command in {"controller", "agent"}:
         from .config_validation import validate_bound_transport
         from .event_profile import load_event_profile
@@ -362,8 +433,20 @@ def main() -> None:
         from .restoration_lab import run
     elif args.command == "policy-lab":
         from .policy_lab import run
+    elif args.command == "native-lab":
+        from .native_range_lab import run
+    elif args.command == "windows-native-lab":
+        from .windows_native_range_lab import run
     elif args.command == "doctor":
         from .diagnostics import run
+    elif args.command == "opening":
+        from .opening import run
+
+        raise SystemExit(run(args))
+    elif args.command == "setup":
+        from .setup import run
+    elif args.command in {"security", "security-guest"}:
+        from .security_workflow import run
     elif args.command.startswith("recovery-"):
         from .recovery_ops import run
     elif args.command == "self-test":
