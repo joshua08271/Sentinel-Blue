@@ -1,0 +1,993 @@
+{
+  "kind": "azure-defensive-acceptance",
+  "status": "failed",
+  "run_id": "98b1979ad545",
+  "boot_seconds_excluded_from_setup": 104.616,
+  "guest_rehearsal_wall_seconds": 698.567,
+  "all_vms_deallocated": true,
+  "network_restored": true,
+  "private_staging_cleanup_verified": true,
+  "full_competition_readiness_proven": false,
+  "live_red_team_executed": false,
+  "public_source_commit": "d82b273f71945d2051ab8e6e953838d469fac33b",
+  "evidence_archive_sha256": "f9947535644c942e05e5c21b6d53050ad737a2097b486c473995ef5270dbf94c",
+  "guest_error_count": 0,
+  "network_restore_error_count": 0,
+  "guests": {
+    "Linux": {
+      "status": "passed",
+      "version": "1.9.45",
+      "runtime_sha256": "a48098b8cd6de91f0dbe3620ed3bee8c343b7dd876a922180247b76858f1c76d",
+      "platform": "Linux",
+      "mode": "full",
+      "seconds": 252.821,
+      "opening_goal_seconds": 180,
+      "setup_stop_limit_seconds": 180,
+      "cleanup": {
+        "installed_packages_or_features_retained": true,
+        "owned_scoring_accounts_removed": true,
+        "owned_service_instances_removed": true,
+        "verified": true
+      },
+      "phases": {
+        "setup": {
+          "passed": true,
+          "seconds": 65.253,
+          "complete_opening_seconds": 53.363,
+          "complete_opening_within_budget": true,
+          "complete_opening_under_180_seconds": true,
+          "opening_clock_scope": "guest entry to readiness; payload transfer and prior bootstrap dependencies excluded",
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "transport": {
+          "passed": true,
+          "seconds": 4.888,
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "probe_deadlines": {
+          "passed": true,
+          "seconds": 1.681,
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "controller_continuity": {
+          "passed": true,
+          "seconds": 36.588,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "service_repair": {
+          "passed": true,
+          "seconds": 16.602,
+          "repair_seconds": {
+            "damaged_files": 1.825,
+            "missing_file": 1.731,
+            "running_unhealthy": 1.726,
+            "failed_validation": 5.482
+          },
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "native_recovery": {
+          "passed": true,
+          "seconds": 31.408,
+          "cleanup_verified": true,
+          "repair_seconds": 22.75,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "collection_pressure": {
+          "passed": true,
+          "seconds": 96.396,
+          "cleanup_verified": true,
+          "samples": [
+            {
+              "phase": "idle",
+              "elapsed_seconds": 3.302,
+              "observation_age_seconds": 3.302,
+              "collector_error_count": 0,
+              "usable_for_recovery": true
+            },
+            {
+              "phase": "cpu_load",
+              "elapsed_seconds": 8.916,
+              "observation_age_seconds": 8.916,
+              "collector_error_count": 0,
+              "usable_for_recovery": true
+            },
+            {
+              "phase": "cpu_load",
+              "elapsed_seconds": 10.991,
+              "observation_age_seconds": 10.991,
+              "collector_error_count": 0,
+              "usable_for_recovery": true
+            },
+            {
+              "phase": "after_load",
+              "elapsed_seconds": 3.058,
+              "observation_age_seconds": 3.057,
+              "collector_error_count": 0,
+              "usable_for_recovery": true
+            }
+          ],
+          "failed_checks": [],
+          "errors": {}
+        }
+      },
+      "probe_deadlines": {
+        "version": "1.9.45",
+        "scope": "owned loopback HTTP service and opening-readiness peers",
+        "budget_seconds": 0.25,
+        "trials": [
+          {
+            "component": "http_probe",
+            "seconds": 0.2502,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "opening_readiness",
+            "seconds": 0.2503,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "http_probe",
+            "seconds": 0.2505,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "opening_readiness",
+            "seconds": 0.2502,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "http_probe",
+            "seconds": 0.2504,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "opening_readiness",
+            "seconds": 0.2503,
+            "late_result_rejected": true,
+            "bounded": true
+          }
+        ],
+        "controls": {
+          "healthy_http_after": true,
+          "healthy_readiness_after": true
+        },
+        "cleanup_verified": true,
+        "minimum_seconds": 0.2502,
+        "median_seconds": 0.2503,
+        "maximum_seconds": 0.2505,
+        "seconds": 1.616,
+        "passed": true
+      },
+      "collection_pressure": {
+        "schema_version": 1,
+        "version": "1.9.45",
+        "platform": "Linux",
+        "commit": "",
+        "status": "passed",
+        "logical_cpu_count": 1,
+        "owned_cpu_workers": 1,
+        "load_seconds": 90.031,
+        "duration_seconds": 96.396,
+        "freshness_limit_seconds": 90,
+        "samples": [
+          {
+            "phase": "idle",
+            "elapsed_seconds": 3.302,
+            "observation_age_seconds": 3.302,
+            "collector_error_count": 0,
+            "error_categories": [],
+            "boot_identity_available": true,
+            "inventory_counts": {
+              "accounts": 39,
+              "sessions": 0,
+              "services": 305,
+              "processes": 129,
+              "integrity": 27
+            },
+            "sections": [
+              {
+                "section": "_integrity",
+                "seconds": 0.003
+              },
+              {
+                "section": "_boot_id",
+                "seconds": 0.0
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": true
+          },
+          {
+            "phase": "cpu_load",
+            "elapsed_seconds": 8.916,
+            "observation_age_seconds": 8.916,
+            "collector_error_count": 0,
+            "error_categories": [],
+            "boot_identity_available": true,
+            "inventory_counts": {
+              "accounts": 39,
+              "sessions": 0,
+              "services": 305,
+              "processes": 130,
+              "integrity": 27
+            },
+            "sections": [
+              {
+                "section": "_integrity",
+                "seconds": 0.006
+              },
+              {
+                "section": "_boot_id",
+                "seconds": 0.0
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": true
+          },
+          {
+            "phase": "cpu_load",
+            "elapsed_seconds": 10.991,
+            "observation_age_seconds": 10.991,
+            "collector_error_count": 0,
+            "error_categories": [],
+            "boot_identity_available": true,
+            "inventory_counts": {
+              "accounts": 39,
+              "sessions": 0,
+              "services": 305,
+              "processes": 131,
+              "integrity": 27
+            },
+            "sections": [
+              {
+                "section": "_integrity",
+                "seconds": 0.006
+              },
+              {
+                "section": "_boot_id",
+                "seconds": 0.0
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": true
+          },
+          {
+            "phase": "after_load",
+            "elapsed_seconds": 3.058,
+            "observation_age_seconds": 3.057,
+            "collector_error_count": 0,
+            "error_categories": [],
+            "boot_identity_available": true,
+            "inventory_counts": {
+              "accounts": 39,
+              "sessions": 0,
+              "services": 305,
+              "processes": 127,
+              "integrity": 27
+            },
+            "sections": [
+              {
+                "section": "_integrity",
+                "seconds": 0.003
+              },
+              {
+                "section": "_boot_id",
+                "seconds": 0.0
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": true
+          }
+        ],
+        "cleanup_verified": true,
+        "limitations": [
+          "one runner image and bounded CPU workload",
+          "read-only native collection; no service recovery or full-event uptime claim"
+        ]
+      },
+      "native_recovery": {
+        "passed": true,
+        "checks": {
+          "healthy_collection_responsiveness": [
+            {
+              "requests": 14,
+              "failed": 0,
+              "maximum_scheduled_response_seconds": 0.043,
+              "monitor_removed": true
+            },
+            {
+              "requests": 13,
+              "failed": 0,
+              "maximum_scheduled_response_seconds": 0.01,
+              "monitor_removed": true
+            }
+          ],
+          "healthy_service_responsive_during_collection": true,
+          "missing_file_initially_healthy": true,
+          "missing_file_approved_backup_captured": true,
+          "missing_file_first_observation_did_not_mutate": true,
+          "missing_file_autonomous_repair_passed": true,
+          "missing_file_fixture_removed": true
+        },
+        "repair_seconds": 22.75,
+        "observation_interval_seconds": 15,
+        "telemetry_source": "full native collector",
+        "cleanup_verified": true,
+        "samples": [
+          {
+            "collection_seconds": 3.412,
+            "collector_error_count": 0,
+            "readiness_ready": true
+          },
+          {
+            "collection_seconds": 2.803,
+            "collector_error_count": 0,
+            "readiness_ready": false
+          },
+          {
+            "collection_seconds": 3.042,
+            "collector_error_count": 0,
+            "readiness_ready": false
+          },
+          {
+            "collection_seconds": 3.078,
+            "collector_error_count": 0,
+            "readiness_ready": true
+          }
+        ]
+      },
+      "setup_task_diagnostic": {
+        "available": true,
+        "not_a_completion_proof": true,
+        "source": "persisted task state after setup returned",
+        "tasks": {
+          "database": {
+            "health_check_seconds": 1.7066240730000004,
+            "initial_check_seconds": 0.16782326199999886,
+            "persisted_status": "ready",
+            "seconds": 2.1932693740000104
+          },
+          "db": {
+            "health_check_seconds": 1.5896547719999887,
+            "initial_check_seconds": 0.009313144999993028,
+            "persisted_status": "ready",
+            "seconds": 2.818981273999995
+          },
+          "dns": {
+            "health_check_seconds": 1.425421428000007,
+            "initial_check_seconds": 0.01812459399999966,
+            "persisted_status": "ready",
+            "seconds": 3.117655127000006
+          },
+          "ftp": {
+            "health_check_seconds": 0.6452449800000011,
+            "initial_check_seconds": 0.008571442999993906,
+            "persisted_status": "ready",
+            "seconds": 1.923719079999998
+          },
+          "layout": {
+            "health_check_seconds": 0.5090138690000003,
+            "initial_check_seconds": 0.005565226999991069,
+            "persisted_status": "ready",
+            "seconds": 3.1394827299999974
+          },
+          "packages": {
+            "initial_check_seconds": 0.1658674050000002,
+            "persisted_status": "ready",
+            "seconds": 0.16586810500000126
+          },
+          "smb": {
+            "health_check_seconds": 0.5998453499999954,
+            "initial_check_seconds": 0.009609648999997944,
+            "persisted_status": "ready",
+            "seconds": 1.8803942599999885
+          },
+          "smb-account": {
+            "health_check_seconds": 2.6818073080000033,
+            "initial_check_seconds": 0.06499403000000825,
+            "persisted_status": "ready",
+            "seconds": 2.863771786000001
+          },
+          "ssh": {
+            "health_check_seconds": 1.6156423139999987,
+            "initial_check_seconds": 0.008462244000000396,
+            "persisted_status": "ready",
+            "seconds": 2.8945924169999984
+          },
+          "web": {
+            "health_check_seconds": 0.7311100169999918,
+            "initial_check_seconds": 0.00960965000000158,
+            "persisted_status": "ready",
+            "seconds": 2.011453777
+          }
+        }
+      },
+      "setup_status": "passed",
+      "setup_error_type": null,
+      "setup_phase_seconds_from_original_start": {
+        "fixture_inputs_ready": 1.171,
+        "guest_entered": 0.0,
+        "prerequisites_ready": 5.269,
+        "service_setup_and_checks_complete": 39.18
+      },
+      "setup_acceptance": {
+        "status": "passed",
+        "budget_seconds": 180.0,
+        "elapsed_seconds": 39.157,
+        "clock_scope": "all elapsed time since the supplied start, initial service checks, management preflight, provisioning, and final service checks; VM creation/boot excluded",
+        "seconds_before_acceptance": 5.445,
+        "setup_execute_seconds": 26.573,
+        "under_3_minutes": true,
+        "final_checks_completed": 6,
+        "final_checks_expected": 6
+      }
+    },
+    "Windows": {
+      "status": "failed",
+      "version": "1.9.45",
+      "runtime_sha256": "a48098b8cd6de91f0dbe3620ed3bee8c343b7dd876a922180247b76858f1c76d",
+      "platform": "Windows",
+      "mode": "full",
+      "seconds": 615.052,
+      "opening_goal_seconds": 180,
+      "setup_stop_limit_seconds": 180,
+      "cleanup": {
+        "installed_packages_or_features_retained": true,
+        "owned_smb_share_and_account_removed": true,
+        "verified": true
+      },
+      "phases": {
+        "setup": {
+          "passed": false,
+          "seconds": 221.964,
+          "error_type": "RuntimeError",
+          "opening_clock_scope": "guest entry to readiness; payload transfer and prior bootstrap dependencies excluded",
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "transport": {
+          "passed": true,
+          "seconds": 6.828,
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "probe_deadlines": {
+          "passed": false,
+          "seconds": 3.053,
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "controller_continuity": {
+          "passed": true,
+          "seconds": 40.448,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "service_repair": {
+          "passed": true,
+          "seconds": 57.025,
+          "repair_seconds": {
+            "damaged_files": 8.51,
+            "missing_file": 5.38,
+            "running_unhealthy": 2.312,
+            "failed_validation": 12.212
+          },
+          "cleanup_verified": true,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "native_recovery": {
+          "passed": true,
+          "seconds": 89.257,
+          "cleanup_verified": true,
+          "repair_seconds": 42.015,
+          "failed_checks": [],
+          "errors": {}
+        },
+        "collection_pressure": {
+          "passed": false,
+          "seconds": 196.47,
+          "cleanup_verified": true,
+          "samples": [
+            {
+              "phase": "idle",
+              "elapsed_seconds": 12.502,
+              "observation_age_seconds": 12.502,
+              "collector_error_count": 0,
+              "usable_for_recovery": true
+            },
+            {
+              "phase": "cpu_load",
+              "elapsed_seconds": 76.189,
+              "observation_age_seconds": 76.189,
+              "collector_error_count": 10,
+              "usable_for_recovery": false
+            },
+            {
+              "phase": "cpu_load",
+              "elapsed_seconds": 76.28,
+              "observation_age_seconds": 76.28,
+              "collector_error_count": 10,
+              "usable_for_recovery": false
+            },
+            {
+              "phase": "after_load",
+              "elapsed_seconds": 28.097,
+              "observation_age_seconds": 28.097,
+              "collector_error_count": 0,
+              "usable_for_recovery": true
+            }
+          ],
+          "failed_checks": [],
+          "errors": {}
+        }
+      },
+      "probe_deadlines": {
+        "version": "1.9.45",
+        "scope": "owned loopback HTTP service and opening-readiness peers",
+        "budget_seconds": 0.25,
+        "trials": [
+          {
+            "component": "http_probe",
+            "seconds": 0.3277,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "opening_readiness",
+            "seconds": 0.2916,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "http_probe",
+            "seconds": 0.2586,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "opening_readiness",
+            "seconds": 0.4614,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "http_probe",
+            "seconds": 0.2731,
+            "late_result_rejected": true,
+            "bounded": true
+          },
+          {
+            "component": "opening_readiness",
+            "seconds": 0.2983,
+            "late_result_rejected": true,
+            "bounded": true
+          }
+        ],
+        "controls": {
+          "healthy_http_after": false,
+          "healthy_readiness_after": true
+        },
+        "cleanup_verified": true,
+        "minimum_seconds": 0.2586,
+        "median_seconds": 0.29495000000000005,
+        "maximum_seconds": 0.4614,
+        "seconds": 2.866,
+        "passed": false
+      },
+      "collection_pressure": {
+        "schema_version": 1,
+        "version": "1.9.45",
+        "platform": "Windows",
+        "commit": "",
+        "status": "failed",
+        "logical_cpu_count": 1,
+        "owned_cpu_workers": 1,
+        "load_seconds": 155.641,
+        "duration_seconds": 196.469,
+        "freshness_limit_seconds": 90,
+        "samples": [
+          {
+            "phase": "idle",
+            "elapsed_seconds": 12.502,
+            "observation_age_seconds": 12.502,
+            "collector_error_count": 0,
+            "error_categories": [],
+            "boot_identity_available": true,
+            "inventory_counts": {
+              "accounts": 4,
+              "sessions": 4,
+              "services": 201,
+              "processes": 66,
+              "integrity": 3
+            },
+            "sections": [
+              {
+                "section": "_boot_id",
+                "seconds": 12.078
+              },
+              {
+                "section": "_windows_accounts",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_services",
+                "seconds": 0.001
+              },
+              {
+                "section": "_windows_topology",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_processes",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_persistence",
+                "seconds": 0.255
+              },
+              {
+                "section": "_windows_firewall",
+                "seconds": 0.024
+              },
+              {
+                "section": "_windows_interfaces",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_security_events",
+                "seconds": 0.001
+              },
+              {
+                "section": "_windows_sessions",
+                "seconds": 0.003
+              },
+              {
+                "section": "_integrity",
+                "seconds": 0.031
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": true
+          },
+          {
+            "phase": "cpu_load",
+            "elapsed_seconds": 76.189,
+            "observation_age_seconds": 76.189,
+            "collector_error_count": 10,
+            "error_categories": [
+              "identity",
+              "query_budget"
+            ],
+            "boot_identity_available": false,
+            "inventory_counts": {
+              "accounts": 0,
+              "sessions": 0,
+              "services": 0,
+              "processes": 0,
+              "integrity": 3
+            },
+            "sections": [
+              {
+                "section": "_boot_id",
+                "seconds": 75.241
+              },
+              {
+                "section": "_windows_accounts",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_services",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_topology",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_processes",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_persistence",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_firewall",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_interfaces",
+                "seconds": 0.002
+              },
+              {
+                "section": "_windows_security_events",
+                "seconds": 0.001
+              },
+              {
+                "section": "_windows_sessions",
+                "seconds": 0.0
+              },
+              {
+                "section": "_integrity",
+                "seconds": 0.025
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": false
+          },
+          {
+            "phase": "cpu_load",
+            "elapsed_seconds": 76.28,
+            "observation_age_seconds": 76.28,
+            "collector_error_count": 10,
+            "error_categories": [
+              "identity",
+              "query_budget"
+            ],
+            "boot_identity_available": false,
+            "inventory_counts": {
+              "accounts": 0,
+              "sessions": 0,
+              "services": 0,
+              "processes": 0,
+              "integrity": 3
+            },
+            "sections": [
+              {
+                "section": "_boot_id",
+                "seconds": 75.232
+              },
+              {
+                "section": "_windows_accounts",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_services",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_topology",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_processes",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_persistence",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_firewall",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_interfaces",
+                "seconds": 0.001
+              },
+              {
+                "section": "_windows_security_events",
+                "seconds": 0.001
+              },
+              {
+                "section": "_windows_sessions",
+                "seconds": 0.0
+              },
+              {
+                "section": "_integrity",
+                "seconds": 0.024
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": false
+          },
+          {
+            "phase": "after_load",
+            "elapsed_seconds": 28.097,
+            "observation_age_seconds": 28.097,
+            "collector_error_count": 0,
+            "error_categories": [],
+            "boot_identity_available": true,
+            "inventory_counts": {
+              "accounts": 4,
+              "sessions": 4,
+              "services": 201,
+              "processes": 67,
+              "integrity": 3
+            },
+            "sections": [
+              {
+                "section": "_boot_id",
+                "seconds": 27.742
+              },
+              {
+                "section": "_windows_accounts",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_services",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_topology",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_processes",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_persistence",
+                "seconds": 0.281
+              },
+              {
+                "section": "_windows_firewall",
+                "seconds": 0.028
+              },
+              {
+                "section": "_windows_interfaces",
+                "seconds": 0.0
+              },
+              {
+                "section": "_windows_security_events",
+                "seconds": 0.002
+              },
+              {
+                "section": "_windows_sessions",
+                "seconds": 0.003
+              },
+              {
+                "section": "_integrity",
+                "seconds": 0.022
+              }
+            ],
+            "protected_fixture_unchanged": true,
+            "usable_for_recovery": true
+          }
+        ],
+        "cleanup_verified": true,
+        "limitations": [
+          "one runner image and bounded CPU workload",
+          "read-only native collection; no service recovery or full-event uptime claim"
+        ]
+      },
+      "native_recovery": {
+        "passed": true,
+        "checks": {
+          "healthy_collection_responsiveness": [
+            {
+              "requests": 58,
+              "failed": 0,
+              "maximum_scheduled_response_seconds": 1.544,
+              "monitor_removed": true
+            },
+            {
+              "requests": 38,
+              "failed": 0,
+              "maximum_scheduled_response_seconds": 0.364,
+              "monitor_removed": true
+            }
+          ],
+          "healthy_service_responsive_during_collection": true,
+          "missing_file_initially_healthy": true,
+          "missing_file_approved_backup_captured": true,
+          "missing_file_first_observation_did_not_mutate": true,
+          "missing_file_autonomous_repair_passed": true,
+          "missing_file_fixture_removed": true
+        },
+        "repair_seconds": 42.015,
+        "observation_interval_seconds": 15,
+        "telemetry_source": "full native collector",
+        "cleanup_verified": true,
+        "samples": [
+          {
+            "collection_seconds": 23.019,
+            "collector_error_count": 0,
+            "readiness_ready": true
+          },
+          {
+            "collection_seconds": 5.982,
+            "collector_error_count": 0,
+            "readiness_ready": false
+          },
+          {
+            "collection_seconds": 15.655,
+            "collector_error_count": 0,
+            "readiness_ready": false
+          },
+          {
+            "collection_seconds": 12.556,
+            "collector_error_count": 0,
+            "readiness_ready": true
+          }
+        ]
+      },
+      "setup_task_diagnostic": {
+        "available": true,
+        "not_a_completion_proof": true,
+        "source": "persisted task state after setup returned",
+        "tasks": {
+          "dns-service": {
+            "initial_check_seconds": 6.043850399999997,
+            "persisted_status": "ready",
+            "seconds": 6.0438510999999835
+          },
+          "features": {
+            "initial_check_seconds": 16.5099826,
+            "persisted_status": "ready",
+            "seconds": 16.509983300000016
+          },
+          "scoring-clients": {
+            "initial_check_seconds": 4.859277199999951,
+            "persisted_status": "ready",
+            "seconds": 4.859277999999961
+          },
+          "smb-service": {
+            "initial_check_seconds": 7.794854799999996,
+            "persisted_status": "ready",
+            "seconds": 7.794855400000017
+          },
+          "smb-share": {
+            "persisted_status": "running"
+          },
+          "web-service": {
+            "initial_check_seconds": 4.756978199999992,
+            "persisted_status": "ready",
+            "seconds": 4.756979000000001
+          },
+          "website": {
+            "health_check_seconds": 16.071784200000025,
+            "initial_check_seconds": 4.119313900000009,
+            "persisted_status": "ready",
+            "seconds": 26.165278100000023
+          },
+          "zone": {
+            "health_check_seconds": 22.030482499999977,
+            "initial_check_seconds": 21.250138100000015,
+            "persisted_status": "ready",
+            "seconds": 60.114713800000004
+          }
+        }
+      },
+      "setup_status": "failed",
+      "setup_error_type": "RuntimeError",
+      "setup_phase_seconds_from_original_start": {
+        "fixture_inputs_ready": 20.677,
+        "guest_entered": 0.0,
+        "prerequisites_ready": 21.641,
+        "service_setup_and_checks_complete": 182.183
+      },
+      "setup_acceptance": {
+        "status": "incomplete",
+        "budget_seconds": 180.0,
+        "elapsed_seconds": 181.963,
+        "clock_scope": "all elapsed time since the supplied start, initial service checks, management preflight, provisioning, and final service checks; VM creation/boot excluded",
+        "reason": "execution did not finish inside the measured budget; review in-flight remote work",
+        "seconds_before_acceptance": 22.803,
+        "setup_execute_seconds": 143.187,
+        "under_3_minutes": false,
+        "final_checks_completed": 0,
+        "final_checks_expected": 3
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "version": "1.9.45",
+  "platform": "Linux",
+  "python": "3.12.14",
+  "suite_run": 223,
+  "passed": 221,
+  "skipped": 2,
+  "seconds": 18.678,
+  "runtime_sha256": "a48098b8cd6de91f0dbe3620ed3bee8c343b7dd876a922180247b76858f1c76d",
+  "log_sha256": "b4729678816a4d684118458c18de7f7f904c4a471a038a67902895a7992fdca9",
+  "skipped_checks": [
+    "native Windows file handles",
+    "native PowerShell inert provider"
+  ]
+}

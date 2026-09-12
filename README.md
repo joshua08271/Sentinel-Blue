@@ -11,7 +11,13 @@ collection under CPU load. It does not run live red-team testing.
 
 ## Run the program
 
-Extract the defender bundle. The `.pyz` is the runnable program; unpack the
+The [public 1.9.45 runtime](https://github.com/joshua08271/Sentinel-Blue/blob/d82b273f71945d2051ab8e6e953838d469fac33b/releases/sentinel-blue-1.9.45.pyz)
+is pinned to an immutable commit. The example inventory contains its matching
+public download URL and SHA-256. Event approval fields and controller trust still
+require the actual competition configuration.
+
+Download the [complete defender bundle](https://github.com/joshua08271/Sentinel-Blue/raw/refs/heads/maintenance/defender-1.9.42/releases/sentinel-blue-defender-1.9.45.zip).
+The `.pyz` is the runnable program; unpack the
 included source archive into the same directory to read `docs/`, edit the
 example inventories, or run the supplied tests. `VALIDATION.md` records
 this candidate's measured results and remaining limits. `AZURE_ACCEPTANCE_1.9.41.md`
@@ -86,7 +92,8 @@ inventory budget remains 75 seconds.
 The installed/source command now defaults to the same defensive commands as
 the packaged runtime. The source bundle includes the new coverage and read-budget
 regressions. See [current validation](docs/DEFENSIVE_VALIDATION_1.9.45.md) for the
-measured results and exact scope. Earlier Azure timings apply to 1.9.41 only.
+measured results and exact scope. Each Azure result records its exact runtime
+version and SHA-256; historical timings do not validate a newer runtime.
 
 A reviewed starting baseline is a trust decision. Sentinel cannot establish
 that an already compromised root/SYSTEM host is clean, discover every unknown

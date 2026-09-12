@@ -40,8 +40,9 @@ Server 2022 lab target. A later pass does not erase those failures. The older
 cleanup, and the new preflight independently verified the original VMs off and
 the reviewed network unchanged before testing.
 
-The 1.9.43 GitHub Windows job passed native file-handle tests and an inert
-provider test executing the real PowerShell process query. That CI result does
+The 1.9.45 GitHub Windows job passed all 52 selected tests, including native
+file handles, the real PowerShell query with inert provider rows, and the setup
+query's shared allowance and late-result guards. That CI result does
 not measure the full Windows inventory under Azure load. Use each Azure report's
 version and checksum before attributing a result to a later release.
 

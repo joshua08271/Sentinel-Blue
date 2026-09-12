@@ -13,13 +13,25 @@ tests, including actual PowerShell provider-query execution and native file
 handles. Packaged controller continuity and bounded transport fixtures passed.
 See [machine-readable CI evidence](validation-1.9.43/ci.json).
 
-Validation of 1.9.44 is in progress. A full isolated Azure acceptance run of the
-public 1.9.43 runtime is running separately. It is not an acceptance result for
-1.9.44. Exact runtime hashes and guest results will be recorded when available.
-The earlier preflight verified the original four VMs off and the reviewed
-network unchanged before boot. Final cleanup has not yet been reported.
+Version 1.9.44 passed [Linux and native Windows CI](https://github.com/joshua08271/Sentinel-Blue/actions/runs/34660233853):
+218 Linux tests passed with two Windows-only skips; all 49 selected Windows
+tests passed. Packaged lifecycle, transport and deadline fixtures passed.
+See [CI evidence](validation-1.9.44/ci.json).
+
+The Linux-only Azure retest used public commit
+`67f0ae0b54638b0079bb3016e8d152c4ed80bbef` and runtime SHA-256
+`c115f1620f537fc77354aa0150e271cb0934d374e4ffa8ec44847c908f3a1cb8`.
+All seven defensive phases passed. Guest entry to readiness took 75.413 seconds;
+payload transfer and prior bootstrap dependencies are excluded. Native service
+repair took 23.067 seconds. Collections took 4.183 seconds idle, 8.015 and 10.262
+seconds under finite CPU load, and 3.251 seconds afterward, with no collector
+errors. All four VMs were deallocated afterward, the original network restored,
+and temporary private staging deletion verified. See [Azure evidence](validation-1.9.44/azure-summary.json).
+
+Windows was not booted in this 1.9.44 Azure run. The paired 1.9.43 run's Windows
+failures remain recorded against that version and do not prove 1.9.44 acceptance.
 
 No full competition, external scorer, mixed-host network, or VM reboot
 continuity result is claimed. Historical Windows opening and collection timing
-limits remain unresolved pending the new measurements. The test scope uses
+limits remain unresolved for this version. The test scope uses
 owned fixtures, ordinary faults and finite load; no live red-team campaign runs.
