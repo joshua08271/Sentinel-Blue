@@ -1,4 +1,8 @@
-# Competition opening in 1.9.29
+# Competition opening
+
+Use [current validation](DEFENSIVE_VALIDATION_1.9.44.md) for the distributed
+runtime's measured results. The versioned native measurements below are
+historical. They do not establish current event eligibility or opening times.
 
 The opening target is **under 180 seconds from the first upload through scored
 service readiness and active Sentinel Blue protection**, excluding VM creation
@@ -266,47 +270,39 @@ the original deadline. It does not retry arbitrary runbooks or mutations. Linux'
 latest native run preceded this Windows-only change; the final Windows run used
 the released runtime bytes. Local tests exercise the retry-budget edge cases.
 
-All native attempts, including failures and their initial-state qualifications,
-are retained in [the release evidence](../reports/competition-setup-1.9.27.json).
+The original 1.9.27 raw reports are not included in this defender distribution.
+Later [historical Azure evidence](AZURE_DEFENSIVE_ACCEPTANCE_1.9.41.md) and the
+current validation report disclose failures and environment qualifications.
 The complete event opening remains unproven.
 
-## Native complete-opening harness
+## Current defensive Azure harness
 
-`tools/azure_opening_rehearsal.py` uses a private, temporary Azure blob and one
-checksum-verified HTTPS download per target. Its timestamp includes private
-blob staging, Azure command dispatch/queue time, guest download, observer dependencies, fixture configuration,
-service checks, real controller/agent installation, enrollment, approved fixture
-baseline capture, activation and final transactions. VM boot is excluded. The
-temporary blob is deleted, owned services/accounts are cleaned up, and the
-reviewed power/network state is restored.
+The supplied `tools/azure_defensive_rehearsal.py` uses a private temporary blob
+and checksum-verified download on each existing Linux and Windows target.
+Execution requires the exact runtime and reviewed network digests. The default
+mode reviews the network; `--execute` runs the guarded test and cleanup.
 
-The provider stamps each guest's start before dispatch and adds private staging
-time back; the guest cannot reset the timer after leaving Azure's command queue.
-This relies on synchronized provider/guest wall clocks and excludes the earlier
-browser upload into Cloud Shell and operator preparation. It therefore does not
-by itself prove the requested complete laptop-to-network installation time.
-Windows observer downloads use three bounded workers and verify every pinned
-checksum before extraction; the original deadline also bounds this work.
+The current opening clock is guest-local. Read the reported `opening_clock_scope`
+and separate orchestration/boot durations; do not add historical provider-timing
+claims to this harness. `--mode full` measures setup, controller continuity,
+ordinary owned service faults, bounded loopback transport and native collection
+under finite CPU load. `--mode recovery` selects recovery, collection and probe
+timing. Neither mode runs the separate native security campaign.
 
-The helper installs a separate controller and agent on each guest and runs the
-installed programs as supervised child processes. It does not establish a single
-controller managing a complete mixed-OS network, boot-persistent installation,
-all 13 event score columns, real event data, or an event-length defense. Its
-fixture baseline approval is explicit test authorization, not a claim that a
-competition's starting files are clean. Additional security fixtures execute
-after opening timing and cleanup; their elapsed time is reported separately.
+The helper supervises a separate controller and agent on each guest. It does not
+establish one controller managing a mixed-OS network, boot-persistent installation,
+all event score columns, real event data or competition-length defense. Fixture
+baseline approval is explicit test authorization; it does not prove a competition's
+starting files are clean.
 
-To measure the actual completion time beyond the three-minute target, pass
-`--budget-seconds 900 --skip-security-fixture` to this Azure helper. The first
-option changes only the rehearsal's stop limit; the reported
-`complete_opening_under_180_seconds` remains false for a slower completed run.
-The second omits the separate post-timer security exercise. Reports include
-delivery/prerequisite milestones, initial checks, setup execution, subsequent
-service checks, agent visibility, baseline readiness and approval submission.
-Final success requires authenticated defender readiness after the final service
-transactions, all within the selected measurement budget.
+The default setup stop limit is 180 seconds. `--setup-budget-seconds` supports
+180 through 600 seconds for diagnosis; it does not change the reported
+three-minute goal. Success still requires complete checks and verified cleanup.
+VMs are deallocated before original public-IP associations are restored, and the
+temporary blob container is deleted and checked. Review the explicit final
+cleanup fields even when a guest test fails.
 
-### Windows telemetry rejection found during completion testing
+### Historical Windows telemetry rejection during completion testing
 
 The first extended run on 10 September 2026 completed Linux services and Sentinel
 in 67.677 seconds. Windows service setup and checks finished at 131.130 seconds,

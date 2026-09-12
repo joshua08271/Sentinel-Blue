@@ -1,3 +1,3 @@
 """Sentinel Blue defensive competition tooling."""
 
-__version__ = "1.9.43"
+__version__ = "1.9.44"

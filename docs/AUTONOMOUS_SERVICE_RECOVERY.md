@@ -27,6 +27,19 @@ These checks cover declared dependencies, accounts, files, and transactions. The
 
 Ordinary controller SIGTERM/SIGINT shutdowns drain active requests and finish the authenticated controller session. A crash or forced kill still preserves the dirty marker and resumes in safe governance for explicit operator review. Discovered Linux systemd aliases are monitored through their canonical files while alias paths remain in persistence telemetry; changed destinations require fresh manifest/baseline review. Explicit protected paths are never silently redirected.
 
+## Current collection and validation
+
+Windows collection uses one owned helper that reuses native modules, while every
+cycle obtains a fresh inventory within the original 75-second budget. The helper
+alone runs at AboveNormal priority. Agent and service priorities remain unchanged.
+Missing or failed sections hold automatic recovery. See [Windows collection](WINDOWS_COLLECTION.md)
+and [current validation](DEFENSIVE_VALIDATION_1.9.44.md).
+
+## Historical implementation notes
+
+The versioned paragraphs below describe earlier behavior and measurements.
+Current helper scheduling and acceptance status are described above.
+
 Version 1.9.18 schedules Windows session inventory after the other bounded native collectors and excludes only the querying PowerShell process itself. Other sessions retain exact process-identity checks. Controller-local relay observations never obtain remote-agent authority; their intentionally unbound metadata does not trigger a global storage quarantine. Invalid external agent metadata remains quarantined.
 
 Version 1.9.19 polls queued actions before collecting and before publishing a healthy replacement sample. Actions use the last accepted observation; native action preflight remains required. If work arrives during collection, the agent recollects before publishing. The controller still rejects a capture whose approved observation was replaced; this guard is not relaxed. Windows full firewall inventory retains all rule/filter fields and uses a 60-second timeout with concise error reporting.

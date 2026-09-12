@@ -1,4 +1,4 @@
-# Controller continuity — 1.9.34 candidate
+# Controller continuity
 
 This change addresses controller disconnections interrupting the agent collection
 loop and ordinary controller crashes unnecessarily stopping committed autonomy.
@@ -19,11 +19,11 @@ rejection remains available to the existing reconciliation logic. TLS, response
 authentication, enrollment binding, and replay checks are unchanged. Truncated
 HTTP responses and disconnects during response reading are also handled.
 
-The agent still uses synchronous transport. A request already in flight can spend
-its configured timeout (12 seconds by default); this change prevents stacked
-timeouts across routes, not every possible network delay. DNS and slow response
-behavior are not covered by an absolute request deadline. Collection duration and
-the configured collection interval also contribute to recovery latency.
+The caller's network wait has an absolute deadline, including slow headers,
+response bodies and DNS. One owned worker contains a resolver that the operating
+system cannot interrupt; a replacement is not admitted while that worker drains.
+Late results cannot update authentication or action state. Collection duration
+and the configured collection interval also contribute to recovery latency.
 
 Only a verified, accepted telemetry document is used after uploading a batch.
 Partial local execution failures still force recollection instead of being
@@ -80,13 +80,11 @@ an obsolete revision.
 
 ## Verification and remaining limits
 
-The final candidate passed 968 regression tests (971 discovered, 3 skipped),
-all 15 packaged self-tests, both packaged process-kill scenarios, and native
-Linux telemetry spooling/reconnection. In the owned loopback fixture, the
-authorized controller relaunch reached its signed dashboard in 0.428 seconds;
-the offline and reconnect agent cycles took 0.454 and 0.551 seconds. These are
-single fixture measurements with their scope recorded in
-[the validation report](../reports/continuity-1.9.34-validation.json).
+Use the [current validation report](DEFENSIVE_VALIDATION_1.9.44.md) for exact
+runtime hashes, current test counts and measured results. Packaged lifecycle
+tests cover authenticated backup, clean restart, explicitly authorized crash
+resume, emergency-stop retention and telemetry replay. Historical measurements
+from other versions do not establish this runtime's Azure acceptance.
 
 Targeted tests cover every collection disconnect boundary, bounded retry/reset,
 truncated responses, preserved capture ordering, lost acknowledgements and action
@@ -95,8 +93,8 @@ profile changes, and the post-start observation gate. The packaged lifecycle run
 also supports an actual POSIX process-kill check:
 
 ```console
-python tools/smoke_release.py /path/to/sentinel-blue-1.9.34.pyz --exercise-lifecycle
-python tools/smoke_release.py /path/to/sentinel-blue-1.9.34.pyz --exercise-crash-resume
+python tools/smoke_release.py /path/to/sentinel-blue-1.9.44.pyz --exercise-lifecycle
+python tools/smoke_release.py /path/to/sentinel-blue-1.9.44.pyz --exercise-crash-resume
 ```
 
 The first checks default stopped recovery; the second checks authorized resumption
@@ -112,7 +110,7 @@ planner would require bounded delegated authority, stop/revocation semantics, an
 joint controller/agent budget reconciliation; those remain unresolved portions of
 the original availability issue.
 
-The candidate inherits 1.9.33's unverified native Windows load changes. Local
-regressions and POSIX process-kill acceptance cannot establish native Windows,
-full-event, or fully autonomous competition uptime. Version 1.9.32 remains the last
-validated release until the native acceptance gates are completed.
+Native Windows collection is measured separately. Local regressions and POSIX
+process-kill acceptance do not establish Windows load performance, full-event
+availability or fully autonomous competition uptime. See [Windows collection](WINDOWS_COLLECTION.md)
+and the current validation report for measured scope and remaining limits.

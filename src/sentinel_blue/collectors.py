@@ -292,11 +292,14 @@ def _linux_services(errors: list[str]) -> list[Service]:
     # Do not include unloaded names in the batched `systemctl show`: some valid
     # alias and generated unit-file entries make that command return nonzero.
     loaded_names = {name for name, _active, _substate in parsed}
+    if len(loaded_names | set(installed_names)) > 2000:
+        errors.append("Linux service inventory exceeded its 2000-entry limit; coverage is incomplete")
     for name in installed_names:
         if name not in loaded_names and len(parsed) < 2000:
             parsed.append((name, "inactive", "dead"))
+            loaded_names.add(name)
     services: list[Service] = []
-    for name, active, substate in parsed:
+    for name, active, substate in parsed[:2000]:
         detail = details.get(name, {})
         raw_exit = detail.get("ExecMainStatus", "")
         services.append(
