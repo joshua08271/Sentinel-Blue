@@ -43,7 +43,9 @@ DEFENSIVE_DOCS = [
     'DEFENSIVE_VALIDATION_1.9.42.md',
     'DEFENSIVE_VALIDATION_1.9.43.md',
     'DEFENSIVE_VALIDATION_1.9.44.md',
+    'DEFENSIVE_VALIDATION_1.9.45.md',
     'validation-1.9.43/ci.json', 'validation-1.9.43/local-tests.json',
+    'validation-1.9.44/ci.json', 'validation-1.9.44/local-tests.json',
     'validation-1.9.42/lifecycle.json', 'validation-1.9.42/transport.json',
     'validation-1.9.42/probe-timing.json', 'validation-1.9.42/local-tests.json',
 ]

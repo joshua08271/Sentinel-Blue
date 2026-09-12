@@ -1,11 +1,11 @@
 # Public defender releases
 
-Latest runtime candidate: **1.9.44**, [releases/sentinel-blue-1.9.44.pyz](releases/sentinel-blue-1.9.44.pyz). The expanded branch source matches it. Runtime SHA-256: `c115f1620f537fc77354aa0150e271cb0934d374e4ffa8ec44847c908f3a1cb8`.
+Latest runtime candidate: **1.9.45**, [releases/sentinel-blue-1.9.45.pyz](releases/sentinel-blue-1.9.45.pyz). The expanded branch source matches it. Runtime SHA-256: `a48098b8cd6de91f0dbe3620ed3bee8c343b7dd876a922180247b76858f1c76d`.
 
-The 1.9.44 local suite ran 220 tests: 218 passed, two Windows-only tests skipped. CI and targeted Azure acceptance are pending. See [current validation](docs/DEFENSIVE_VALIDATION_1.9.44.md).
+The 1.9.45 local suite ran 223 tests: 221 passed, two Windows-only tests skipped. Its Windows feature query can use one continuous read within the existing 60-second allowance, sharing any unused time with one early retry. Late native results hold setup. See [current validation](docs/DEFENSIVE_VALIDATION_1.9.45.md); current CI and Azure verification are pending.
 
-The public 1.9.43 runtime passed [Linux and Windows CI](https://github.com/joshua08271/Sentinel-Blue/actions/runs/34659310009). Its live Azure Linux run passed all seven guest-local defensive phases; the paired Windows run and final Azure cleanup are still in progress. These are separate results for the exact 1.9.43 runtime, not acceptance of 1.9.44.
+Version 1.9.44 passed [Linux and Windows CI](https://github.com/joshua08271/Sentinel-Blue/actions/runs/34660233853) and all seven live Azure Linux defensive phases, with all VM, network and temporary staging cleanup verified. The earlier paired 1.9.43 Azure run passed Linux; Windows had setup, responsiveness and load failures. Those results remain tied to their exact runtime versions and do not establish 1.9.45 acceptance.
 
-The previous [1.9.42 complete bundle](releases/sentinel-blue-defender-1.9.42.zip) remains available unchanged. Its [CI](https://github.com/joshua08271/Sentinel-Blue/actions/runs/34658160560) passed after explicit public-publication authorization on 11 September 2026; publication-blocked text inside that historical bundle predates this authorization.
+The original [1.9.42 complete bundle](releases/sentinel-blue-defender-1.9.42.zip) remains available unchanged. Its historical publication-blocked text predates the explicit public-publication authorization on 11 September 2026.
 
-The public maintenance branch retains its original `maintenance/defender-1.9.42` name as later versions are developed. See [pull request #3](https://github.com/joshua08271/Sentinel-Blue/pull/3). The complete 1.9.44 bundle will include the final acceptance evidence.
+The public branch retains its original `maintenance/defender-1.9.42` name while later versions are developed. See [pull request #3](https://github.com/joshua08271/Sentinel-Blue/pull/3). The final 1.9.45 bundle will include the completed validation evidence.

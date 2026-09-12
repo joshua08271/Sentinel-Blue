@@ -1,6 +1,6 @@
 # Competition opening
 
-Use [current validation](DEFENSIVE_VALIDATION_1.9.44.md) for the distributed
+Use [current validation](DEFENSIVE_VALIDATION_1.9.45.md) for the distributed
 runtime's measured results. The versioned native measurements below are
 historical. They do not establish current event eligibility or opening times.
 

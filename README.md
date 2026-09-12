@@ -1,4 +1,4 @@
-# Sentinel Blue 1.9.44
+# Sentinel Blue 1.9.45
 
 Sentinel Blue is a controller and host agent for authorized Linux and Windows
 blue-team environments. It collects native telemetry, records changes, and can
@@ -22,10 +22,10 @@ packages. SSH and SMB scoring transactions require the optional dependencies
 listed in `pyproject.toml`; credential-vault operations require `cryptography`.
 
 ```console
-python sentinel-blue-1.9.44.pyz --version
-python sentinel-blue-1.9.44.pyz --help
-python sentinel-blue-1.9.44.pyz doctor --json
-python sentinel-blue-1.9.44.pyz opening --help
+python sentinel-blue-1.9.45.pyz --version
+python sentinel-blue-1.9.45.pyz --help
+python sentinel-blue-1.9.45.pyz doctor --json
+python sentinel-blue-1.9.45.pyz opening --help
 ```
 
 `doctor` checks the local runtime and state directory. It does not certify a
@@ -56,6 +56,11 @@ controller/agent processes and do not prove VM-reboot continuity.
 
 ## Changes and verification
 
+Version 1.9.45 gives Windows feature inventory one continuous read within the
+existing 60-second total allowance. An early uncertain return may retry once
+using only the unused allowance. The overall setup deadline still applies, and
+late native results hold setup without starting a mutation.
+
 Version 1.9.44 also reports incomplete Linux service coverage above its
 2,000-entry inventory limit, including installed units that are currently
 unloaded. It preserves bounded observations and avoids constructing discarded
@@ -80,7 +85,7 @@ inventory budget remains 75 seconds.
 
 The installed/source command now defaults to the same defensive commands as
 the packaged runtime. The source bundle includes the new coverage and read-budget
-regressions. See [current validation](docs/DEFENSIVE_VALIDATION_1.9.44.md) for the
+regressions. See [current validation](docs/DEFENSIVE_VALIDATION_1.9.45.md) for the
 measured results and exact scope. Earlier Azure timings apply to 1.9.41 only.
 
 A reviewed starting baseline is a trust decision. Sentinel cannot establish

@@ -267,7 +267,26 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(len(transport.applies), 2)
         self.assertGreaterEqual(second["elapsed_seconds"], first["elapsed_seconds"])
 
-    def test_windows_feature_query_retries_once_inside_original_health_budget(self):
+    def test_slow_feature_inventory_uses_one_continuous_shared_allowance(self):
+        plan = self.plan()
+        task = dict(plan["tasks"][0], recipe="windows-features", probes=[])
+        host = dict(plan["hosts"]["host-0"], platform="windows")
+        clock, limits = [100.0], []
+        def execute(_host, script, seconds):
+            limits.append(seconds)
+            elapsed = min(45, seconds)
+            clock[0] += elapsed
+            return CommandResult(0 if seconds >= 45 else None, elapsed, seconds < 45)
+        transport = FixtureTransport()
+        transport.execute = execute
+        runner = SetupRunner(plan, self.profile, transport=transport)
+        runner.started_monotonic, runner.remaining_at_start = 100, 90
+        with patch("sentinel_blue.setup.time.monotonic", side_effect=lambda: clock[0]):
+            healthy, _ = runner._healthy(task, host, 90)
+        self.assertTrue(healthy)
+        self.assertEqual(limits, [60])
+
+    def test_windows_feature_query_retries_early_failure_inside_original_health_budget(self):
         plan = self.plan()
         task = dict(plan["tasks"][0], recipe="windows-features", probes=[])
         task["check"], task["apply"], _ = compile_recipe("windows-features", {"features": ["DNS"]}, self.root, "windows")
@@ -277,8 +296,8 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(script, task["check"])
             self.assertNotIn("Install-WindowsFeature", script)
             limits.append(seconds)
-            clock[0] += seconds if len(limits) == 1 else 0.1
-            return CommandResult(1, seconds, True) if len(limits) == 1 else CommandResult(0, 0.1)
+            clock[0] += 2 if len(limits) == 1 else 0.1
+            return CommandResult(1, 2, True) if len(limits) == 1 else CommandResult(0, 0.1)
         transport = FixtureTransport()
         transport.execute = execute
         runner = SetupRunner(plan, self.profile, transport=transport)
@@ -286,8 +305,29 @@ class SetupTests(unittest.TestCase):
         with patch("sentinel_blue.setup.time.monotonic", side_effect=lambda: clock[0]):
             healthy, checks = runner._healthy(task, host, 40)
         self.assertTrue(healthy)
-        self.assertEqual(limits, [30, 10])
+        self.assertEqual(limits, [40, 38])
         self.assertEqual(checks[0]["attempts"], 2)
+
+    def test_feature_query_retry_cannot_extend_total_native_allowance(self):
+        plan = self.plan()
+        task = dict(plan["tasks"][0], recipe="windows-features", probes=[])
+        host = dict(plan["hosts"]["host-0"], platform="windows")
+        clock, limits = [100.0], []
+        def execute(_host, script, seconds):
+            limits.append(seconds)
+            elapsed = 10 if len(limits) == 1 else seconds
+            clock[0] += elapsed
+            return CommandResult(None, elapsed, True)
+        transport = FixtureTransport()
+        transport.execute = execute
+        runner = SetupRunner(plan, self.profile, transport=transport)
+        runner.started_monotonic, runner.remaining_at_start = 100, 180
+        with patch("sentinel_blue.setup.time.monotonic", side_effect=lambda: clock[0]):
+            healthy, checks = runner._healthy(task, host, 180)
+        self.assertFalse(healthy)
+        self.assertEqual(limits, [60, 50])
+        self.assertEqual(clock[0], 160)
+        self.assertTrue(any(row.get("uncertain") for row in checks))
 
     def test_query_retry_never_replays_runbooks_or_resets_expired_budget(self):
         for recipe, budget, uncertain in (("runbook", 40, True), ("windows-features", 30, True),
@@ -309,6 +349,26 @@ class SetupTests(unittest.TestCase):
                     healthy, _ = runner._healthy(task, host, budget)
                 self.assertFalse(healthy)
                 self.assertEqual(calls, [task["check"]])
+
+    def test_late_native_success_never_authorizes_setup_mutation(self):
+        plan = self.plan()
+        task = dict(plan['tasks'][0], recipe='windows-features', probes=[], timeout_seconds=180)
+        plan['hosts']['host-0']['platform'] = 'windows'
+        clock, calls = [100.0], []
+        def execute(_host, script, seconds):
+            calls.append(script)
+            clock[0] += seconds + 0.1
+            return CommandResult(0, seconds + 0.1)
+        transport = FixtureTransport()
+        transport.execute = execute
+        runner = SetupRunner(plan, self.profile, transport=transport)
+        runner.started_monotonic, runner.remaining_at_start = 100, 180
+        with patch('sentinel_blue.setup.time.monotonic', side_effect=lambda: clock[0]):
+            result = runner._task(task)
+        self.assertEqual(calls, [task['check']])
+        self.assertEqual(result['status'], 'uncertain')
+        self.assertFalse(result['changed'])
+        self.assertNotIn('apply', result)
 
     def test_uncertain_initial_readiness_never_starts_setup_mutation(self):
         for recipe, expected_reads in (('runbook', 1), ('windows-features', 2)):

@@ -273,17 +273,25 @@ class SetupRunner:
         deadline = time.monotonic() + min(seconds, self.remaining())
         if seconds <= 0 or self.remaining() <= 0:
             return False, [{"kind": "deadline", "healthy": False}]
-        result = self._command(host, task["check"], min(30, seconds))
+        feature_query = (task.get("recipe") == "windows-features" and
+                         host.get("platform") == "windows")
+        # ServerManager can need more than thirty continuous seconds on a
+        # small Windows host. Two fresh thirty-second processes repeat its
+        # startup cost. Use the same sixty-second total allowance continuously,
+        # sharing it with any retry after an early uncertain return.
+        native_deadline = min(deadline, time.monotonic() + (60 if feature_query else 30))
+        result = self._command(host, task["check"], max(0, native_deadline - time.monotonic()))
         attempts = 1
-        available = min(self.remaining(), deadline - time.monotonic())
-        # ServerManager's read-only feature inventory timed out once on the
-        # native Windows target although the scored services remained healthy.
-        # Retry only this compiler-owned query, once, within the SAME deadline.
-        # Arbitrary runbooks and mutating commands never receive this retry.
-        if (result.uncertain and task.get("recipe") == "windows-features" and
-                host.get("platform") == "windows" and available >= 0.25):
-            result = self._command(host, task["check"], min(30, available))
+        available = min(self.remaining(), native_deadline - time.monotonic())
+        # Only this compiler-owned read may retry, once, inside its original
+        # native allowance and the original caller deadline. Mutations do not.
+        if result.uncertain and feature_query and available >= 0.25:
+            result = self._command(host, task["check"], available)
             attempts += 1
+        if time.monotonic() >= native_deadline:
+            return False, [{"kind": "native-check", "healthy": False,
+                            "returncode": result.returncode, "uncertain": True, "attempts": attempts},
+                           {"kind": "deadline", "healthy": False}]
         if result.uncertain or result.returncode != 0:
             return False, [{"kind": "native-check", "healthy": False, "returncode": result.returncode,
                             "uncertain": result.uncertain, "attempts": attempts}]

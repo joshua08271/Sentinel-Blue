@@ -3,7 +3,7 @@
 Sentinel Blue requires complete, fresh observations before automatic service
 recovery. A slow or failed native query holds recovery even when the service
 fault is otherwise repairable. Current results and exact runtime hashes are in
-[the validation report](DEFENSIVE_VALIDATION_1.9.44.md).
+[the validation report](DEFENSIVE_VALIDATION_1.9.45.md).
 
 ## Current behavior
 

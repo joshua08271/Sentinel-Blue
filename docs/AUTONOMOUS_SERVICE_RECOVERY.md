@@ -33,7 +33,7 @@ Windows collection uses one owned helper that reuses native modules, while every
 cycle obtains a fresh inventory within the original 75-second budget. The helper
 alone runs at AboveNormal priority. Agent and service priorities remain unchanged.
 Missing or failed sections hold automatic recovery. See [Windows collection](WINDOWS_COLLECTION.md)
-and [current validation](DEFENSIVE_VALIDATION_1.9.44.md).
+and [current validation](DEFENSIVE_VALIDATION_1.9.45.md).
 
 ## Historical implementation notes
 

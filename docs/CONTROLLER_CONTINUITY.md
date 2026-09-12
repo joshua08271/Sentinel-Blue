@@ -80,7 +80,7 @@ an obsolete revision.
 
 ## Verification and remaining limits
 
-Use the [current validation report](DEFENSIVE_VALIDATION_1.9.44.md) for exact
+Use the [current validation report](DEFENSIVE_VALIDATION_1.9.45.md) for exact
 runtime hashes, current test counts and measured results. Packaged lifecycle
 tests cover authenticated backup, clean restart, explicitly authorized crash
 resume, emergency-stop retention and telemetry replay. Historical measurements
@@ -93,8 +93,8 @@ profile changes, and the post-start observation gate. The packaged lifecycle run
 also supports an actual POSIX process-kill check:
 
 ```console
-python tools/smoke_release.py /path/to/sentinel-blue-1.9.44.pyz --exercise-lifecycle
-python tools/smoke_release.py /path/to/sentinel-blue-1.9.44.pyz --exercise-crash-resume
+python tools/smoke_release.py /path/to/sentinel-blue-1.9.45.pyz --exercise-lifecycle
+python tools/smoke_release.py /path/to/sentinel-blue-1.9.45.pyz --exercise-crash-resume
 ```
 
 The first checks default stopped recovery; the second checks authorized resumption
