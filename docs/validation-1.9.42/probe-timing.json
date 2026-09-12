@@ -1,0 +1,77 @@
+{
+  "version": "1.9.42",
+  "scope": "owned loopback HTTP service and opening-readiness peers",
+  "budget_seconds": 0.25,
+  "trials": [
+    {
+      "component": "http_probe",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "opening_readiness",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "http_probe",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "opening_readiness",
+      "seconds": 0.2504,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "http_probe",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "opening_readiness",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "http_probe",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "opening_readiness",
+      "seconds": 0.2503,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "http_probe",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    },
+    {
+      "component": "opening_readiness",
+      "seconds": 0.2502,
+      "late_result_rejected": true,
+      "bounded": true
+    }
+  ],
+  "controls": {
+    "healthy_http_after": true,
+    "healthy_readiness_after": true
+  },
+  "cleanup_verified": true,
+  "minimum_seconds": 0.2502,
+  "median_seconds": 0.2502,
+  "maximum_seconds": 0.2504,
+  "seconds": 2.618,
+  "passed": true
+}

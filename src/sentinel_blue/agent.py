@@ -6,8 +6,10 @@ import argparse
 import atexit
 import hashlib
 import hmac
+from http.client import HTTPException
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 import platform
@@ -19,10 +21,10 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from . import __version__
 from .actions import ActionExecutor
@@ -30,9 +32,11 @@ from .auth import ReplayGuard, signature, unwrap_enrollment_token, verify_respon
 from .change_watch import ChangeWatcher
 from .collectors import collect, integrity_watch_paths, machine_identity
 from .event_profile import EventProfile, load_event_profile
+from .service_recovery import validate_automatic_recovery
 from .health import assess_agent_health
 from .json_codec import canonical_json_bytes, strict_json_loads
 from .net_safety import validate_http_origin
+from .request_deadline import BoundedRequest, DeadlineHTTPHandler, DeadlineHTTPSHandler, RequestBudget
 from .state import (
     MAX_STATE_BYTES,
     AgentProcessLock,
@@ -77,6 +81,12 @@ MAX_ACTION_RESULT_ATTEMPT_COUNTER = 2**31 - 1
 ACTION_RESULT_INITIAL_BACKOFF_SECONDS = 5.0
 ACTION_RESULT_MAX_BACKOFF_SECONDS = 3600.0
 MAX_ACTION_RESULT_DELIVERY_DETAIL = 256
+CONTROLLER_RETRY_INITIAL_SECONDS = 5.0
+CONTROLLER_RETRY_MAX_SECONDS = 15.0
+
+
+class ControllerBackoff(URLError):
+    """The shared connection retry deadline has not elapsed yet."""
 
 
 def telemetry_matches_release_binding(
@@ -294,11 +304,15 @@ class AgentClient:
         self.token = token
         self.agent_token = agent_token
         self.agent_id = agent_id
-        self.timeout = timeout
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("agent request timeout must be finite and positive")
+        self.timeout = float(timeout)
+        self._transport = BoundedRequest()
+        self._connection_failures = 0
+        self._retry_at = 0.0
         self.ssl_context = ssl.create_default_context(cafile=ca_file) if ca_file else None
-        handlers: list[Any] = [ProxyHandler({}), NoRedirectHandler()]
-        if self.ssl_context is not None:
-            handlers.append(HTTPSHandler(context=self.ssl_context))
+        handlers: list[Any] = [ProxyHandler({}), NoRedirectHandler(), DeadlineHTTPHandler(),
+                               DeadlineHTTPSHandler(context=self.ssl_context)]
         self.opener = build_opener(*handlers)
         self.response_guard = ReplayGuard()
         self.profile_id = profile_id
@@ -330,6 +344,37 @@ class AgentClient:
         payload: dict[str, Any] | None = None,
         enrollment: bool = False,
     ) -> Any:
+        # One failed connection backs off *all* controller routes. Otherwise
+        # result delivery, action polls and upload each spend a full timeout
+        # before the same host can perform another local collection.
+        if time.monotonic() < self._retry_at:
+            raise ControllerBackoff("controller retry deferred; local collection continues")
+        try:
+            result = self._request_once(method, path, payload, enrollment)
+        except (HTTPError, URLError, OSError, HTTPException, ValueError) as exc:
+            if isinstance(exc, HTTPError) and getattr(exc, "sentinel_blue_verified", False) and 400 <= exc.code < 500 and exc.code != 429:
+                # A signed permanent rejection is an application response,
+                # not a connection outage. Preserve it for reconciliation.
+                self._connection_failures = 0
+                self._retry_at = 0.0
+            else:
+                self._connection_failures = min(3, self._connection_failures + 1)
+                self._retry_at = time.monotonic() + min(
+                    CONTROLLER_RETRY_MAX_SECONDS,
+                    CONTROLLER_RETRY_INITIAL_SECONDS * 2 ** (self._connection_failures - 1),
+                )
+            raise
+        self._connection_failures = 0
+        self._retry_at = 0.0
+        return result
+
+    def _request_once(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        enrollment: bool = False,
+    ) -> Any:
         route = path.partition("?")[0]
         request_limit = AGENT_REQUEST_LIMITS.get(route, MAX_AGENT_REQUEST_BYTES)
         body = (
@@ -349,50 +394,40 @@ class AgentClient:
             "Content-Type": "application/json",
         }
         request = Request(urljoin(self.controller, path.lstrip("/")), data=body if method != "GET" else None, headers=headers, method=method)
-        try:
-            response = self.opener.open(request, timeout=self.timeout)
-        except HTTPError as exc:
-            response_limit = AGENT_RESPONSE_LIMITS.get(route, MAX_CONTROLLER_RESPONSE_BYTES)
-            response_body = self._read_response_body(exc, response_limit)
-            self._verify_response(
-                request_token,
-                path,
-                int(exc.code),
-                request_signature,
-                response_body,
-                exc.headers,
+        response_limit = AGENT_RESPONSE_LIMITS.get(route, MAX_CONTROLLER_RESPONSE_BYTES)
+
+        def exchange(budget: RequestBudget) -> tuple[int, bytes, Any, HTTPError | None]:
+            request._sentinel_blue_budget = budget
+            error = None
+            try:
+                response = self.opener.open(request, timeout=self.timeout)
+            except HTTPError as exc:
+                response, error = exc, exc
+            # Error bodies hold sockets too. Close both success and failure
+            # responses even when a length check or cancellation interrupts.
+            with response:
+                status_value = getattr(response, "status", None)
+                status = int(response.getcode() if status_value is None else status_value)
+                return status, self._read_response_body(response, response_limit), response.headers, error
+
+        status, response_body, response_headers, error = self._transport.run(exchange, self.timeout)
+        # Only the caller authenticates and consumes a response. An expired
+        # network worker can never enroll, accept a replay marker, or act.
+        self._verify_response(request_token, path, status, request_signature, response_body, response_headers)
+        if error is not None:
+            error.sentinel_blue_verified = True
+            error.sentinel_blue_error = self._verified_error_reason(response_body, response_headers)
+            raise error
+        self._require_json_response_headers(response_headers)
+        decoded = strict_json_loads(response_body, max_bytes=response_limit)
+        if enrollment:
+            if not isinstance(decoded, dict) or "agent_token" in decoded:
+                raise ValueError("controller returned an unsafe enrollment response")
+            decoded["agent_token"] = unwrap_enrollment_token(
+                request_token, request_signature, decoded.get("agent_token_wrapped", ""),
             )
-            exc.sentinel_blue_verified = True
-            exc.sentinel_blue_error = self._verified_error_reason(
-                response_body,
-                exc.headers,
-            )
-            raise
-        with response:
-            status_value = getattr(response, "status", None)
-            status = int(response.getcode() if status_value is None else status_value)
-            response_limit = AGENT_RESPONSE_LIMITS.get(route, MAX_CONTROLLER_RESPONSE_BYTES)
-            response_body = self._read_response_body(response, response_limit)
-            self._verify_response(
-                request_token,
-                path,
-                status,
-                request_signature,
-                response_body,
-                response.headers,
-            )
-            self._require_json_response_headers(response.headers)
-            decoded = strict_json_loads(response_body, max_bytes=response_limit)
-            if enrollment:
-                if not isinstance(decoded, dict) or "agent_token" in decoded:
-                    raise ValueError("controller returned an unsafe enrollment response")
-                decoded["agent_token"] = unwrap_enrollment_token(
-                    request_token,
-                    request_signature,
-                    decoded.get("agent_token_wrapped", ""),
-                )
-                decoded.pop("agent_token_wrapped", None)
-            return decoded
+            decoded.pop("agent_token_wrapped", None)
+        return decoded
 
     @staticmethod
     def _read_response_body(response: Any, maximum: int = MAX_CONTROLLER_RESPONSE_BYTES) -> bytes:
@@ -518,7 +553,16 @@ class AgentClient:
 
     def actions(self) -> list[dict[str, Any]]:
         path = "/api/v1/agent/actions?" + urlencode({"agent_id": self.agent_id})
-        return list(self._request("GET", path).get("actions", []))
+        response = self._request("GET", path)
+        if not isinstance(response, dict) or not isinstance(response.get("actions"), list):
+            raise ValueError("controller action response must contain an actions array")
+        actions = response["actions"]
+        if len(actions) > 128 or any(
+            not isinstance(action, dict) or not isinstance(action.get("action_id"), str)
+            for action in actions
+        ):
+            raise ValueError("controller action batch is malformed or oversized")
+        return actions
 
     def result(self, action_id: str, result: dict[str, Any]) -> Any:
         # The queue-issued identifier is authoritative even if an executor result is
@@ -851,7 +895,7 @@ def deliver_pending_action_results(
             if not permanent:
                 break
             continue
-        except (URLError, TimeoutError, OSError, RuntimeError, ValueError, KeyError, ssl.SSLError) as exc:
+        except (URLError, TimeoutError, OSError, HTTPException, RuntimeError, ValueError, KeyError, ssl.SSLError) as exc:
             outbox.defer(action_id, str(exc), now=now)
             # One transport/authentication failure predicts the same outcome for
             # the remainder of this controller batch; avoid multiplying timeouts.
@@ -1144,7 +1188,22 @@ def execute_queued_action(
     ):
         raise RuntimeError("action journal claim changed unexpectedly")
     execution_started = time.time()
-    if health["action_safe"]:
+    recovery_error = None
+    if action_type == "repair_service":
+        try:
+            from .service_repair import validate_repair_contract
+            validate_repair_contract(profile, local_agent_id, envelope["parameters"], telemetry)
+            executor.repairs.bind_profile(profile.fingerprint)
+        except (KeyError, TypeError, ValueError) as exc:
+            recovery_error = str(exc)
+    if action_type == "restart_service" and envelope["automated"]:
+        try:
+            validate_automatic_recovery(profile, local_agent_id, envelope["parameters"], telemetry)
+        except (KeyError, TypeError, ValueError) as exc:
+            recovery_error = str(exc)
+    if recovery_error is not None:
+        result = {"success": False, "message": f"agent service recovery gate refused action: {recovery_error}"}
+    elif health["action_safe"]:
         result = executor.execute(action_type, envelope["parameters"], telemetry)
     else:
         result = {
@@ -1185,7 +1244,17 @@ def process_controller_actions(
         )
         return 0
     processed = 0
-    for action in client.actions():
+    try:
+        actions = client.actions()
+    except ControllerBackoff:
+        return 0
+    except (HTTPError, URLError, OSError, HTTPException, ValueError) as exc:
+        # Fetch errors cannot have changed local state. In particular, neither
+        # the pre-collection poll nor the capture-order poll may suppress a
+        # collection or discard its sample when the controller disappears.
+        LOG.warning("controller action fetch unavailable: %s", exc)
+        return 0
+    for action in actions:
         if not isinstance(action, dict):
             raise ValueError("controller action must be an object")
         action_id = action.get("action_id")
@@ -1206,6 +1275,36 @@ def process_controller_actions(
         if result_outbox.has_unacknowledged():
             break
     return processed
+
+
+def wait_for_next_collection(
+    watcher: ChangeWatcher,
+    interval: float,
+    poll_actions: Callable[[], int] | None = None,
+) -> bool:
+    """Keep action delivery responsive without increasing full-scan frequency.
+
+    A processed action wakes collection so its resulting state is observed. A
+    failed poll backs off for the rest of this interval; protected-file changes
+    can still wake collection immediately. The callback retains the exact last
+    accepted telemetry and rechecks local health before leasing work.
+    """
+    deadline = time.monotonic() + max(5.0, interval)
+    while (remaining := deadline - time.monotonic()) > 0:
+        if watcher.wait(min(1.0, remaining) if poll_actions else remaining):
+            return True
+        if poll_actions is None:
+            return False
+        try:
+            if poll_actions():
+                return False
+        except (
+            HTTPError, URLError, TimeoutError, OSError, RuntimeError,
+            ValueError, KeyError, ssl.SSLError, HTTPException,
+        ) as exc:
+            LOG.error("idle controller action poll failed: %s", exc)
+            poll_actions = None
+    return False
 
 
 def _run_with_windows_state_guard(
@@ -1230,6 +1329,9 @@ def _run_with_windows_state_guard(
     excluded_hosts = list(event_profile.excluded_hosts)
     if args.allow_containment and not event_profile.allows("session_containment"):
         raise ValueError("session containment is not authorized by the event profile")
+    allow_service_recovery = bool(getattr(args, "allow_service_recovery", False))
+    if allow_service_recovery and not event_profile.allows("in_place_repair"):
+        raise ValueError("service recovery is not authorized by the event profile")
     if args.allow_restoration and not event_profile.allows("file_restoration"):
         raise ValueError("file restoration is not authorized by the event profile")
     state_dir = prepare_state_directory(args.state_dir)
@@ -1317,6 +1419,8 @@ def _run_with_windows_state_guard(
         default_probes=probe_specs,
         authorized_hosts=authorized_hosts,
         excluded_hosts=excluded_hosts,
+        allow_service_recovery=allow_service_recovery,
+        profile_fingerprint=event_profile.fingerprint,
     )
     watcher = ChangeWatcher(
         integrity_watch_paths(integrity_paths),
@@ -1325,12 +1429,29 @@ def _run_with_windows_state_guard(
     if not args.once:
         watcher.start()
     LOG.warning(
-        "agent %s starting; containment=%s restoration=%s",
+        "agent %s starting; containment=%s restoration=%s service_recovery=%s",
         agent_id,
         args.allow_containment,
         args.allow_restoration,
+        allow_service_recovery,
     )
     systemd_notify("READY=1\nSTATUS=Sentinel Blue agent collecting defensive telemetry")
+    accepted_telemetry: dict[str, Any] | None = None
+
+    def poll_idle_actions() -> int:
+        if accepted_telemetry is None:
+            return 0
+        idle_health = assess_agent_health(state_dir, args.expected_package_sha256)
+        refresh_windows_state_health(windows_state_guard, idle_health)
+        if client.agent_token:
+            deliver_pending_action_results(client, result_outbox)
+        if not journal.healthy or not sequence.healthy:
+            return 0
+        return process_controller_actions(
+            client, result_outbox, journal, executor,
+            accepted_telemetry, idle_health, event_profile,
+        )
+
     while True:
         try:
             health = assess_agent_health(
@@ -1340,6 +1461,11 @@ def _run_with_windows_state_guard(
             refresh_windows_state_health(windows_state_guard, health)
             if client.agent_token:
                 deliver_pending_action_results(client, result_outbox)
+            if accepted_telemetry is not None and journal.healthy and sequence.healthy:
+                process_controller_actions(
+                    client, result_outbox, journal, executor,
+                    accepted_telemetry, health, event_profile,
+                )
             collection_started = time.monotonic()
             telemetry = collect(
                 agent_id,
@@ -1368,6 +1494,20 @@ def _run_with_windows_state_guard(
                 executor, health, str(telemetry.get("boot_id", "unknown"))
             )
             telemetry["collector_errors"].extend(health["errors"])
+            # Operator-approved capture can arrive during a slow collection.
+            # Finish work bound to the last accepted sample before replacing it.
+            # Recollect after any action so pre-action state is never published.
+            if (
+                accepted_telemetry is not None
+                and not telemetry["collector_errors"]
+                and all(probe.get("healthy", False) for probe in telemetry.get("probes", []))
+                and process_controller_actions(
+                    client, result_outbox, journal, executor,
+                    accepted_telemetry, health, event_profile,
+                )
+            ):
+                systemd_notify("WATCHDOG=1\nSTATUS=Recollecting after controller action")
+                continue
             telemetry["sequence"] = sequence.next()
             # The controller's observation digest includes the durable queue
             # timestamp.  Keep the exact submitted document in memory so an
@@ -1385,6 +1525,7 @@ def _run_with_windows_state_guard(
                 try:
                     client.telemetry(queued)
                     spool.acknowledge(queued_path)
+                    accepted_telemetry = queued
                 except HTTPError as exc:
                     if exc.code in {400, 403} and getattr(
                         exc, "sentinel_blue_verified", False
@@ -1397,15 +1538,11 @@ def _run_with_windows_state_guard(
                         )
                         continue
                     raise
-            process_controller_actions(
-                client,
-                result_outbox,
-                journal,
-                executor,
-                telemetry,
-                health,
-                event_profile,
-            )
+            if accepted_telemetry is not None:
+                process_controller_actions(
+                    client, result_outbox, journal, executor,
+                    accepted_telemetry, health, event_profile,
+                )
         except (
             HTTPError,
             URLError,
@@ -1415,6 +1552,7 @@ def _run_with_windows_state_guard(
             ValueError,
             KeyError,
             ssl.SSLError,
+            HTTPException,
         ) as exc:
             LOG.error("agent cycle failed: %s", exc)
         systemd_notify("WATCHDOG=1\nSTATUS=Sentinel Blue agent cycle complete")
@@ -1422,7 +1560,10 @@ def _run_with_windows_state_guard(
             watcher.stop()
             process_lock.close()
             return
-        if watcher.wait(max(5.0, args.interval)):
+        if wait_for_next_collection(
+            watcher, args.interval,
+            poll_idle_actions if accepted_telemetry is not None else None,
+        ):
             changed = watcher.changed_paths()
             LOG.warning("protected-file change triggered an early collection: %s", changed[:16])
 

@@ -12,6 +12,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import socket
 import sqlite3
 import ssl
@@ -20,12 +21,13 @@ import sys
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
@@ -70,6 +72,7 @@ from .protocol import (
     AlertCandidate,
 )
 from .risk import RiskModel, features_for_kind
+from .service_recovery import ServiceRecoveryPlanner, RECOVERY_CONFIRMATIONS, RECOVERY_FRESHNESS_SECONDS
 from .store import (
     ActionQuotaExceeded,
     Store,
@@ -79,6 +82,7 @@ from .store import (
 from .state import read_private_json, read_private_text
 from .topology import build_topology
 from .validation import (
+    ModelBoundAlertCandidate,
     MODEL_FEATURE_SCHEMA_SHA256,
     validate_action_result,
     validate_agent_id,
@@ -418,9 +422,11 @@ SERVICE_MANIFEST_ACTIONS = frozenset(
         "rollback_integrity",
         "restart_service",
         "rollback_service",
+        "repair_service",
+        "rollback_service_repair",
     }
 )
-SERVICE_ID_ACTIONS = frozenset({"restart_service", "rollback_service"})
+SERVICE_ID_ACTIONS = frozenset({"restart_service", "rollback_service", "repair_service", "rollback_service_repair"})
 PATH_ACTIONS = frozenset(
     {"capture_restore_point", "restore_integrity", "rollback_integrity"}
 )
@@ -861,7 +867,7 @@ def relay_probe_loop(
 ) -> None:
     from dataclasses import asdict
 
-    from .probes import run_probes
+    from .probes import ProbeBatchCancelled, run_probes
 
     while not stop.is_set():
         try:
@@ -870,7 +876,10 @@ def relay_probe_loop(
                 app.authorized_networks,
                 authorized_hosts=app.authorized_hosts,
                 excluded_hosts=app.excluded_hosts,
+                stop_event=stop,
             )
+            if stop.is_set():
+                return
             app.ingest(
                 {
                     "agent_id": "sentinel-relay-probes",
@@ -892,6 +901,8 @@ def relay_probe_loop(
                     "profile_fingerprint": app.event_profile.fingerprint,
                 }
             )
+        except ProbeBatchCancelled:
+            return
         except Exception:
             LOG.exception("relay probe cycle failed")
         stop.wait(max(5.0, interval))
@@ -921,7 +932,9 @@ class ControllerApp:
         recovery_anchor: str | os.PathLike[str] | None = None,
         require_authenticated_recovery: bool = False,
         force_safe_governance: bool = False,
+        unclean_shutdown: bool = False,
         campaign_id: str | None = None,
+        auto_recover_services: bool = False,
     ):
         if len(token) < 16:
             raise ValueError("the enrollment token must be at least 16 characters")
@@ -1023,6 +1036,8 @@ class ControllerApp:
         )
         self.health_stale_after = max(15.0, health_stale_after)
         self.auto_restore = auto_restore
+        self.auto_recover_services = bool(auto_recover_services)
+        self.service_recovery_planner = ServiceRecoveryPlanner(self.event_profile)
         self.restoration_probes = restoration_probes or []
         self.restore_confirmations = max(1, min(int(restore_confirmations), 5))
         self.allow_unprobed_restoration = bool(allow_unprobed_restoration)
@@ -1048,17 +1063,34 @@ class ControllerApp:
         if self.event_profile.environment != "range-autonomous":
             allowed_governance_modes.discard("range-autonomous")
         self._allowed_governance_modes = frozenset(allowed_governance_modes)
+        crash_resume = False
+        if (
+            unclean_shutdown
+            and not force_safe_governance
+            and self.event_profile.raw.get("recovery", {}).get("resume_after_controller_crash") is True
+            and self.require_authenticated_recovery
+            and self.recovery_key is not None
+            and self.recovery_anchor is not None
+            and self.store.path != ":memory:"
+        ):
+            from .recovery_ops import controller_recovery_status
+            crash_resume = controller_recovery_status(
+                self.store.path, self.recovery_anchor, self.recovery_key
+            )["ready"] is True
         governance = self.store.load_governance(
             profile_fingerprint=self.event_profile.fingerprint,
             default_mode=self.event_profile.autonomy_mode,
             strict=self._strict_release_binding and self.store.path != ":memory:",
             allowed_modes=self._allowed_governance_modes,
             force_safe=bool(force_safe_governance),
+            unclean_shutdown=bool(unclean_shutdown),
+            resume_after_crash=crash_resume,
         )
         self.autonomy_mode = str(governance["autonomy_mode"])
         self.emergency_stopped = bool(governance["emergency_stopped"])
         self._governance_revision = int(governance["revision"])
         self._governance_persistence_uncertain = False
+        self._recovery_fresh_after = time.time() if unclean_shutdown or force_safe_governance else 0.0
         self.connection_pressure_provider: Any = lambda: {}
         if self.auto_restore and not self.event_profile.action_allowed(
             "restore_integrity",
@@ -1068,6 +1100,12 @@ class ControllerApp:
             raise ValueError("automatic restoration is not authorized by the event profile")
         if self.allow_unprobed_restoration and self.event_profile.environment == "live-competition":
             raise ValueError("live competition profiles cannot authorize unprobed restoration")
+        if self.auto_recover_services and (
+            not self.event_profile.services_confirmed or not any(self.event_profile.action_allowed(
+                action, automated=True, autonomy_mode=self.event_profile.autonomy_mode
+            ) for action in ("restart_service", "repair_service"))
+        ):
+            raise ValueError("automatic service recovery is not authorized by confirmed event manifests")
         self._integrity_lock = threading.Lock()
         self._decision_lock = threading.Lock()
         # The outer barrier spans both leasing and the actual HTTP write. Any
@@ -1168,10 +1206,27 @@ class ControllerApp:
             }
             return automatic, manual
 
+    def _post_recovery_observation(self, agent_id: str) -> bool:
+        """After a crash require a complete observation collected after startup."""
+        if not self._recovery_fresh_after:
+            return True
+        sample = self.store.latest_telemetry_for_agent(agent_id) or {}
+        observed = sample.get("observed_at")
+        return (
+            type(observed) in {int, float}
+            and self._recovery_fresh_after <= observed <= time.time()
+            and not sample.get("collector_errors")
+        )
+
     def pending_actions_for_agent(self, agent_id: str) -> list[Any]:
         """Compute policy and lease actions under one stop/dispatch barrier."""
         with self._governance_lock:
             automatic, manual = self.dispatch_policy()
+            if not self._post_recovery_observation(agent_id):
+                # Recovery must not deadlock the existing emergency rollback
+                # path when a damaged host cannot produce a complete sample.
+                automatic &= EMERGENCY_ALLOWED_ACTIONS
+                manual &= EMERGENCY_ALLOWED_ACTIONS
             binding = (
                 self.store.agent_binding(
                     agent_id,
@@ -1207,9 +1262,10 @@ class ControllerApp:
             self.emergency_stopped = True
             self._governance_persistence_uncertain = True
             try:
-                self.store.force_safe_governance(
+                safe = self.store.force_safe_governance(
                     self.event_profile.fingerprint
                 )
+                self._governance_revision = int(safe["revision"])
                 self._governance_persistence_uncertain = False
             except Exception:
                 LOG.exception("durable fail-safe governance write also failed")
@@ -1465,6 +1521,10 @@ class ControllerApp:
         authorization_code: str = "",
         authorization_subject: str | None = None,
     ) -> str | None:
+        if action_type not in EMERGENCY_ALLOWED_ACTIONS and not self._post_recovery_observation(agent_id):
+            if automated:
+                return None
+            raise PermissionError("fresh post-recovery agent telemetry is required")
         if action_type in PROCESS_SIGNAL_ACTIONS:
             validate_action_parameters(
                 action_type, parameters, require_process_binding=True
@@ -1683,6 +1743,34 @@ class ControllerApp:
                 selected.append(dict(spec))
         return selected
 
+    def service_recovery_probes(
+        self, agent_id: str, service_id: str
+    ) -> list[dict[str, Any]]:
+        """Return exact manifest transactions for one service recovery.
+
+        A service manager's ``running`` state is not enough to prove that the
+        application transaction recovered. Confirmed manifests define the
+        probes a manually approved restart must pass. An absent or ambiguous
+        mapping returns no probes so the existing manifest policy can reject
+        the restart instead of guessing.
+        """
+
+        if not self.event_profile.services_confirmed:
+            return []
+        matches = [
+            service
+            for service in self.event_profile.services
+            if service.get("host") == agent_id
+            and service.get("service_id") == service_id
+        ]
+        if len(matches) != 1:
+            return []
+        return [
+            dict(probe)
+            for probe in matches[0].get("expected_transactions", [])
+            if isinstance(probe, dict)
+        ]
+
     def dashboard(self) -> dict[str, Any]:
         payload = self.store.dashboard(self.health_stale_after)
         agent_by_id = {
@@ -1793,6 +1881,9 @@ class ControllerApp:
             "restoration_blocked_agents": restoration_blocked_agents,
             "restoration_blockers": restoration_blockers,
             "restore_confirmations": self.restore_confirmations,
+            "automatic_service_recovery": self.auto_recover_services,
+            "service_recovery_confirmations": RECOVERY_CONFIRMATIONS,
+            "service_recovery_status": self.service_recovery_status(telemetry_by_agent),
             "allow_unprobed_restoration": self.allow_unprobed_restoration,
             "connection_pressure": self.connection_pressure_provider(),
             "credential_migration_blockers": self.credential_migration_blockers(),
@@ -1820,6 +1911,45 @@ class ControllerApp:
             "failed_actions": sum(action.get("status") == "failed" for action in payload["actions"]),
         }
         return payload
+
+    def service_recovery_status(self, telemetry_by_agent: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        diagnoses = {(item["agent_id"], item["service"]): item.get("diagnosis", {})
+                     for item in self.service_recovery_planner.status()}
+        observations = {
+            (item["agent_id"], item["service"]): item["status"]
+            for item in self.service_recovery_planner.status()
+        }
+        rows = []
+        now = time.time()
+        for manifest in self.event_profile.services:
+            agent_id, service = manifest["host"], manifest["service_id"]
+            status = observations.get((agent_id, service), "awaiting observations")
+            budget = self.store.service_recovery_budget_status(agent_id, service)
+            telemetry = telemetry_by_agent.get(agent_id) or {}
+            observed = telemetry.get("observed_at")
+            if not self.auto_recover_services:
+                status = "automatic service recovery disabled"
+            elif self.emergency_stopped:
+                status = "emergency stop enabled"
+            elif not self.event_profile.action_allowed(
+                "repair_service" if "repair_service" in manifest["allowed_automatic_actions"] else "restart_service",
+                automated=True, autonomy_mode=self.autonomy_mode,
+                emergency_stopped=self.emergency_stopped,
+            ):
+                status = "current governance holds automatic recovery"
+            elif not self.store.agent_enabled(agent_id):
+                status = "agent disabled or not enrolled"
+            elif type(observed) not in (int, float) or not 0 <= now - observed <= RECOVERY_FRESHNESS_SECONDS:
+                status = "fresh telemetry unavailable"
+            elif not budget["allowed"]:
+                status = budget["reason"]
+            rows.append({
+                "agent_id": agent_id, "service": service, "status": status,
+                "observation_status": observations.get((agent_id, service), "awaiting observations"),
+                "budget": budget,
+                "diagnosis": diagnoses.get((agent_id, service), {}),
+            })
+        return rows
 
     def enroll(
         self,
@@ -2015,9 +2145,53 @@ class ControllerApp:
         baseline = self.store.get_baseline(agent_id, binding=binding)
         baseline_status = self.store.baseline_status(agent_id, binding=binding)
         protected = self.store.protected_accounts(agent_id)
-        candidates, candidate_summary = prioritize_detection_candidates(
-            detect(payload, baseline, protected, self.model)
+        service_recoveries = (
+            self.service_recovery_planner.observe(agent_id, baseline, baseline_status == "approved", payload)
+            if self.auto_recover_services else {}
         )
+        detected = detect(payload, baseline, protected, self.model,
+                   identity_guards=self.event_profile.raw.get("identity_guards", []),
+                   persistence_policy=self.event_profile.raw.get("persistence_policy"))
+        coordinated_paths: set[str] = set()
+        if self.auto_recover_services and self.event_profile.action_allowed(
+            "repair_service", automated=True, autonomy_mode=self.autonomy_mode,
+            emergency_stopped=self.emergency_stopped,
+        ):
+            # Reserve these paths for the composite operation while their
+            # service is down. Standalone restoration would undo good files
+            # merely because the application has not been started yet.
+            for manifest in self.event_profile.services:
+                if manifest["host"] != agent_id or "repair_service" not in manifest["allowed_automatic_actions"]:
+                    continue
+                states = [row for row in payload.get("services", []) if row.get("name") == manifest["service_id"]]
+                from .service_repair import probe_health, local_probe
+                local_failed = any(local_probe(spec) and health is False for spec, health in zip(
+                    manifest["expected_transactions"], probe_health(manifest["expected_transactions"], payload)))
+                if len(states) == 1 and (states[0].get("state") != "running" or local_failed):
+                    coordinated_paths.update(manifest.get("repair_policy", {}).get("restore_files", []))
+        for service, parameters in list(service_recoveries.items()):
+            if "repair" not in parameters:
+                continue
+            held = False
+            for item in parameters["repair"]["restore_files"]:
+                material = "\x00".join((str(item["observed_sha256"]) if not item["observed_missing"] else "__missing__",
+                                        str(item["observed_security_descriptor_sha256"] or "__missing__")))
+                if self.store.consume_change_grant(agent_id, item["path"], hashlib.sha256(material.encode()).hexdigest(), binding=binding):
+                    held = True
+            if held:
+                service_recoveries.pop(service)
+                self.service_recovery_planner.hold(agent_id, service, "approved change grant holds coordinated repair",
+                                                   reset_confirmations=False)
+                continue
+            features = {"probe_failure": 1.0, "integrity_change": float(bool(parameters["repair"]["restore_files"]))}
+            detected.append(ModelBoundAlertCandidate(
+                kind="service_repair_required", title="Service has a verified repair plan",
+                summary=f"{service} requires coordinated configuration and application recovery.",
+                severity="high", confidence=0.9, model_features=features,
+                evidence={"service": service},
+                recommendation="Apply the confirmed manifest repair, validate stable service health, and roll back on failure.",
+                recommended_action="repair_service"))
+        candidates, candidate_summary = prioritize_detection_candidates(detected)
         if candidate_summary["suppressed_candidates"]:
             self.store.audit(
                 "controller",
@@ -2097,6 +2271,8 @@ class ControllerApp:
                             "accepts or rejects the change."
                         )
                         candidate.evidence["change_grant_id"] = grant["grant_id"]
+                    elif path in coordinated_paths:
+                        candidate.evidence["automation_hold"] = "configuration belongs to coordinated service repair"
                     elif self.auto_restore:
                         selected_probes = self.restoration_probes_for_path(path)
                         candidate.evidence["probes"] = selected_probes
@@ -2144,6 +2320,23 @@ class ControllerApp:
                     dict(candidate.evidence),
                     alert_id,
                     automated=True,
+                )
+            elif (
+                candidate.kind == "service_repair_required"
+                and candidate.evidence.get("service") in service_recoveries
+                and self.store.action_for_alert(alert_id, "repair_service") is None
+            ):
+                self._queue_action(agent_id, "repair_service", service_recoveries[candidate.evidence["service"]],
+                                   alert_id, automated=True)
+            elif (
+                candidate.kind == "baseline_service_stopped"
+                and candidate.evidence.get("service") in service_recoveries
+                and "repair" not in service_recoveries[candidate.evidence["service"]]
+                and self.store.action_for_alert(alert_id, "restart_service") is None
+            ):
+                self._queue_action(
+                    agent_id, "restart_service", service_recoveries[candidate.evidence["service"]],
+                    alert_id, automated=True,
                 )
             elif should_automate_evidence(candidate.recommended_action, candidate.severity):
                 self._queue_action(
@@ -2271,7 +2464,9 @@ class ControllerApp:
         )
         if not isinstance(evidence, dict):
             raise ValueError("stored alert evidence is not an object")
-        account = evidence.get("account", {}).get("name") or evidence.get("session", {}).get("username")
+        account_row, session_row = evidence.get("account"), evidence.get("session")
+        account = ((account_row.get("name") if isinstance(account_row, dict) else None)
+                   or (session_row.get("username") if isinstance(session_row, dict) else None))
         result: dict[str, Any]
         if decision == "mark_protected" and account:
             self.store.protect_account(row["agent_id"], account, "competition-protected")
@@ -2368,6 +2563,18 @@ class ControllerApp:
                 if action_type in PROCESS_SIGNAL_ACTIONS
                 else dict(evidence)
             )
+            if action_type == "restart_service" and "probes" not in parameters:
+                parameters["probes"] = self.service_recovery_probes(
+                    str(row["agent_id"]), str(parameters.get("service", ""))
+                )
+            if action_type == "repair_service":
+                from .service_repair import repair_parameters
+                agent = str(row["agent_id"])
+                baseline = self.store.get_baseline(agent)
+                if not baseline or self.store.baseline_status(agent) != "approved":
+                    raise ValueError("service repair requires an approved baseline")
+                parameters = repair_parameters(self.event_profile, agent, str(parameters["service"]),
+                                               baseline, self.store.latest_telemetry_for_agent(agent) or {})
             action_id = self._queue_action(
                 row["agent_id"], action_type, parameters, alert_id,
                 authorization_code=authorization_code,
@@ -2729,7 +2936,7 @@ class ControllerApp:
         with self._governance_lock, self.store._lock:
             action = self.store.get_action(action_id)
             if not action or action["action_type"] not in {
-                "restart_service", "restore_integrity"
+                "restart_service", "restore_integrity", "repair_service"
             }:
                 return None
             result = action.get("result")
@@ -2764,8 +2971,8 @@ class ControllerApp:
                 ) != self.store._binding_values(binding):
                     return None
             rollback_type = (
-                "rollback_service"
-                if action["action_type"] == "restart_service"
+                "rollback_service_repair" if action["action_type"] == "repair_service" else "rollback_service"
+                if action["action_type"] in {"restart_service", "repair_service"}
                 else "rollback_integrity"
             )
             rollback_parameters = dict(pre_state)
@@ -3401,6 +3608,8 @@ def make_handler(app: ControllerApp) -> type[BaseHTTPRequestHandler]:
                     if not self._deadline_expired():
                         self.server._record_expected_connection_failure(type(exc).__name__)
                 return
+            except ActionQuotaExceeded as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except PermissionError as exc:
                 self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -3420,6 +3629,63 @@ def run(args: argparse.Namespace) -> None:
     # second process fails here even when it intends to bind a different port.
     with ControllerDatabaseLock(args.database):
         _run_locked(args)
+
+
+@contextmanager
+def _controller_shutdown_signals(server: ControllerServer) -> Iterator[None]:
+    """Keep repeated service-manager signals harmless through session cleanup."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    requested = False
+    worker: threading.Thread | None = None
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        nonlocal worker, requested
+        if requested:
+            return
+        requested = True
+        # BaseServer.shutdown must run outside the serve_forever thread.
+        worker = threading.Thread(target=server.shutdown, daemon=True, name="sentinel-shutdown")
+        worker.start()
+
+    previous = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for number in previous:
+            signal.signal(number, request_stop)
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        if worker:
+            worker.join(timeout=3)
+
+
+def _drain_controller_workers(
+    server: ControllerServer,
+    workers: list[threading.Thread],
+    *,
+    timeout: float = 20.0,
+) -> bool:
+    """Wait on all database users against one shared monotonic deadline."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        live_workers = [worker for worker in workers if worker.is_alive()]
+        connections = server.active_connections()
+        if not live_workers and not connections:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            LOG.error(
+                "controller shutdown did not drain: workers=%s, active_requests=%s; "
+                "unclean-session marker retained",
+                [worker.name for worker in live_workers], sum(connections.values()),
+            )
+            return False
+        if live_workers:
+            live_workers[0].join(timeout=min(0.05, remaining))
+        else:
+            time.sleep(min(0.05, remaining))
 
 
 def _run_locked(args: argparse.Namespace) -> None:
@@ -3519,6 +3785,7 @@ def _run_locked(args: argparse.Namespace) -> None:
         max_agents=args.max_agents,
         health_stale_after=args.stale_after,
         auto_restore=args.auto_restore,
+        auto_recover_services=getattr(args, "auto_recover_services", False),
         restoration_probes=probe_specs,
         restore_confirmations=args.restore_confirmations,
         allow_unprobed_restoration=args.allow_unprobed_restoration,
@@ -3529,7 +3796,7 @@ def _run_locked(args: argparse.Namespace) -> None:
         recovery_key=recovery_key,
         recovery_anchor=args.recovery_anchor,
         require_authenticated_recovery=True,
-        force_safe_governance=prior_unclean_shutdown,
+        unclean_shutdown=prior_unclean_shutdown,
         campaign_id=getattr(args, "campaign_id", None),
     )
     server = ControllerServer(
@@ -3579,48 +3846,56 @@ def _run_locked(args: argparse.Namespace) -> None:
         syslog_monitor.start()
     scheme = "https" if args.tls_cert else "http"
     LOG.warning("controller listening on %s://%s:%s", scheme, args.bind, args.port)
-    clean_shutdown = False
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        clean_shutdown = True
-    else:
-        clean_shutdown = True
-    finally:
-        probe_stop.set()
-        if probe_thread:
-            probe_thread.join(timeout=3)
-        maintenance_thread.join(timeout=3)
-        if syslog_monitor:
-            syslog_monitor.stop()
-        server.server_close()
-        if args.adaptive_model_output:
-            try:
-                from .learning import train_candidate
+    with _controller_shutdown_signals(server):
+        clean_shutdown = False
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            clean_shutdown = True
+        else:
+            clean_shutdown = True
+        finally:
+            probe_stop.set()
+            if syslog_monitor:
+                syslog_monitor.stop()
+            server.server_close()
+            # Probes can legitimately outlast the old three-second join. Drain them
+            # together with maintenance and HTTP handlers before closing the store.
+            workers = [maintenance_thread]
+            if probe_thread:
+                workers.append(probe_thread)
+            workers_drained = _drain_controller_workers(server, workers)
+            if args.adaptive_model_output and workers_drained:
+                try:
+                    from .learning import train_candidate
 
-                provenance_filter = {
-                    "campaign_id": app.campaign_id,
-                    "profile_id": event_profile.profile_id,
-                    "profile_fingerprint": event_profile.fingerprint,
-                    "release_sha256": str(
-                        event_profile.release.get("sha256", "")
-                    ).casefold(),
-                    "agent_version": __version__,
-                    "model_fingerprint": model.fingerprint(),
-                }
-                report = train_candidate(
-                    store,
-                    model,
-                    args.adaptive_model_output,
-                    provenance_filter=provenance_filter,
-                    require_structured_lineage=app._strict_release_binding,
+                    provenance_filter = {
+                        "campaign_id": app.campaign_id,
+                        "profile_id": event_profile.profile_id,
+                        "profile_fingerprint": event_profile.fingerprint,
+                        "release_sha256": str(
+                            event_profile.release.get("sha256", "")
+                        ).casefold(),
+                        "agent_version": __version__,
+                        "model_fingerprint": model.fingerprint(),
+                    }
+                    report = train_candidate(
+                        store,
+                        model,
+                        args.adaptive_model_output,
+                        provenance_filter=provenance_filter,
+                        require_structured_lineage=app._strict_release_binding,
+                    )
+                    LOG.warning("adaptive model evaluation: %s", json.dumps(report, sort_keys=True))
+                except Exception:
+                    LOG.exception("adaptive model training failed; current model retained")
+            if clean_shutdown and workers_drained and not app._governance_persistence_uncertain:
+                if not store.end_controller_session(controller_session_id):
+                    LOG.error("controller clean-session marker could not be cleared")
+            else:
+                LOG.error(
+                    "controller session remains unclean: normal_stop=%s, drained=%s, "
+                    "governance_persistence_uncertain=%s",
+                    clean_shutdown, workers_drained, app._governance_persistence_uncertain,
                 )
-                LOG.warning("adaptive model evaluation: %s", json.dumps(report, sort_keys=True))
-            except Exception:
-                LOG.exception("adaptive model training failed; current model retained")
-        if clean_shutdown and not app._governance_persistence_uncertain and not maintenance_thread.is_alive() and not (
-            probe_thread and probe_thread.is_alive()
-        ):
-            if not store.end_controller_session(controller_session_id):
-                LOG.error("controller clean-session marker could not be cleared")
-        store.close()
+            store.close()

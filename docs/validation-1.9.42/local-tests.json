@@ -1,0 +1,21 @@
+{
+  "version": "1.9.42",
+  "platform": "Linux",
+  "baseline": {
+    "run": 194,
+    "passed": 194
+  },
+  "updated": {
+    "run": 215,
+    "passed": 214,
+    "skipped": 1,
+    "failures": 0,
+    "errors": 0,
+    "seconds": 18.517
+  },
+  "skipped_reason": "Native Windows file-handle check requires Windows",
+  "github_publication": "Blocked by automatic approval review pending explicit user permission",
+  "azure_exercise": "Not performed",
+  "live_red_team_exercise": "Not performed",
+  "runtime_sha256": "d410e4b1312fde354f60f756d1cbd18b8eaebaf5ab3b81c686e000d549789238"
+}

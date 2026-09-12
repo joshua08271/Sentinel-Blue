@@ -62,21 +62,21 @@ def _write_zip(
     destination: Path,
     entries: Iterable[tuple[str, bytes]],
     prefix: bytes = b"",
+    *, compressed: bool = False,
 ) -> None:
     prepared = list(entries)
     names = [name for name, _content in prepared]
     if len(names) != len(set(names)) or len(names) != len({name.casefold() for name in names}):
         raise ValueError("archive entries contain a duplicate or case collision")
     destination.write_bytes(prefix)
-    with zipfile.ZipFile(
-        destination, "a", compression=zipfile.ZIP_STORED
-    ) as archive:
+    compression = zipfile.ZIP_DEFLATED if compressed else zipfile.ZIP_STORED
+    with zipfile.ZipFile(destination, "a", compression=compression) as archive:
         for name, content in prepared:
             info = zipfile.ZipInfo(name, FIXED_ZIP_TIME)
             info.create_system = 3
-            info.compress_type = zipfile.ZIP_STORED
+            info.compress_type = compression
             info.external_attr = 0o100644 << 16
-            archive.writestr(info, content, compress_type=zipfile.ZIP_STORED)
+            archive.writestr(info, content, compress_type=compression, compresslevel=9 if compressed else None)
 
 
 def zip_tree(destination: Path, paths: list[Path]) -> None:
@@ -122,7 +122,7 @@ def build(output: Path) -> list[Path]:
             b"from sentinel_blue.__main__ import main\n\nif __name__ == '__main__':\n    main()\n",
         )
     )
-    _write_zip(zipapp_path, runtime_entries, prefix=b"#!/usr/bin/env python3\n")
+    _write_zip(zipapp_path, runtime_entries, prefix=b"#!/usr/bin/env python3\n", compressed=True)
     if os.name == "posix":
         zipapp_path.chmod(0o755)
 

@@ -294,7 +294,7 @@ def _require_success_result_contract(
             or record.get("target_observation") != expected_observation
         ):
             raise ValueError("quarantine success lacks exact process attestation")
-    elif action_type in {"restart_service", "rollback_service"}:
+    elif action_type in {"restart_service", "rollback_service", "repair_service", "rollback_service_repair"}:
         pre_state = result.get("pre_state")
         if (
             not isinstance(pre_state, dict)
@@ -302,6 +302,25 @@ def _require_success_result_contract(
             or pre_state.get("desired_state") not in {"running", "stopped"}
         ):
             raise ValueError("service action success lacks prior-state attestation")
+        if action_type in {"restart_service", "repair_service"} and "recovery_guard" in parameters:
+            probes = result.get("probes")
+            expected = parameters.get("probes", [])
+            if (result.get("stable_health") is not True or not expected
+                or type(result.get("probe_attempts")) is not int or result["probe_attempts"] < 3
+                or not isinstance(probes, list) or len(probes) != len(expected)
+                or any(not isinstance(row, dict) or row.get("healthy") is not True
+                       or row.get("target") != spec.get("target")
+                       or row.get("name") != spec.get("name", spec.get("target"))
+                       for row, spec in zip(probes, expected))):
+                raise ValueError("automatic service recovery lacks stable manifest probe attestations")
+        if action_type == "repair_service":
+            from .service_repair import plan_digest
+            record = result.get("record")
+            if (not isinstance(record, dict) or record.get("plan_sha256") != plan_digest(parameters)
+                or record.get("files") != parameters["recovery_guard"]["files"]
+                or not isinstance(record.get("transaction_id"), str)
+                or record.get("transaction_id") != pre_state.get("transaction_id")):
+                raise ValueError("service repair lacks exact plan and file attestations")
     elif action_type == "validate_service":
         probes = result.get("probes")
         if not isinstance(probes, list) or not probes or any(
@@ -1551,7 +1570,8 @@ class Store:
                 "WHEN 'queued' THEN ? ELSE NULL END, result_json=?, "
                 "result_source='controller' WHERE agent_id=? "
                 "AND action_type IN ('restore_integrity','rollback_integrity',"
-                "'capture_restore_point') AND status IN ('queued','dispatched')",
+                "'capture_restore_point','restart_service','repair_service','rollback_service_repair') "
+                "AND status IN ('queued','dispatched')",
                 (now, ACTION_STORAGE_QUARANTINED_RESULT, row_key),
             )
             return
@@ -2019,6 +2039,11 @@ class Store:
         freshness_seconds: float = 90.0,
         validate_current_telemetry: bool = False,
     ) -> dict[str, Any] | None:
+        # Local relay observations never carry remote-agent authority. Their
+        # intentionally unbound row must not quarantine the entire controller.
+        # HTTP enrollment and authentication reject this reserved identity.
+        if agent_id == "sentinel-relay-probes":
+            return None
         with self._lock:
             row = self._connection.execute(
                 """
@@ -2737,6 +2762,8 @@ class Store:
         strict: bool,
         allowed_modes: set[str] | frozenset[str] | None = None,
         force_safe: bool = False,
+        unclean_shutdown: bool = False,
+        resume_after_crash: bool = False,
     ) -> dict[str, Any]:
         """Load profile-bound governance; missing/corrupt strict state is stopped."""
         admitted_modes = frozenset(allowed_modes or GOVERNANCE_MODES)
@@ -2748,6 +2775,9 @@ class Store:
             row = self._connection.execute(
                 "SELECT state_value FROM controller_state WHERE state_key='governance'"
             ).fetchone()
+            transition_pending = self._connection.execute(
+                "SELECT 1 FROM controller_state WHERE state_key='governance_transition_intent'"
+            ).fetchone() is not None
             value: Any = None
             if row is not None:
                 try:
@@ -2770,8 +2800,19 @@ class Store:
                 and type(value.get("revision")) is int
                 and 0 <= value["revision"] <= 2**63 - 1
             )
-            if valid and not force_safe:
-                self._connection.rollback()
+            if valid and not transition_pending and not force_safe and (not unclean_shutdown or resume_after_crash):
+                if unclean_shutdown:
+                    self._connection.execute(
+                        """INSERT INTO audit_log(audit_id, actor, operation, subject,
+                           detail_json, created_at)
+                           VALUES(?, 'controller', 'governance_crash_resume', ?, ?, ?)""",
+                        (str(uuid.uuid4()), profile_fingerprint,
+                         canonical_json_dumps({"revision": value["revision"],
+                                               "emergency_stopped": value["emergency_stopped"]}), now),
+                    )
+                    self._connection.commit()
+                else:
+                    self._connection.rollback()
                 return dict(value)
             prior_revision = (
                 int(value["revision"])
@@ -2783,8 +2824,8 @@ class Store:
             safe = {
                 "schema": 1,
                 "profile_fingerprint": profile_fingerprint,
-                "autonomy_mode": "observe" if strict or force_safe else safe_default,
-                "emergency_stopped": bool(strict or force_safe),
+                "autonomy_mode": "observe" if strict or force_safe or unclean_shutdown or transition_pending else safe_default,
+                "emergency_stopped": bool(strict or force_safe or unclean_shutdown or transition_pending),
                 "revision": min(2**63 - 1, prior_revision + 1),
             }
             self._connection.execute(
@@ -2825,12 +2866,17 @@ class Store:
                     canonical_json_dumps(
                         {
                             "force_safe": bool(force_safe),
+                            "unclean_shutdown": bool(unclean_shutdown),
                             "prior_valid": bool(valid),
+                            "transition_pending": transition_pending,
                             "revision": safe["revision"],
                         }
                     ),
                     now,
                 ),
+            )
+            self._connection.execute(
+                "DELETE FROM controller_state WHERE state_key='governance_transition_intent'"
             )
             self._connection.commit()
             return safe
@@ -2857,6 +2903,26 @@ class Store:
             "revision": int(expected_revision) + 1,
         }
         with self._lock:
+            # Persist intent in its own transaction before changing authority.
+            # A crash/failed commit in the second transaction must never restore
+            # an older permissive mode as if the transition had not started.
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                if self._connection.execute(
+                    "SELECT 1 FROM controller_state WHERE state_key='governance_transition_intent'"
+                ).fetchone():
+                    raise RuntimeError("an interrupted governance transition requires safe recovery")
+                self._connection.execute(
+                    """INSERT INTO controller_state(state_key, state_value, updated_at)
+                       VALUES('governance_transition_intent', ?, ?)""",
+                    (canonical_json_dumps({"profile_fingerprint": profile_fingerprint,
+                                           "expected_revision": expected_revision}), time.time()),
+                )
+                self._connection.commit()
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                raise
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 now = time.time()
@@ -2893,6 +2959,9 @@ class Store:
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("governance state changed concurrently")
+                self._connection.execute(
+                    "DELETE FROM controller_state WHERE state_key='governance_transition_intent'"
+                )
                 self._connection.execute(
                     """
                     UPDATE actions SET
@@ -2937,7 +3006,7 @@ class Store:
                     self._connection.rollback()
                 raise
 
-    def force_safe_governance(self, profile_fingerprint: str) -> None:
+    def force_safe_governance(self, profile_fingerprint: str) -> dict[str, Any]:
         """Best-effort independent fail-safe used after a governance write error."""
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -3011,7 +3080,11 @@ class Store:
                         time.time(),
                     ),
                 )
+                self._connection.execute(
+                    "DELETE FROM controller_state WHERE state_key='governance_transition_intent'"
+                )
                 self._connection.commit()
+                return safe
             except Exception:
                 if self._connection.in_transaction:
                     self._connection.rollback()
@@ -6611,7 +6684,7 @@ class Store:
                 "source": session.get("source"),
                 "session_id": session.get("session_id"),
             }
-        elif candidate.kind == "baseline_service_stopped":
+        elif candidate.kind in {"baseline_service_stopped", "service_repair_required"}:
             semantic = {"service": evidence.get("service")}
         elif candidate.kind == "critical_file_changed":
             semantic = {
@@ -6815,7 +6888,7 @@ class Store:
                     """
                     SELECT alert_id FROM alerts
                     WHERE agent_id=? AND fingerprint=? AND decided_at IS NOT NULL AND decided_at>?
-                      AND COALESCE(decision, '')!='automatic_restore'
+                      AND COALESCE(decision, '') NOT IN ('automatic_restore','automatic_service_recovery')
                     ORDER BY decided_at DESC LIMIT 1
                     """,
                     (agent_id, fingerprint, now - 900),
@@ -7911,6 +7984,68 @@ class Store:
             self._connection.commit()
             return changed
 
+    def _service_recovery_budget_locked(self, agent_id: str, service: str, now: float) -> str | None:
+        return self._service_recovery_budget_status_locked(agent_id, service, now)["reason"]
+
+    def service_recovery_budget_status(self, agent_id: str, service: str) -> dict[str, Any]:
+        """Describe the same durable admission gate used when queueing a restart."""
+        with self._lock:
+            return self._service_recovery_budget_status_locked(agent_id, service, time.time())
+
+    def _service_recovery_budget_status_locked(self, agent_id: str, service: str, now: float) -> dict[str, Any]:
+        from .service_recovery import (
+            RECOVERY_COOLDOWN_SECONDS, RECOVERY_WINDOW_SECONDS, RECOVERY_MAX_ATTEMPTS,
+        )
+
+        attempts: list[float] = []
+
+        def result(reason: str | None, retry_at: float | None = None) -> dict[str, Any]:
+            return {
+                "allowed": reason is None,
+                "reason": reason,
+                "attempts_in_window": len(attempts),
+                "maximum_attempts": RECOVERY_MAX_ATTEMPTS,
+                "window_seconds": RECOVERY_WINDOW_SECONDS,
+                "cooldown_seconds": RECOVERY_COOLDOWN_SECONDS,
+                "retry_at": retry_at,
+            }
+
+        rows = self._connection.execute(
+            """
+            SELECT action_id, action_type, parameters_json, status, created_at
+            FROM actions WHERE agent_id=?
+              AND action_type IN ('restart_service','rollback_service','repair_service','rollback_service_repair')
+              AND (created_at>? OR status IN ('queued','dispatched','outcome_unknown'))
+            ORDER BY created_at DESC LIMIT 1025
+            """, (agent_id, now - RECOVERY_WINDOW_SECONDS),
+        ).fetchall()
+        if len(rows) > 1024:
+            return result("service_recovery_history_budget_exceeded")
+        for row in rows:
+            parameters = self._decode_stored_json(
+                row["parameters_json"], table_name="actions", row_key=str(row["action_id"]),
+                column_name="parameters_json", expected_type=dict,
+            )
+            if parameters is None:
+                return result("service_recovery_history_unreadable")
+            if str(parameters.get("service", "")).casefold() != service.casefold():
+                continue
+            if row["status"] in {"queued", "dispatched", "outcome_unknown"}:
+                return result("service_recovery_prior_outcome_unresolved")
+            if row["action_type"] in {"restart_service", "repair_service"}:
+                attempts.append(float(row["created_at"]))
+        if len(attempts) >= RECOVERY_MAX_ATTEMPTS:
+            # More than the automatic allowance may exist after manual work.
+            # Wait until enough entries expire, not merely the oldest entry.
+            retry_at = max(
+                sorted(attempts)[-RECOVERY_MAX_ATTEMPTS] + RECOVERY_WINDOW_SECONDS,
+                max(attempts) + RECOVERY_COOLDOWN_SECONDS,
+            )
+            return result("service_recovery_hourly_budget_exhausted", retry_at)
+        if attempts and now - max(attempts) < RECOVERY_COOLDOWN_SECONDS:
+            return result("service_recovery_cooldown", max(attempts) + RECOVERY_COOLDOWN_SECONDS)
+        return result(None)
+
     def queue_action(
         self,
         agent_id: str,
@@ -8122,7 +8257,9 @@ class Store:
                 ).fetchone()
                 if existing:
                     existing_id = str(existing["action_id"])
-            if existing_id is None:
+            if existing_id is None and automated and action_type in {"restart_service", "repair_service"}:
+                quota_reason = self._service_recovery_budget_locked(agent_id, parameters["service"], now)
+            if existing_id is None and quota_reason is None:
                 counts = self._connection.execute(
                     """
                     SELECT COUNT(*) AS total,
@@ -9310,13 +9447,17 @@ class Store:
                 success_restore = (
                     normalized_result["success"] is True
                     and normalized_result.get("dry_run") is not True
-                    and row["action_type"] == "restore_integrity"
+                    and (row["action_type"] == "restore_integrity" or (
+                        row["action_type"] in {"restart_service", "repair_service"} and row["automated"] == 1
+                        and "recovery_guard" in parameters
+                    ))
                     and bool(row["alert_id"])
                     and binding_current
                 )
                 if success_restore:
                     clauses = ""
-                    values: list[Any] = [now, row["alert_id"], row["agent_id"]]
+                    decision = "automatic_service_recovery" if row["action_type"] in {"restart_service", "repair_service"} else "automatic_restore"
+                    values: list[Any] = [decision, now, row["alert_id"], row["agent_id"]]
                     if bound:
                         clauses = (
                             " AND credential_epoch=? AND profile_id=? "
@@ -9333,7 +9474,7 @@ class Store:
                     self._connection.execute(
                         """
                         UPDATE alerts SET status='decided',
-                          decision='automatic_restore', decided_at=?
+                          decision=?, decided_at=?
                         WHERE alert_id=? AND agent_id=? AND status='open'
                         """
                         + clauses,

@@ -1,0 +1,24 @@
+{
+  "version": "1.9.43",
+  "runtime_sha256": "80a67e8a8eefe6e3033879b839c2eefa2c3dca796953cea5c6f441abafcc92aa",
+  "commit": "ba01e4a9dd89ed8d110155c5a30bba89b421f698",
+  "workflow_url": "https://github.com/joshua08271/Sentinel-Blue/actions/runs/34659310009",
+  "linux": {
+    "run": 218,
+    "passed": 216,
+    "skipped": 2,
+    "seconds": 20.692
+  },
+  "windows": {
+    "run": 49,
+    "passed": 49,
+    "skipped": 0,
+    "seconds": 6.485
+  },
+  "native_windows_file_handles": "passed",
+  "native_windows_inert_process_provider": "passed",
+  "packaged_lifecycle": "passed",
+  "agent_transport": "passed",
+  "http_readiness_deadlines": "passed",
+  "scope": "GitHub Actions, separate from Azure guest acceptance"
+}

@@ -28,12 +28,22 @@ from .process_identity import (
 from .restoration import RestorePointStore
 from .state import read_private_json, remove_private_file, write_private_json
 from .validation import validate_telemetry
+from .service_recovery import (
+    RECOVERY_COOLDOWN_SECONDS,
+    RECOVERY_WINDOW_SECONDS,
+    RECOVERY_MAX_ATTEMPTS,
+    check_recovery_observation,
+)
 
 
 SERVICE_NAME = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
 MAX_SNAPSHOTS = 256
 MAX_SERVICE_TRANSACTIONS = 256
 MAX_QUARANTINE_TTL = 3600.0
+SERVICE_RECOVERY_VALIDATION_GRACE_SECONDS = 5.0
+SERVICE_RECOVERY_MAX_PROBE_ATTEMPTS = 20
+SERVICE_RECOVERY_PROBE_INTERVAL_SECONDS = 0.25
+SERVICE_RECOVERY_HEALTHY_CONFIRMATIONS = 3
 
 
 class ActionExecutor:
@@ -47,6 +57,8 @@ class ActionExecutor:
         default_probes: list[dict[str, Any]] | None = None,
         authorized_hosts: list[str] | tuple[str, ...] | None = None,
         excluded_hosts: list[str] | tuple[str, ...] | None = None,
+        allow_service_recovery: bool | None = None,
+        profile_fingerprint: str = "",
     ):
         if (
             type(quarantine_ttl) not in {int, float}
@@ -56,6 +68,11 @@ class ActionExecutor:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.allow_containment = allow_containment
+        # Preserve the pre-1.9.17 Python API contract. Deployable CLI callers
+        # always pass an explicit independent service permission.
+        self.allow_service_recovery = (
+            allow_containment if allow_service_recovery is None else allow_service_recovery
+        )
         self.authorized_networks = authorized_networks or []
         self.authorized_hosts = list(authorized_hosts or [])
         self.excluded_hosts = list(excluded_hosts or [])
@@ -64,6 +81,7 @@ class ActionExecutor:
         )
         self.quarantine_file = self.state_dir / "quarantine.json"
         self.allow_restoration = allow_restoration
+        self.repair_profile_fingerprint = profile_fingerprint
         self.default_probes = default_probes or []
         self.restore_points = RestorePointStore(
             self.state_dir,
@@ -74,6 +92,12 @@ class ActionExecutor:
         self.restore_recovery = self.restore_points.recover_incomplete()
         self.quarantine_recovery = self._recover_incomplete_quarantines()
         self.service_recovery = self._recover_incomplete_service_transactions()
+        from .service_repair_executor import ServiceRepairExecutor
+        self.repairs = ServiceRepairExecutor(self)
+        self.repair_recovery = self.repairs.reconcile()
+        self.service_recovery["unresolved"].extend(self.repair_recovery["unresolved"])
+        self.service_recovery["recovered"].extend(self.repair_recovery["recovered"])
+        self.service_recovery["healthy"] = not self.service_recovery["unresolved"]
 
     def refresh_restore_recovery(self) -> dict[str, Any]:
         """Re-evaluate restoration transactions after in-process mutations."""
@@ -122,6 +146,10 @@ class ActionExecutor:
         """Re-evaluate service transactions after in-process mutations."""
         try:
             self.service_recovery = self._recover_incomplete_service_transactions()
+            self.repair_recovery = self.repairs.reconcile()
+            self.service_recovery["unresolved"].extend(self.repair_recovery["unresolved"])
+            self.service_recovery["recovered"].extend(self.repair_recovery["recovered"])
+            self.service_recovery["healthy"] = not self.service_recovery["unresolved"]
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.service_recovery = {
                 "healthy": False,
@@ -204,7 +232,15 @@ class ActionExecutor:
         if action_type == "release_quarantine":
             return self._release(parameters, started, current_telemetry)
         if action_type == "restart_service":
+            try:
+                validate_action_parameters(action_type, parameters)
+                if "recovery_guard" in parameters:
+                    check_recovery_observation(parameters, current_telemetry)
+            except (KeyError, TypeError, ValueError) as exc:
+                return self._result(action_type, False, f"service recovery held: {exc}", started)
             return self._restart_service(parameters, started)
+        if action_type in {"repair_service", "rollback_service_repair"}:
+            return self.repairs.execute(action_type, parameters, current_telemetry, started)
         if action_type == "rollback_service":
             return self._rollback_service(parameters, started)
         if action_type == "validate_service":
@@ -736,25 +772,35 @@ class ActionExecutor:
         signal_verified_process(process_id, expected_identity, "resume")
 
     def _service_state(self, service: str) -> str:
-        if not SERVICE_NAME.fullmatch(service):
+        if not SERVICE_NAME.fullmatch(service) or service.startswith("-"):
             raise ValueError("invalid service name")
         if platform.system().casefold() == "windows":
             result = subprocess.run(
                 ["sc.exe", "query", service], text=True, capture_output=True, timeout=12, check=False
             )
-            output = result.stdout.casefold()
-            if "running" in output:
-                return "running"
-            if "stopped" in output:
-                return "stopped"
+            if result.returncode == 0:
+                # Match the numeric service state, not an arbitrary service
+                # name containing 'running' or 'stopped'.
+                match = re.search(r"^\s*STATE\s*:\s*([1-7])\s", result.stdout, re.MULTILINE)
+                if match:
+                    return {"1": "stopped", "4": "running"}.get(match[1], "unknown")
             return "unknown"
         result = subprocess.run(
-            ["systemctl", "is-active", service], text=True, capture_output=True, timeout=12, check=False
+            ["systemctl", "show", "--property=LoadState", "--property=ActiveState", service],
+            text=True, capture_output=True, timeout=12, check=False
         )
-        return "running" if result.stdout.strip() == "active" else "stopped"
+        properties = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if result.returncode != 0 or properties.get("LoadState") != "loaded":
+            return "unknown"
+        state = properties.get("ActiveState")
+        if state == "active":
+            return "running"
+        if state in {"inactive", "failed"}:
+            return "stopped"
+        return "unknown"
 
     def _set_service_state(self, service: str, desired: str) -> None:
-        if not SERVICE_NAME.fullmatch(service):
+        if not SERVICE_NAME.fullmatch(service) or service.startswith("-"):
             raise ValueError("invalid service name")
         if platform.system().casefold() == "windows":
             if desired == "running":
@@ -767,11 +813,98 @@ class ActionExecutor:
         if result.returncode != 0:
             raise OSError(result.stderr.strip() or result.stdout.strip() or "service command failed")
 
+    def _wait_for_service_probes(
+        self, probe_specs: list[dict[str, Any]], *, grace_seconds: int | None = None
+    ) -> tuple[list[Any], int, bool]:
+        """Require a stable run of healthy application checks within a grace."""
+
+        if not probe_specs:
+            return [], 0, True
+        grace = SERVICE_RECOVERY_VALIDATION_GRACE_SECONDS if grace_seconds is None else grace_seconds
+        deadline = time.monotonic() + grace
+        maximum = SERVICE_RECOVERY_MAX_PROBE_ATTEMPTS if grace_seconds is None else 64
+        interval = SERVICE_RECOVERY_PROBE_INTERVAL_SECONDS if grace_seconds is None else max(0.25, grace / 60)
+        results: list[Any] = []
+        attempts = 0
+        healthy_count = 0
+        while attempts < maximum:
+            attempts += 1
+            results = run_probes(
+                probe_specs,
+                self.authorized_networks,
+                authorized_hosts=self.authorized_hosts,
+                excluded_hosts=self.excluded_hosts,
+            )
+            if len(results) == len(probe_specs) and all(
+                item.healthy for item in results
+            ):
+                healthy_count += 1
+                if healthy_count >= SERVICE_RECOVERY_HEALTHY_CONFIRMATIONS:
+                    return results, attempts, True
+            else:
+                healthy_count = 0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
+        return results, attempts, False
+
+    def _service_recovery_preflight(self, parameters: dict[str, Any], *,
+                                    skip_paths: tuple[str, ...] = (), ignore_transaction_id: str | None = None) -> None:
+        guard = parameters.get("recovery_guard")
+        if guard is None:
+            return
+        now = time.time()
+        records = list(self.state_dir.glob("service-transaction-*.json")) + list(self.state_dir.glob("service-repair-*.json"))
+        if len(records) > 1024:
+            raise ValueError("service recovery history exceeds its inspection budget")
+        attempts = []
+        for path in records:
+            item = read_private_json(path, 1024 * 1024)
+            if not isinstance(item, dict):
+                raise ValueError("invalid service recovery history")
+            if ignore_transaction_id is not None and item.get("transaction_id") == ignore_transaction_id:
+                continue
+            if str(item.get("service", "")).casefold() != parameters["service"].casefold():
+                continue
+            if item.get("status") not in {"committed", "rolled_back", "recovered"}:
+                raise ValueError("an earlier service action has an unresolved outcome")
+            created = item.get("created_at")
+            if type(created) not in {int, float} or not math.isfinite(created):
+                raise ValueError("invalid service recovery history timestamp")
+            if item.get("operation") in {"restart_service", "repair_service"} and now - created < RECOVERY_WINDOW_SECONDS:
+                attempts.append(created)
+        if len(attempts) >= RECOVERY_MAX_ATTEMPTS:
+            raise ValueError("service recovery hourly attempt budget exhausted")
+        if attempts and now - max(attempts) < RECOVERY_COOLDOWN_SECONDS:
+            raise ValueError("service recovery cooldown is active")
+        for dependency in guard["dependencies"]:
+            if self._service_state(dependency) != "running":
+                raise ValueError(f"dependency stopped before execution: {dependency}")
+        if guard["dependency_probes"]:
+            results = run_probes(guard["dependency_probes"], self.authorized_networks,
+                                 authorized_hosts=self.authorized_hosts,
+                                 excluded_hosts=self.excluded_hosts)
+            if len(results) != len(guard["dependency_probes"]) or not all(item.healthy for item in results):
+                raise ValueError("dependency health failed before execution")
+        # Read current bytes from pinned native file handles immediately before
+        # starting the service; telemetry alone is not a preflight attestation.
+        for item in guard["files"]:
+            if item["path"] in skip_paths:
+                continue
+            path = Path(item["path"])
+            data, metadata = self.restore_points._read_target(path)
+            if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise ValueError(f"required file changed before execution: {path}")
+            security = self.restore_points._metadata_security_descriptor_sha256(metadata)
+            if security != item["security_descriptor_sha256"]:
+                raise ValueError(f"required file security changed before execution: {path}")
+
     def _restart_service(self, parameters: dict[str, Any], started: float) -> dict[str, Any]:
         service = str(parameters.get("service", ""))
         if not SERVICE_NAME.fullmatch(service):
             return self._result("restart_service", False, "invalid or missing service name", started)
-        if not self.allow_containment:
+        if not self.allow_service_recovery:
             return self._result(
                 "restart_service", True, f"dry run: would start {service}", started, dry_run=True
             )
@@ -781,6 +914,20 @@ class ActionExecutor:
             return self._result(
                 "restart_service", False, f"service state inspection failed: {exc}", started
             )
+        if before not in {"running", "stopped"}:
+            return self._result("restart_service", False, "unknown native service state holds recovery", started)
+        if before == "running":
+            probes, attempts, healthy = self._wait_for_service_probes(list(parameters.get("probes", [])))
+            return self._result(
+                "restart_service", healthy, "service already running; validation only", started,
+                pre_state={"service": service, "desired_state": before},
+                probes=[asdict(item) for item in probes], probe_attempts=attempts,
+                stable_health=healthy,
+            )
+        try:
+            self._service_recovery_preflight(parameters)
+        except (OSError, KeyError, TypeError, ValueError, subprocess.TimeoutExpired) as exc:
+            return self._result("restart_service", False, f"service recovery held: {exc}", started)
         transaction = {
             "transaction_id": str(uuid.uuid4()),
             "operation": "restart_service",
@@ -800,14 +947,9 @@ class ActionExecutor:
             )
         try:
             self._set_service_state(service, "running")
-            probes = run_probes(
-                list(parameters.get("probes", [])),
-                self.authorized_networks,
-                authorized_hosts=self.authorized_hosts,
-                excluded_hosts=self.excluded_hosts,
-            )
+            probe_specs = list(parameters.get("probes", []))
+            probes, probe_attempts, probes_ok = self._wait_for_service_probes(probe_specs)
             state_ok = self._service_state(service) == "running"
-            probes_ok = not probes or all(item.healthy for item in probes)
             if not state_ok or not probes_ok:
                 self._set_service_state(service, before if before in {"running", "stopped"} else "stopped")
                 transaction["status"] = "rolled_back"
@@ -821,6 +963,7 @@ class ActionExecutor:
                     started,
                     rolled_back=True,
                     probes=[asdict(item) for item in probes],
+                    probe_attempts=probe_attempts,
                 )
             transaction["status"] = "committed"
             transaction["completed_at"] = time.time()
@@ -833,6 +976,8 @@ class ActionExecutor:
                 started,
                 pre_state={"service": service, "desired_state": before},
                 probes=[asdict(item) for item in probes],
+                probe_attempts=probe_attempts,
+                stable_health=probes_ok,
             )
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             try:
@@ -861,7 +1006,7 @@ class ActionExecutor:
         desired = str(parameters.get("desired_state", ""))
         if not SERVICE_NAME.fullmatch(service) or desired not in {"running", "stopped"}:
             return self._result("rollback_service", False, "invalid service rollback state", started)
-        if not self.allow_containment:
+        if not self.allow_service_recovery:
             return self._result(
                 "rollback_service",
                 True,

@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import hashlib
+import fnmatch
 import os
 import platform
 import re
 import socket
+import stat
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +45,66 @@ from .protocol import (
     Telemetry,
 )
 from .process_identity import inspect_process_identity
+from .windows_queries import WINDOWS_QUERIES
+from .windows_query_batch import QueryResult, decode_rows, read_query_batch
 
 MAX_WINDOWS_INTEGRITY_FILE_BYTES = 32 * 1024 * 1024
+MAX_WINDOWS_INTEGRITY_TOTAL_BYTES = 128 * 1024 * 1024
+WINDOWS_INTEGRITY_BUDGET_SECONDS = 10.0
+MAX_INTEGRITY_PATHS = 256
+MAX_INTEGRITY_DISCOVERY_ENTRIES = 4096
+MAX_POSIX_INTEGRITY_FILE_BYTES = 32 * 1024 * 1024
+MAX_POSIX_INTEGRITY_TOTAL_BYTES = 128 * 1024 * 1024
+POSIX_INTEGRITY_BUDGET_SECONDS = 10.0
+WINDOWS_INVENTORY_BUDGET_SECONDS = 75.0
+_windows_deadline: ContextVar[float | None] = ContextVar("windows_inventory_deadline", default=None)
+_windows_query_cache: ContextVar[Any] = ContextVar("windows_inventory_queries", default=None)
+
+
+class _WindowsQueryCache:
+    """One lazy native snapshot, discarded at the end of this collection."""
+    def __init__(self, deadline: float):
+        self.deadline = deadline
+        self.results: dict[str, QueryResult] | None = None
+        self.lock = threading.Lock()
+
+    def read(self, script: str) -> list[dict[str, Any]]:
+        name = next((name for name, body in WINDOWS_QUERIES.items() if body == script), None)
+        if name is None:
+            raise RuntimeError("query is outside this Windows inventory snapshot")
+        with self.lock:
+            if self.results is None:
+                self.results = read_query_batch(self.deadline)
+        record = self.results.get(name)
+        if record is None or record.error:
+            raise RuntimeError(record.error if record else "Windows inventory section did not complete")
+        if time.monotonic() >= self.deadline:
+            raise RuntimeError("Windows inventory query completed after its collection budget")
+        return record.rows
+
+
+@contextmanager
+def _windows_query_snapshot():
+    deadline = _windows_deadline.get()
+    if deadline is None:
+        raise RuntimeError("Windows snapshot requires the original inventory deadline")
+    token = _windows_query_cache.set(_WindowsQueryCache(deadline))
+    try:
+        yield
+    finally:
+        _windows_query_cache.reset(token)
+
+
+@contextmanager
+def _windows_inventory_budget():
+    """Share one finite query budget without carrying state into the next cycle."""
+    current = _windows_deadline.get()
+    deadline = current if current is not None else time.monotonic() + WINDOWS_INVENTORY_BUDGET_SECONDS
+    token = _windows_deadline.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _windows_deadline.reset(token)
 
 
 def _run(command: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
@@ -51,7 +114,12 @@ def _run(command: list[str], timeout: float = 8.0) -> subprocess.CompletedProces
         capture_output=True,
         timeout=timeout,
         check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        # Avoid inheriting a background task's below-normal scheduling class.
+        # Normal priority still shares the CPU with the applications we monitor.
+        creationflags=(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0)
+        ),
     )
 
 
@@ -87,7 +155,11 @@ def _linux_accounts() -> list[Account]:
             Account(
                 name=entry.pw_name,
                 account_id=str(entry.pw_uid),
-                privileged=entry.pw_uid == 0 or entry.pw_name in privileged_names,
+                privileged=(
+                    entry.pw_uid == 0
+                    or entry.pw_name in privileged_names
+                    or bool(set(groups) & {"sudo", "wheel", "admin"})
+                ),
                 enabled=not disabled_shell,
                 source="local",
                 groups=groups,
@@ -148,6 +220,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
             "--no-legend",
             "--no-pager",
             "--plain",
+            "--full",
         ],
         timeout=15,
     )
@@ -155,6 +228,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
         errors.append("systemctl service inventory unavailable")
         return []
     start_modes: dict[str, str] = {}
+    installed_names: list[str] = []
     try:
         unit_files = _run(
             [
@@ -164,6 +238,7 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 "--no-legend",
                 "--no-pager",
                 "--plain",
+                "--full",
             ],
             timeout=15,
         )
@@ -172,6 +247,9 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 fields = line.split()
                 if len(fields) >= 2:
                     start_modes[fields[0]] = fields[1]
+                    installed_names.append(fields[0])
+        else:
+            errors.append("systemctl service startup inventory unavailable")
     except (OSError, subprocess.TimeoutExpired):
         errors.append("systemctl service startup inventory unavailable")
     parsed: list[tuple[str, str, str]] = []
@@ -208,8 +286,20 @@ def _linux_services(errors: list[str]) -> list[Service]:
                 errors.append("systemctl service failure metadata unavailable")
         except (OSError, subprocess.TimeoutExpired):
             errors.append("systemctl service failure metadata unavailable")
+    # systemd may garbage-collect a stopped static unit from list-units even
+    # while its unit file remains installed.  Preserve those identities so a
+    # baseline service cannot disappear from telemetry at the moment it stops.
+    # Do not include unloaded names in the batched `systemctl show`: some valid
+    # alias and generated unit-file entries make that command return nonzero.
+    loaded_names = {name for name, _active, _substate in parsed}
+    if len(loaded_names | set(installed_names)) > 2000:
+        errors.append("Linux service inventory exceeded its 2000-entry limit; coverage is incomplete")
+    for name in installed_names:
+        if name not in loaded_names and len(parsed) < 2000:
+            parsed.append((name, "inactive", "dead"))
+            loaded_names.add(name)
     services: list[Service] = []
-    for name, active, substate in parsed:
+    for name, active, substate in parsed[:2000]:
         detail = details.get(name, {})
         raw_exit = detail.get("ExecMainStatus", "")
         services.append(
@@ -237,27 +327,41 @@ def _linux_services(errors: list[str]) -> list[Service]:
     return services[:2000]
 
 
-def _windows_json(script: str) -> Any:
-    result = _run(
-        ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-        timeout=20,
-    )
+def _windows_json(script: str, timeout: float = 60.0) -> Any:
+    deadline = _windows_deadline.get()
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Windows inventory query budget exhausted")
+        timeout = min(timeout, remaining)
+    cache = _windows_query_cache.get()
+    if cache is not None:
+        return cache.read(script)
+    try:
+        result = _run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+             "$ErrorActionPreference = 'Stop'\n" + script],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"PowerShell collector timed out after {timeout:g} seconds") from exc
+    if deadline is not None and time.monotonic() > deadline:
+        raise RuntimeError("Windows inventory query completed after its collection budget")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "PowerShell command failed")
-    if not result.stdout.strip():
-        return []
-    value = json.loads(result.stdout)
-    return value if isinstance(value, list) else [value]
+    if result.stderr.strip():
+        # PowerShell can exit successfully after a non-terminating error and
+        # still emit partial JSON. Never turn that into a complete observation.
+        raise RuntimeError("PowerShell collector reported errors: " + result.stderr.strip())
+    return decode_rows(result.stdout)
 
 
 def _windows_accounts(errors: list[str]) -> list[Account]:
-    script = r"""
-$admins = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object {$_.Name.Split('\\')[-1]})
-Get-LocalUser | ForEach-Object {
-  [PSCustomObject]@{Name=$_.Name; SID=$_.SID.Value; Enabled=$_.Enabled; Privileged=($admins -contains $_.Name)}
-} | ConvertTo-Json -Compress
-"""
+    script = WINDOWS_QUERIES["ACCOUNTS"]
     try:
+        rows = _windows_json(script)
+        if not rows:
+            raise ValueError("Windows account inventory returned no records")
         return [
             Account(
                 name=str(item.get("Name", "unknown")),
@@ -267,7 +371,7 @@ Get-LocalUser | ForEach-Object {
                 source="local",
                 groups=["Administrators"] if bool(item.get("Privileged")) else [],
             )
-            for item in _windows_json(script)
+            for item in rows
         ]
     except Exception as exc:
         errors.append(f"Windows account inventory failed: {exc}")
@@ -275,18 +379,11 @@ Get-LocalUser | ForEach-Object {
 
 
 def _windows_services(errors: list[str]) -> list[Service]:
-    script = r"""
-$restartFailures = @{}
-$since = (Get-Date).AddMinutes(-15)
-Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Service Control Manager';Id=7031,7034;StartTime=$since} -MaxEvents 512 -ErrorAction SilentlyContinue | ForEach-Object {
-  if ($_.Properties.Count -gt 0) { $key = [string]$_.Properties[0].Value; $restartFailures[$key] = 1 + [int]$restartFailures[$key] }
-}
-Get-CimInstance Win32_Service | ForEach-Object {
-  $count = [int]$restartFailures[$_.Name] + [int]$restartFailures[$_.DisplayName]
-  [PSCustomObject]@{Name=$_.Name;State=$_.State;StartMode=$_.StartMode;Status=$_.Status;ExitCode=$_.ExitCode;RestartCount=$count}
-} | ConvertTo-Json -Compress
-"""
+    script = WINDOWS_QUERIES["SERVICES"]
     try:
+        rows = _windows_json(script)
+        if not rows:
+            raise ValueError("Windows service inventory returned no records")
         return [
             Service(
                 name=str(item.get("Name", "unknown")),
@@ -301,25 +398,20 @@ Get-CimInstance Win32_Service | ForEach-Object {
                 restart_count=max(0, int(item.get("RestartCount", 0) or 0)),
                 exit_code=max(0, int(item.get("ExitCode", 0) or 0)),
             )
-            for item in _windows_json(script)
+            for item in rows
         ]
     except Exception as exc:
         errors.append(f"Windows service inventory failed: {exc}")
         return []
 
 
-def _windows_sessions(accounts: list[Account], errors: list[str]) -> list[Session]:
+def _windows_sessions(accounts: list[Account], errors: list[str], *, boot_id: str | None = None) -> list[Session]:
     privileged = {account.name.casefold() for account in accounts if account.privileged}
-    script = r"""
-$names = @('powershell','pwsh','cmd','WindowsTerminal','ssh','sshd','wsmprovhost')
-Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
-  Where-Object { $names -contains $_.ProcessName } |
-  Select-Object Id,ProcessName,SessionId,UserName |
-  ConvertTo-Json -Compress
-"""
+    script = WINDOWS_QUERIES["SESSIONS"]
     try:
         sessions: list[Session] = []
-        boot_id = _boot_id("windows")
+        if boot_id is None:
+            boot_id = _boot_id("windows")
         for item in _windows_json(script):
             raw_user = str(item.get("UserName", ""))
             username = raw_user.split("\\")[-1] if raw_user else "unknown"
@@ -386,10 +478,7 @@ def _linux_interfaces(errors: list[str]) -> list[Interface]:
 
 
 def _windows_interfaces(errors: list[str]) -> list[Interface]:
-    script = (
-        "Get-NetIPAddress | Where-Object {$_.AddressState -ne 'Tentative'} | "
-        "Select InterfaceAlias,IPAddress,PrefixLength | ConvertTo-Json -Compress"
-    )
+    script = WINDOWS_QUERIES["INTERFACES"]
     try:
         grouped: dict[str, set[str]] = {}
         for row in _windows_json(script):
@@ -480,10 +569,38 @@ def _linux_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], lis
 
 
 def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], list[Listener]]:
+    # Reuse one PowerShell host and its network module for the related queries.
+    # Each section retains an explicit error so a partial batch cannot look fresh
+    # and complete merely because the enclosing process exited successfully.
+    script = WINDOWS_QUERIES["TOPOLOGY"]
     try:
-        route_rows = _windows_json(
-            "Get-NetRoute | Select DestinationPrefix,NextHop,InterfaceAlias,RouteMetric | ConvertTo-Json -Compress"
-        )
+        batch = _windows_json(script)
+        if len(batch) != 1 or not isinstance(batch[0], dict):
+            raise ValueError("incomplete topology batch")
+        state = batch[0]
+        sections = {"Routes", "Neighbors", "Listeners"}
+        if state.get("Schema") != 1 or not sections.issubset(state):
+            raise ValueError("incomplete topology sections")
+        failures = state.get("Errors")
+        if (
+            not isinstance(failures, dict)
+            or not set(failures).issubset(sections)
+            or any(not isinstance(value, str) or not value for value in failures.values())
+        ):
+            raise ValueError("invalid topology error records")
+    except Exception as exc:
+        errors.append(f"Windows topology inventory failed: {exc}")
+        return [], [], []
+
+    def rows_for(section: str) -> list[dict[str, Any]]:
+        if section in failures:
+            raise RuntimeError(failures[section])
+        rows = state[section]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"incomplete topology section: {section}")
+        return rows
+
+    try:
         routes = [
             Route(
                 destination=str(row.get("DestinationPrefix", "")),
@@ -491,15 +608,12 @@ def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], l
                 interface=str(row.get("InterfaceAlias", "")),
                 metric=int(row["RouteMetric"]) if row.get("RouteMetric") is not None else None,
             )
-            for row in route_rows
+            for row in rows_for("Routes")
         ]
     except Exception as exc:
         errors.append(f"Windows route inventory failed: {exc}")
         routes = []
     try:
-        neighbor_rows = _windows_json(
-            "Get-NetNeighbor | Select IPAddress,LinkLayerAddress,InterfaceAlias,State | ConvertTo-Json -Compress"
-        )
         neighbors = [
             Neighbor(
                 address=str(row.get("IPAddress", "")),
@@ -507,15 +621,12 @@ def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], l
                 interface=str(row.get("InterfaceAlias", "")),
                 state=str(row.get("State", "unknown")),
             )
-            for row in neighbor_rows
+            for row in rows_for("Neighbors")
         ]
     except Exception as exc:
         errors.append(f"Windows neighbor inventory failed: {exc}")
         neighbors = []
     try:
-        listener_rows = _windows_json(
-            "Get-NetTCPConnection -State Listen | Select LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress"
-        )
         listeners = [
             Listener(
                 protocol="tcp",
@@ -523,7 +634,7 @@ def _windows_topology(errors: list[str]) -> tuple[list[Route], list[Neighbor], l
                 port=int(row.get("LocalPort", 0)),
                 process=str(row.get("OwningProcess", "")),
             )
-            for row in listener_rows
+            for row in rows_for("Listeners")
             if row.get("LocalPort")
         ]
     except Exception as exc:
@@ -540,6 +651,8 @@ def _linux_processes(errors: list[str]) -> list[ProcessObservation]:
     except OSError as exc:
         errors.append(f"process inventory unavailable: {exc}")
         return []
+    if len(entries) > 4096:
+        errors.append("Linux process inventory exceeded its 4096-entry limit; coverage is incomplete")
     for entry in entries[:4096]:
         try:
             values: dict[str, str] = {}
@@ -574,15 +687,11 @@ def _linux_processes(errors: list[str]) -> list[ProcessObservation]:
 
 
 def _windows_processes(errors: list[str]) -> list[ProcessObservation]:
-    script = r"""
-$admins = @(Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | Get-LocalGroupMember -ErrorAction SilentlyContinue | ForEach-Object {$_.Name.Split('\')[-1]})
-Get-CimInstance Win32_Process | Select-Object -First 4096 | ForEach-Object {
-  $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
-  $user = if ($owner.User) {$owner.User} else {'unknown'}
-  [PSCustomObject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;Name=$_.Name;ExecutablePath=$_.ExecutablePath;UserName=$user;Privileged=($user -eq 'SYSTEM' -or $user -eq 'Administrator' -or $admins -contains $user)}
-} | ConvertTo-Json -Compress
-"""
+    script = WINDOWS_QUERIES["PROCESSES"]
     try:
+        rows = _windows_json(script)
+        if len(rows) > 4096:
+            errors.append("Windows process inventory exceeded its 4096-entry limit; coverage is incomplete")
         return [
             ProcessObservation(
                 name=str(item.get("Name", "unknown")),
@@ -592,9 +701,9 @@ Get-CimInstance Win32_Process | Select-Object -First 4096 | ForEach-Object {
                 parent_id=int(item.get("ParentProcessId", 0)),
                 privileged=bool(item.get("Privileged", False)),
             )
-            for item in _windows_json(script)
+            for item in rows[:4096]
             if int(item.get("ProcessId", 0)) > 0
-        ][:4096]
+        ]
     except Exception as exc:
         errors.append(f"Windows process inventory failed: {exc}")
         return []
@@ -602,25 +711,44 @@ Get-CimInstance Win32_Process | Select-Object -First 4096 | ForEach-Object {
 
 def _file_persistence(path: Path, kind: str, owner: str = "unknown") -> PersistenceItem | None:
     try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        # Hash links themselves. A startup alias must not redirect a bounded
+        # inventory read to an arbitrary file/device controlled by an attacker.
+        if path.is_symlink():
+            return PersistenceItem(kind=kind + "-link", name=str(path), owner=owner,
+                                   sha256=hashlib.sha256(os.readlink(path).encode()).hexdigest())
+        from .restoration import RestorePointStore
+        from .payload_inventory import _distribution_alias, _alias_unchanged
+        native_path, alias = _distribution_alias(path)
+        data, metadata = RestorePointStore._read_target(native_path)
+        if alias and not _alias_unchanged(alias):
+            raise ValueError('startup directory alias changed during inventory')
+        digest = hashlib.sha256(data).hexdigest()
         if pwd is not None:
             try:
-                owner = pwd.getpwuid(path.stat().st_uid).pw_name
+                owner = pwd.getpwuid(metadata['uid']).pw_name
             except KeyError:
                 pass
         return PersistenceItem(kind=kind, name=str(path), owner=owner, sha256=digest)
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
 def _linux_persistence(errors: list[str]) -> list[PersistenceItem]:
     items: list[PersistenceItem] = []
-    for fixed in (Path("/etc/crontab"), Path("/etc/rc.local")):
+    for fixed in (Path("/etc/crontab"), Path("/etc/rc.local"), Path("/etc/profile"),
+                  Path("/etc/bash.bashrc"), Path("/etc/ld.so.preload")):
         item = _file_persistence(fixed, "startup-file") if fixed.is_file() else None
         if item:
             items.append(item)
     for directory, kind in (
         (Path("/etc/cron.d"), "cron"),
+        (Path("/etc/cron.hourly"), "cron"),
+        (Path("/etc/cron.daily"), "cron"),
+        (Path("/etc/cron.weekly"), "cron"),
+        (Path("/etc/cron.monthly"), "cron"),
+        (Path("/etc/profile.d"), "shell-startup"),
+        (Path("/etc/pam.d"), "authentication-config"),
+        (Path("/etc/ssh/sshd_config.d"), "ssh-config"),
         (Path("/var/spool/cron"), "user-cron"),
         (Path("/var/spool/cron/crontabs"), "user-cron"),
         (Path("/etc/systemd/system"), "systemd-file"),
@@ -633,8 +761,35 @@ def _linux_persistence(errors: list[str]) -> list[PersistenceItem]:
                 item = _file_persistence(path, kind) if path.is_file() else None
                 if item:
                     items.append(item)
+                elif path.is_file():
+                    errors.append("persistence inventory could not safely read a startup entry")
         except OSError:
             continue
+    if pwd is not None:
+        # Service-account UIDs are not a trust boundary. An attacker can place
+        # authorized keys or shell startup files under those homes too.
+        users = list(pwd.getpwall())
+        if len(users) > 256:
+            errors.append("persistence user inventory exceeded 256 accounts")
+        for user in users[:256]:
+            home_path = Path(user.pw_dir)
+            if not home_path.is_absolute():
+                continue
+            for suffix, kind in ((".ssh/authorized_keys", "authorized-keys"), (".profile", "shell-startup"),
+                                 (".bashrc", "shell-startup"), (".bash_profile", "shell-startup"),
+                                 (".zshrc", "shell-startup")):
+                path = home_path / suffix
+                try:
+                    present = path.is_file()
+                except OSError:
+                    errors.append("persistence inventory could not inspect a user startup path")
+                    continue
+                if present:
+                    item = _file_persistence(path, kind, user.pw_name)
+                    if item:
+                        items.append(item)
+                    else:
+                        errors.append("persistence inventory could not safely read a user startup entry")
     try:
         result = _run(
             [
@@ -662,20 +817,19 @@ def _linux_persistence(errors: list[str]) -> list[PersistenceItem]:
                     )
     except OSError:
         pass
+    from .payload_inventory import linux_startup_payloads, linux_process_payloads
+    items.extend(linux_startup_payloads(items, errors))
+    items.extend(linux_process_payloads(errors))
+    if len(items) > 4096:
+        errors.append("persistence inventory exceeded its 4096-entry bound")
     return items[:4096]
 
 
 def _windows_persistence(errors: list[str]) -> list[PersistenceItem]:
-    script = r"""
-Get-ScheduledTask | ForEach-Object {
-  $actionText = ($_.Actions | ConvertTo-Json -Depth 4 -Compress)
-  $sha = [Security.Cryptography.SHA256]::Create()
-  try { $hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($actionText)))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
-  [PSCustomObject]@{Kind='scheduled-task';Name=($_.TaskPath+$_.TaskName);Owner=$_.Author;Enabled=($_.State -ne 'Disabled');SHA256=$hash}
-} | ConvertTo-Json -Compress
-"""
+    script = WINDOWS_QUERIES["PERSISTENCE"]
     try:
-        return [
+        native = _windows_json(script)
+        items = [
             PersistenceItem(
                 kind=str(item.get("Kind", "scheduled-task")),
                 name=str(item.get("Name", "unknown")),
@@ -683,8 +837,27 @@ Get-ScheduledTask | ForEach-Object {
                 enabled=bool(item.get("Enabled", True)),
                 sha256=str(item.get("SHA256") or ""),
             )
-            for item in _windows_json(script)
-        ][:4096]
+            for item in native if item.get('Kind') not in {'process-reference','startup-folder'}
+        ]
+        from .payload_inventory import fingerprint_references, windows_startup_payload_paths
+        folders = [row for row in native if row.get('Kind') == 'startup-folder']
+        if folders:
+            from .windows_startup import startup_folder_inventory
+            items.extend(startup_folder_inventory(folders, errors))
+        references = [path for row in native if row.get('Kind') != 'process-reference'
+                      for command in row.get('References', [])
+                      for path in windows_startup_payload_paths(str(command))]
+        items.extend(fingerprint_references(references, errors))
+        process_rows = [row for row in native if row.get('Kind') == 'process-reference']
+        if len(process_rows) > 4096:
+            errors.append('Windows process payload inventory exceeded its process bound')
+        running = [path for row in process_rows[:4096]
+                   for command in row.get('References', [])
+                   for path in windows_startup_payload_paths(str(command))]
+        items.extend(fingerprint_references(running, errors, kind='process-payload', max_files=128, seconds=3.0))
+        if len(items) > 4096:
+            errors.append('Windows persistence inventory exceeded its entry bound')
+        return items[:4096]
     except Exception as exc:
         errors.append(f"Windows persistence inventory failed: {exc}")
         return []
@@ -724,18 +897,22 @@ def _linux_firewall(errors: list[str]) -> FirewallState:
 
 
 def _windows_firewall(errors: list[str]) -> FirewallState:
-    script = r"""
-$profiles = @(Get-NetFirewallProfile | Select Name,Enabled)
-$rules = @(Get-NetFirewallRule | Sort-Object Name | Select Name,Enabled,Direction,Action,Profile)
-[PSCustomObject]@{Profiles=$profiles;Rules=$rules} | ConvertTo-Json -Depth 4 -Compress
-"""
+    script = WINDOWS_QUERIES["FIREWALL"]
     try:
-        rows = _windows_json(script)
-        state = rows[0] if rows and isinstance(rows[0], dict) else {}
+        rows = _windows_json(script, timeout=60.0)
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise ValueError("incomplete firewall inventory")
+        state = rows[0]
+        filters = state.get("Filters")
+        expected_filters = {"Address", "Port", "Application", "Service", "Interface", "InterfaceType", "Security"}
+        if state.get("Schema") != 2 or not isinstance(filters, dict) or set(filters) != expected_filters:
+            raise ValueError("incomplete firewall filter inventory")
+        if not isinstance(state.get("Rules"), list) or any(not isinstance(value, list) for value in filters.values()):
+            raise ValueError("malformed firewall inventory")
         profiles = state.get("Profiles", [])
-        if isinstance(profiles, dict):
-            profiles = [profiles]
-        encoded = json.dumps(state, separators=(",", ":"), sort_keys=True)
+        if not isinstance(profiles, list) or not profiles or any(not isinstance(item, dict) or not isinstance(item.get("Enabled"), bool) for item in profiles):
+            raise ValueError("incomplete firewall profile inventory")
+        encoded = json.dumps(_canonical_firewall_state(state), separators=(",", ":"), sort_keys=True)
         enabled = bool(profiles) and all(bool(item.get("Enabled")) for item in profiles)
         return FirewallState(
             enabled=enabled,
@@ -748,6 +925,16 @@ $rules = @(Get-NetFirewallRule | Sort-Object Name | Select Name,Enabled,Directio
         return FirewallState(False, provider="Windows Defender Firewall", detail="inventory failed")
 
 
+def _canonical_firewall_state(value: Any) -> Any:
+    """NetSecurity inventories and condition arrays are unordered sets."""
+    if isinstance(value, dict):
+        return {key: _canonical_firewall_state(item) for key, item in value.items()}
+    if isinstance(value, list):
+        normalized = [_canonical_firewall_state(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, separators=(",", ":"), sort_keys=True))
+    return value
+
+
 def _boot_id(system: str) -> str:
     if system != "windows":
         try:
@@ -755,9 +942,7 @@ def _boot_id(system: str) -> str:
         except OSError:
             return "unknown"
     try:
-        rows = _windows_json(
-            "Get-CimInstance Win32_OperatingSystem | Select LastBootUpTime | ConvertTo-Json -Compress"
-        )
+        rows = _windows_json(WINDOWS_QUERIES["BOOT"])
         return str(rows[0].get("LastBootUpTime", "unknown")) if rows else "unknown"
     except Exception:
         return "unknown"
@@ -848,58 +1033,44 @@ def _linux_security_events(errors: list[str]) -> list[SecurityEvent]:
 
 
 def _windows_security_events(errors: list[str]) -> list[SecurityEvent]:
-    script = r"""
-$ids = 1102,4624,4625,4697,4698,4700,4701,4702,4719,4720,4722,4725,4726,4728,4729,4732,4733,4735,4738,4756,4757,4946,4947,4948,4950
-$start = (Get-Date).AddMinutes(-5)
-$events = @(Get-WinEvent -FilterHashtable @{LogName='Security';Id=$ids;StartTime=$start} -MaxEvents 512 -ErrorAction SilentlyContinue)
-if ($events.Count -eq 0) { exit 0 }
-$events | ForEach-Object {
-  $xml = [xml]$_.ToXml(); $data = @{}
-  foreach ($node in $xml.Event.EventData.Data) { $data[[string]$node.Name] = [string]$node.'#text' }
-  $category = switch ($_.Id) {
-    1102 {'audit_cleared'}
-    4624 {'auth_success'}
-    4625 {'auth_failure'}
-    4697 {'service_installed'}
-    {$_ -in 4698,4700,4701,4702} {'scheduled_task_changed'}
-    4719 {'audit_policy_changed'}
-    4720 {'account_created'}
-    {$_ -in 4725,4726} {'account_disabled_or_deleted'}
-    {$_ -in 4722,4738} {'account_changed'}
-    {$_ -in 4946,4947,4948,4950} {'firewall_changed'}
-    default {'privilege_change'}
-  }
-  $outcome = if ($_.Id -eq 4625) {'failure'} else {'success'}
-  $account = if ($data.MemberName) {$data.MemberName} elseif ($data.MemberSid) {$data.MemberSid} elseif ($data.TargetUserName) {$data.TargetUserName} elseif ($data.TaskName) {$data.TaskName} elseif ($data.ServiceName) {$data.ServiceName} else {'unknown'}
-  [PSCustomObject]@{
-    EventId=('windows-'+$_.RecordId);Category=$category;Outcome=$outcome
-    Account=([string]$account);Actor=([string]$data.SubjectUserName)
-    RemoteAddress=([string]$data.IpAddress)
-    OccurredAt=([DateTimeOffset]$_.TimeCreated).ToUnixTimeMilliseconds()/1000.0
-    Detail=($_.ProviderName+' event '+$_.Id)
-  }
-} | ConvertTo-Json -Compress
-"""
+    from .windows_audit import logon_audit_policy
     try:
+        policy = logon_audit_policy()
+        if not policy['success'] or not policy['failure']:
+            errors.append('Windows successful/failed logon auditing is disabled or incomplete')
+    except (OSError,ValueError):
+        errors.append('Windows logon audit policy could not be verified')
+    script = WINDOWS_QUERIES["SECURITY_EVENTS"]
+    try:
+        native_events = _windows_json(script)
+        # Enforce age against the native event timestamp in Python. Keep the
+        # bounded native query independent of PowerShell DateTime conversion.
+        now = time.time()
+        native_events = [item for item in native_events
+                         if now-300 <= float(item.get('OccurredAt',0) or 0) <= now+5]
+        if len(native_events) > 256:
+            errors.append('Windows security-event inventory exceeded its 256-event telemetry bound')
         return [
             SecurityEvent(
                 event_id=_clean_event_text(item.get("EventId", "unknown"), 256),
                 category=_clean_event_text(item.get("Category", "unknown"), 64),
                 outcome=_clean_event_text(item.get("Outcome", "observed"), 64),
                 account=_clean_event_text(item.get("Account") or "unknown", 128),
+                account_id=_clean_event_text(item.get("AccountId") or "", 256),
+                account_domain=_clean_event_text(item.get("AccountDomain") or "", 256),
                 actor=_clean_event_text(item.get("Actor") or "unknown", 128),
                 remote_address=_clean_event_text(item.get("RemoteAddress") or "unknown", 256),
                 occurred_at=max(0.0, float(item.get("OccurredAt", 0) or 0)),
                 detail=_clean_event_text(item.get("Detail", ""), 512),
             )
-            for item in _windows_json(script)
+            for item in native_events
         ][:256]
     except Exception as exc:
         errors.append(f"Windows security-event inventory failed: {exc}")
         return []
 
 
-def _windows_inventory(errors: list[str]) -> tuple[
+def _windows_inventory(errors: list[str], *, boot_id: str | None = None) -> tuple[
     list[Account],
     list[Session],
     list[Service],
@@ -912,12 +1083,12 @@ def _windows_inventory(errors: list[str]) -> tuple[
     list[Interface],
     list[SecurityEvent],
 ]:
-    """Collect independent native inventories concurrently and merge errors in order."""
-    account_errors: list[str] = []
-    accounts = _windows_accounts(account_errors)
+    """Bound native helper contention and merge complete inventory errors in order."""
+    deadline = _windows_deadline.get()
+    if deadline is None:
+        deadline = time.monotonic() + WINDOWS_INVENTORY_BUDGET_SECONDS
     jobs = (
         lambda local: _windows_services(local),
-        lambda local: _windows_sessions(accounts, local),
         lambda local: _windows_topology(local),
         lambda local: _windows_processes(local),
         lambda local: _windows_persistence(local),
@@ -925,13 +1096,31 @@ def _windows_inventory(errors: list[str]) -> tuple[
         lambda local: _windows_interfaces(local),
         lambda local: _windows_security_events(local),
     )
+    query_cache = _windows_query_cache.get()
 
     def execute(job: Any) -> tuple[Any, list[str]]:
         local_errors: list[str] = []
-        return job(local_errors), local_errors
+        token = _windows_deadline.set(deadline)
+        cache_token = _windows_query_cache.set(query_cache)
+        try:
+            return job(local_errors), local_errors
+        finally:
+            _windows_query_cache.reset(cache_token)
+            _windows_deadline.reset(token)
 
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="sb-win-collect") as pool:
+    accounts, account_errors = execute(_windows_accounts)
+
+    # On a single CPU, overlapping PowerShell/CIM helpers made otherwise valid
+    # inventories time out and held recovery. Keep each query bounded without
+    # dropping a collector or trusting its prior result as a fresh observation.
+    workers = min(2, max(1, os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sb-win-collect") as pool:
         results = list(pool.map(execute, jobs))
+    # A session scan must not observe our short-lived inventory PowerShell
+    # helpers after they exit. Its own PowerShell process is excluded by $PID;
+    # every remaining session still needs the normal exact process identity.
+    results.insert(1, execute(lambda local: _windows_sessions(accounts, local) if boot_id is None
+                             else _windows_sessions(accounts, local, boot_id=boot_id)))
     errors.extend(account_errors)
     for _value, local_errors in results:
         errors.extend(local_errors)
@@ -954,7 +1143,55 @@ def _windows_inventory(errors: list[str]) -> tuple[
     )
 
 
-def _integrity_paths(system: str, extra_paths: list[str] | None = None) -> list[Path]:
+def _discover_integrity_paths(root: Path, pattern: str) -> list[Path]:
+    """Expand fixed watch patterns without hiding directory access failures."""
+    remaining = MAX_INTEGRITY_DISCOVERY_ENTRIES
+
+    def walk(directory: Path, parts: list[str]):
+        nonlocal remaining
+        part, *tail = parts
+        if not any(mark in part for mark in "*?["):
+            target = directory / part
+            if tail:
+                yield from walk(target, tail)
+            else:
+                try:
+                    target.lstat()
+                except (FileNotFoundError, NotADirectoryError):
+                    return
+                yield target
+            return
+        try:
+            entries = os.scandir(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            return  # Optional application directories need not be installed.
+        with entries:
+            for entry in entries:
+                remaining -= 1
+                if remaining < 0:
+                    raise ValueError("integrity discovery entry limit exceeded; coverage is incomplete")
+                if fnmatch.fnmatchcase(entry.name, part):
+                    target = directory / entry.name
+                    if tail:
+                        yield from walk(target, tail)
+                    else:
+                        yield target
+
+    return sorted(walk(root, pattern.split("/")))
+
+
+def _integrity_paths(
+    system: str, extra_paths: list[str] | None = None, *, errors: list[str] | None = None
+) -> list[Path]:
+    # Watcher hints may use a bounded subset, but collection must explicitly
+    # report every loss of coverage so it cannot authorize automatic repair.
+    diagnostics = errors if errors is not None else []
+    protected: list[Path] = []
+    for raw in extra_paths or []:
+        if not isinstance(raw, str) or "\x00" in raw or not Path(raw).is_absolute():
+            diagnostics.append("integrity protected path must be an absolute path without NUL")
+            continue
+        protected.append(Path(raw))
     if system == "windows":
         windows = Path(os.environ.get("WINDIR", r"C:\Windows"))
         user_profile = Path(os.environ.get("USERPROFILE", str(Path.home())))
@@ -992,49 +1229,149 @@ def _integrity_paths(system: str, extra_paths: list[str] | None = None) -> list[
             (Path("/var/named"), "*.zone"),
         ):
             try:
-                candidates.extend(sorted(root.glob(pattern)))
-            except OSError:
-                pass
-    for raw in extra_paths or []:
-        path = Path(str(raw))
-        if path.is_absolute():
-            candidates.append(path)
+                for discovered in _discover_integrity_paths(root, pattern):
+                    # Installed service aliases are not writable restore targets.
+                    # Monitor/capture the canonical file; the alias remains in
+                    # persistence telemetry. A new destination is a new path
+                    # requiring manifest and baseline review. Explicit protected
+                    # paths are never silently redirected by this discovery step.
+                    if root == Path("/etc/systemd/system") and discovered.is_symlink():
+                        try:
+                            discovered = discovered.resolve(strict=True)
+                        except (OSError, RuntimeError):
+                            pass
+                    candidates.append(discovered)
+            except (OSError, ValueError) as exc:
+                diagnostics.append(f"integrity path discovery failed for {root}: {exc}")
     unique: list[Path] = []
     seen: set[str] = set()
-    for path in candidates:
+    for path in [*protected, *candidates]:
+        # Windows directories can opt into case-sensitive names. Without
+        # filesystem identity evidence, case variants remain distinct targets.
         normalized = str(path)
         if normalized not in seen:
+            if len(unique) >= MAX_INTEGRITY_PATHS:
+                diagnostics.append(
+                    f"integrity path limit of {MAX_INTEGRITY_PATHS} exceeded; coverage is incomplete"
+                )
+                break
             seen.add(normalized)
             unique.append(path)
-        if len(unique) >= 256:
-            break
     return unique
 
 
 def integrity_watch_paths(extra_paths: list[str] | None = None) -> list[str]:
-    """Return the exact default and configured files used by integrity collection."""
+    """Return bounded watcher hints; collection reports any missing coverage."""
     system = platform.system().casefold()
     return [str(path) for path in _integrity_paths(system, extra_paths)]
+
+
+class _IntegrityBudget:
+    """One cycle's read allowance, including bytes from rejected snapshots."""
+
+    def __init__(self, system: str = "linux") -> None:
+        windows = system == "windows"
+        self.label = "Windows" if windows else "POSIX"
+        self.deadline = time.monotonic() + (
+            WINDOWS_INTEGRITY_BUDGET_SECONDS if windows else POSIX_INTEGRITY_BUDGET_SECONDS
+        )
+        self.remaining_bytes = (
+            MAX_WINDOWS_INTEGRITY_TOTAL_BYTES if windows else MAX_POSIX_INTEGRITY_TOTAL_BYTES
+        )
+
+    def check(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError(f"{self.label} integrity collection time budget exhausted")
+
+    def consume(self, count: int) -> None:
+        self.remaining_bytes -= count
+        if self.remaining_bytes < 0:
+            raise ValueError(f"{self.label} integrity collection byte budget exhausted")
+        self.check()
+
+
+def _file_snapshot_identity(value: os.stat_result) -> tuple[int, ...]:
+    # Access time changes on normal reads and is deliberately excluded.
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _posix_integrity_item(path: Path, budget: _IntegrityBudget) -> IntegrityItem | None:
+    """Hash a bounded regular-file snapshot; reject concurrent changes.
+
+    Deadlines are checked between operations. A blocked filesystem call still
+    depends on the OS. Existing monitored symlink paths remain supported, with
+    the final pathname required to identify the same snapshot as the open file.
+    """
+    budget.check()
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("integrity target is not a regular file")
+        if before.st_size > MAX_POSIX_INTEGRITY_FILE_BYTES:
+            raise ValueError("integrity file exceeds the per-file byte limit")
+        # Leave room for one bounded EOF check. This also rejects pseudo-files
+        # whose reported size does not describe their readable contents.
+        if before.st_size >= budget.remaining_bytes:
+            raise ValueError("POSIX integrity collection byte budget exhausted")
+        digest = hashlib.sha256()
+        received = 0
+        while received <= before.st_size:
+            budget.check()
+            chunk = os.read(descriptor, min(131072, before.st_size + 1 - received))
+            budget.consume(len(chunk))
+            if not chunk:
+                break
+            received += len(chunk)
+            if received > before.st_size:
+                raise ValueError("integrity file changed while being read or reports an unsupported size")
+            digest.update(chunk)
+        if received != before.st_size:
+            raise ValueError("integrity file changed while being read")
+        after = os.fstat(descriptor)
+        named = path.stat()
+        budget.check()
+        identity = _file_snapshot_identity(before)
+        if identity != _file_snapshot_identity(after) or identity != _file_snapshot_identity(named):
+            raise ValueError("integrity file changed while being read")
+        return IntegrityItem(path=str(path), sha256=digest.hexdigest(),
+                             size=received, modified_at=float(after.st_mtime))
+    finally:
+        os.close(descriptor)
 
 
 def _integrity(
     system: str, errors: list[str], extra_paths: list[str] | None = None
 ) -> list[IntegrityItem]:
     items: list[IntegrityItem] = []
-    for path in _integrity_paths(system, extra_paths):
-        if system != "windows" and (not path.exists() or not path.is_file()):
-            continue
+    budget = _IntegrityBudget(system)
+    for path in _integrity_paths(system, extra_paths, errors=errors):
         try:
+            budget.check()
+            if system != "windows":
+                item = _posix_integrity_item(path, budget)
+                if item is not None:
+                    items.append(item)
+                continue
             digest = hashlib.sha256()
             security_descriptor_sha256 = ""
             if system == "windows":
                 from .restoration import _windows_read_file_snapshot_if_present
 
+                if budget.remaining_bytes <= 0:
+                    raise ValueError("Windows integrity collection byte budget exhausted")
                 result = _windows_read_file_snapshot_if_present(
                     path,
-                    MAX_WINDOWS_INTEGRITY_FILE_BYTES,
+                    min(MAX_WINDOWS_INTEGRITY_FILE_BYTES, budget.remaining_bytes - 1),
                     allow_security_failure=True,
+                    read_budget=budget,
                 )
+                budget.check()
                 if result is None:
                     continue
                 data, snapshot = result
@@ -1051,13 +1388,7 @@ def _integrity(
                     errors.append(
                         f"integrity security metadata read failed for {path}: {security_error}"
                     )
-            else:
-                with path.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(131072), b""):
-                        digest.update(chunk)
-                    file_stat = os.fstat(handle.fileno())
-                size = int(file_stat.st_size)
-                modified_at = float(file_stat.st_mtime)
+            budget.check()
             items.append(
                 IntegrityItem(
                     path=str(path),
@@ -1069,6 +1400,8 @@ def _integrity(
             )
         except (OSError, ValueError) as exc:
             errors.append(f"integrity read failed for {path}: {exc}")
+            if time.monotonic() >= budget.deadline or budget.remaining_bytes <= 0:
+                break
     return items
 
 
@@ -1080,22 +1413,29 @@ def collect(
     authorized_hosts: list[str] | tuple[str, ...] | None = None,
     excluded_hosts: list[str] | tuple[str, ...] | None = None,
 ) -> Telemetry:
+    # Date the oldest part of this observation. Dating completion instead would
+    # let a slow inventory refresh the apparent age of already-stale evidence.
+    observed_at = time.time()
     errors: list[str] = []
     system = platform.system().casefold()
     if system == "windows":
-        (
-            accounts,
-            sessions,
-            services,
-            routes,
-            neighbors,
-            listeners,
-            processes,
-            persistence,
-            firewall,
-            interfaces,
-            security_events,
-        ) = _windows_inventory(errors)
+        with _windows_inventory_budget(), _windows_query_snapshot():
+            boot_id = _boot_id(system)
+            if boot_id == "unknown":
+                errors.append("Windows boot identity is unavailable")
+            (
+                accounts,
+                sessions,
+                services,
+                routes,
+                neighbors,
+                listeners,
+                processes,
+                persistence,
+                firewall,
+                interfaces,
+                security_events,
+            ) = _windows_inventory(errors, boot_id=boot_id)
     else:
         accounts = _linux_accounts()
         privileged = {item.name.casefold() for item in accounts if item.privileged}
@@ -1135,7 +1475,7 @@ def collect(
         agent_id=agent_id,
         hostname=socket.gethostname(),
         platform=f"{platform.system()} {platform.release()}",
-        observed_at=time.time(),
+        observed_at=observed_at,
         accounts=accounts,
         sessions=sessions,
         services=services,
@@ -1150,7 +1490,7 @@ def collect(
         security_events=security_events,
         firewall=firewall,
         collector_errors=bounded_errors,
-        boot_id=_boot_id(system),
+        boot_id=boot_id if system == "windows" else _boot_id(system),
     )
 
 

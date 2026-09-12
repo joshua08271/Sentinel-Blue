@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentinel-blue"
-version = "1.9.12"
+version = "1.9.45"
 description = "Competition-safe defensive monitoring and response orchestrator"
 readme = {text = "Sentinel Blue competition-safe defensive software.", content-type = "text/plain"}
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Sentinel Blue contributors"}]
 dependencies = []
+
+[project.optional-dependencies]
+scoring = ["paramiko==5.0.0", "smbprotocol==1.17.0"]
+security = ["cryptography>=46,<51", "paramiko==5.0.0"]
 
 [project.scripts]
 sentinel-blue = "sentinel_blue.__main__:main"

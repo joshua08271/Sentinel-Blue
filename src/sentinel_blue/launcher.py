@@ -14,9 +14,12 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -43,6 +46,11 @@ REQUIRED_RUNTIME_ENTRIES = {
 }
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 MAX_RUNTIME_ENTRIES = 4096
+_DEPLOYMENT_DEADLINE: ContextVar[float | None] = ContextVar("deployment_deadline", default=None)
+
+
+class DeploymentUncertain(RuntimeError):
+    """The management connection was lost without a reliable remote result."""
 
 
 @dataclass(slots=True)
@@ -154,6 +162,8 @@ def deployment_plan(
                 raise ValueError(f"session containment is not approved for {address}")
             if host.get("allow_restoration") and not event_profile.allows("file_restoration"):
                 raise ValueError(f"file restoration is not approved for {address}")
+            if host.get("allow_service_recovery") and not event_profile.allows("in_place_repair"):
+                raise ValueError(f"service recovery is not approved for {address}")
         operation = "install-agent"
         requires = ["approved credentials", "reachable management service"]
         if transport == "web-console":
@@ -182,6 +192,7 @@ def deployment_plan(
                         "python",
                         "allow_containment",
                         "allow_restoration",
+                        "allow_service_recovery",
                         "probe_config",
                         "install_directory",
                         "quarantine_ttl",
@@ -191,6 +202,8 @@ def deployment_plan(
                         "controller_ca_file",
                         "range_deployment",
                         "agent_id",
+                        "port",
+                        "credential_file",
                     )
                     if key in host
                 }
@@ -272,7 +285,14 @@ def validate_runtime_package(path: str | Path) -> dict[str, Any]:
 
 
 def _run(command: list[str], timeout: float = 120.0) -> str:
+    deadline = _DEPLOYMENT_DEADLINE.get()
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("deployment deadline exhausted before starting another command")
     result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    if result.returncode == 255 and command and Path(command[0]).name in {"ssh", "scp"}:
+        raise DeploymentUncertain("SSH connection lost; inspect the remote operation before retrying")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "deployment command failed")
     return result.stdout.strip()
@@ -288,6 +308,8 @@ def _ssh_base(step: DeploymentStep) -> tuple[list[str], str]:
         "-o", "BatchMode=yes",
         "-o", "ForwardAgent=no",
         "-o", "ClearAllForwardings=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ConnectionAttempts=1",
         "-o", f"StrictHostKeyChecking={strict_host_key}",
     ]
     known_hosts_file = step.options.get("known_hosts_file")
@@ -302,6 +324,11 @@ def _ssh_base(step: DeploymentStep) -> tuple[list[str], str]:
         if not key_path.is_file():
             raise ValueError(f"SSH key not found for {step.host}: {key_path}")
         base.extend(["-i", str(key_path)])
+        base.extend(["-o", "IdentitiesOnly=yes"])
+    port = step.options.get("port", 22)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("SSH port must be an integer from 1 to 65535")
+    base.extend(["-o", f"Port={port}"])
     return base, target
 
 
@@ -319,6 +346,7 @@ def _linux_unit(
     range_deployment: bool = False,
     agent_id: str | None = None,
     ca_file: str | None = None,
+    service_recovery: bool = False,
 ) -> str:
     args = [
         "/usr/bin/python3",
@@ -351,6 +379,8 @@ def _linux_unit(
         args.append("--allow-containment")
     if restoration:
         args.append("--allow-restoration")
+    if service_recovery:
+        args.append("--allow-service-recovery")
     command = " ".join(shlex.quote(value) for value in args)
     return "\n".join(
         (
@@ -459,9 +489,10 @@ def _deploy_ssh(
 ) -> dict[str, Any]:
     ssh_options, target = _ssh_base(step)
     deployment_nonce = uuid.uuid4().hex[:16]
-    remote_stage = f"/tmp/sentinel-blue-{checksum[:12]}-{deployment_nonce}.pyz"
-    remote_token_stage = f"/tmp/sentinel-blue-enroll-{deployment_nonce}.json"
-    remote_unit_stage = f"/tmp/sentinel-blue-{deployment_nonce}.service"
+    remote_upload = f"/tmp/sentinel-blue-upload-{deployment_nonce}"
+    remote_stage = f"{remote_upload}/sentinel-blue.pyz"
+    remote_token_stage = f"{remote_upload}/enrollment.json"
+    remote_unit_stage = f"{remote_upload}/sentinel-blue.service"
     install_dir = str(step.options.get("install_directory", "/opt/sentinel-blue"))
     if not SAFE_POSIX_PATH.fullmatch(install_dir) or ".." in Path(install_dir).parts:
         raise ValueError("Linux install_directory must be a safe absolute path")
@@ -471,11 +502,11 @@ def _deploy_ssh(
     local_probe_config = _validated_probe_config(step)
     local_event_profile = _validated_event_profile(step)
     local_controller_ca = _validated_controller_ca(step, local_event_profile)
-    remote_probe_stage = f"/tmp/sentinel-blue-probes-{deployment_nonce}.json"
+    remote_probe_stage = f"{remote_upload}/probes.json"
     remote_probe = f"{state_dir}/probes.json" if local_probe_config else None
-    remote_profile_stage = f"/tmp/sentinel-blue-profile-{deployment_nonce}.json"
+    remote_profile_stage = f"{remote_upload}/event-profile.json"
     remote_profile = f"{state_dir}/event-profile.json"
-    remote_ca_stage = f"/tmp/sentinel-blue-controller-ca-{deployment_nonce}.crt"
+    remote_ca_stage = f"{remote_upload}/controller-ca.crt"
     remote_ca = f"{state_dir}/controller-ca.crt"
     containment = bool(step.options.get("allow_containment", False))
     restoration = bool(step.options.get("allow_restoration", False))
@@ -501,16 +532,27 @@ def _deploy_ssh(
                 bool(step.options.get("range_deployment", False)),
                 str(step.options.get("agent_id", "")) or None,
                 remote_ca,
+                service_recovery=bool(step.options.get("allow_service_recovery", False)),
             ),
             encoding="utf-8",
         )
-        _run(["scp", *ssh_options, str(package), f"{target}:{remote_stage}"])
-        _run(["scp", *ssh_options, str(unit_file), f"{target}:{remote_unit_stage}"])
-        _run(["scp", *ssh_options, str(token_file), f"{target}:{remote_token_stage}"])
-        _run(["scp", *ssh_options, str(local_event_profile), f"{target}:{remote_profile_stage}"])
-        _run(["scp", *ssh_options, str(local_controller_ca), f"{target}:{remote_ca_stage}"])
+        transfers = [(package, "sentinel-blue.pyz"), (unit_file, "sentinel-blue.service"),
+                     (token_file, "enrollment.json"), (local_event_profile, "event-profile.json")]
         if local_probe_config:
-            _run(["scp", *ssh_options, str(local_probe_config), f"{target}:{remote_probe_stage}"])
+            transfers.append((local_probe_config, "probes.json"))
+        transfers.append((local_controller_ca, "controller-ca.crt"))
+        staged = []
+        for source, name in transfers:
+            destination = Path(directory) / name
+            if source.resolve() != destination.resolve():
+                shutil.copyfile(source, destination)
+            if os.name == "posix":
+                destination.chmod(0o600)
+            staged.append(str(destination))
+        # One exclusive private remote directory, then one transfer connection.
+        # A failed/uncertain upload is never retried automatically.
+        _run(["ssh", *ssh_options, target, f"umask 077; mkdir -m 700 {shlex.quote(remote_upload)}"])
+        _run(["scp", *ssh_options, *staged, f"{target}:{remote_upload}/"])
         python_command = str(step.options.get("python", "python3"))
         if not SAFE_USERNAME.fullmatch(python_command):
             raise ValueError("invalid remote Python command")
@@ -548,6 +590,7 @@ def _deploy_ssh(
             f"rm -f {shlex.quote(remote_stage)} {shlex.quote(remote_token_stage)} "
             f"{shlex.quote(remote_probe_stage)} {shlex.quote(remote_profile_stage)} "
             f"{shlex.quote(remote_ca_stage)} {shlex.quote(remote_unit_stage)}; "
+            f"rmdir {shlex.quote(remote_upload)}; "
             f"sudo -n rm -f {shlex.quote(remote_token)}"
         )
         rollback_dir = f"/tmp/sentinel-blue-rollback-{deployment_nonce}"
@@ -613,6 +656,7 @@ def _deploy_ssh(
             f"sudo -n /usr/bin/python3 {shlex.quote(remote_package)} --version",
             "trap - EXIT",
             f"rm -f {shlex.quote(remote_stage)} {shlex.quote(remote_token_stage)} {shlex.quote(remote_probe_stage)} {shlex.quote(remote_profile_stage)} {shlex.quote(remote_ca_stage)} {shlex.quote(remote_unit_stage)}",
+            f"rmdir {shlex.quote(remote_upload)}",
             f"sudo -n rm -rf {shlex.quote(rollback_dir)}",
         ]
         output = _run(["ssh", *ssh_options, target, " && ".join(commands)], timeout=180)
@@ -646,6 +690,18 @@ def _deploy_winrm(
     local_probe_config = _validated_probe_config(step)
     local_event_profile = _validated_event_profile(step)
     local_controller_ca = _validated_controller_ca(step, local_event_profile)
+    remote_python = str(step.options.get("python", "py.exe"))
+    if remote_python not in {"py.exe", "python.exe"} and not re.fullmatch(r"[A-Za-z]:[\\/][A-Za-z0-9_ .\\/-]+\.exe", remote_python):
+        raise ValueError("Windows python must be py.exe, python.exe, or a safe absolute executable path")
+    python_prefix = "-3 " if remote_python == "py.exe" else ""
+    winrm_port = step.options.get("port", 5986)
+    if type(winrm_port) is not int or not 1 <= winrm_port <= 65535:
+        raise ValueError("WinRM port must be from 1 to 65535")
+    credential_argument = ""
+    if step.options.get("credential_file"):
+        credential_path = Path(str(step.options["credential_file"])).expanduser().absolute()
+        read_private_text(credential_path, 65536)
+        credential_argument = " -Credential (Import-Clixml -LiteralPath '" + str(credential_path).replace("'", "''") + "')"
     with tempfile.TemporaryDirectory(prefix="sentinel-blue-winrm-") as directory:
         token_file = Path(directory) / "enrollment.json"
         token_file.write_text(json.dumps({"token": token}), encoding="utf-8")
@@ -655,6 +711,7 @@ def _deploy_winrm(
         )
         containment = " --allow-containment" if step.options.get("allow_containment") else ""
         restoration = " --allow-restoration" if step.options.get("allow_restoration") else ""
+        service_recovery = " --allow-service-recovery" if step.options.get("allow_service_recovery") else ""
         range_argument = (
             " --range-deployment" if step.options.get("range_deployment", False) else ""
         )
@@ -695,7 +752,7 @@ def _deploy_winrm(
         quarantine_ttl = max(30.0, min(float(step.options.get("quarantine_ttl", 300.0)), 3600.0))
         script = f"""
 $ErrorActionPreference = 'Stop'
-$session = New-PSSession -ComputerName '{step.address}'
+$session = New-PSSession -ComputerName '{step.address}' -UseSSL -Authentication Negotiate -Port {winrm_port}{credential_argument}
 try {{
   Invoke-Command -Session $session -ScriptBlock {{ New-Item -ItemType Directory -Force -Path 'C:\\ProgramData\\SentinelBlue' | Out-Null }}
   Invoke-Command -Session $session -ScriptBlock {{ icacls 'C:\\ProgramData\\SentinelBlue' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null; if ($LASTEXITCODE -ne 0) {{ throw 'Sentinel Blue ACL setup failed' }} }}
@@ -728,11 +785,11 @@ try {{
       Move-Item -Force (Join-Path $root '{incoming_profile}') $profile
       Move-Item -Force (Join-Path $root '{incoming_ca}') $controllerCa
       if ((Get-FileHash -Algorithm SHA256 $package).Hash.ToLowerInvariant() -ne '{checksum}') {{ throw 'Sentinel Blue package checksum mismatch' }}
-      py -3 $package agent --controller '{controller}' --token-file C:\\ProgramData\\SentinelBlue\\enrollment.json --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --once {network_args}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}
+      & '{remote_python}' {python_prefix}$package agent --controller '{controller}' --token-file C:\\ProgramData\\SentinelBlue\\enrollment.json --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --once {network_args}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}
       if ($LASTEXITCODE -ne 0) {{ throw ('Sentinel Blue enrollment failed with exit code ' + $LASTEXITCODE) }}
-      $action = New-ScheduledTaskAction -Execute 'py.exe' -Argument '-3 C:\\ProgramData\\SentinelBlue\\sentinel-blue.pyz agent --controller {controller} --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --log-file C:\\ProgramData\\SentinelBlue\\state\\agent.log --log-max-bytes 5242880 --log-backups 3 --quarantine-ttl {quarantine_ttl} {network_args}{containment}{restoration}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}'
+      $action = New-ScheduledTaskAction -Execute '{remote_python}' -Argument '{python_prefix}C:\\ProgramData\\SentinelBlue\\sentinel-blue.pyz agent --controller {controller} --state-dir C:\\ProgramData\\SentinelBlue\\state --event-profile C:\\ProgramData\\SentinelBlue\\event-profile.json --log-file C:\\ProgramData\\SentinelBlue\\state\\agent.log --log-max-bytes 5242880 --log-backups 3 --quarantine-ttl {quarantine_ttl} {network_args}{containment}{restoration}{service_recovery}{probe_argument}{integrity_argument}{ca_argument}{range_argument}{agent_argument}'
       $trigger = New-ScheduledTaskTrigger -AtStartup
-      $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+      $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4
       Register-ScheduledTask -TaskName 'SentinelBlueAgent' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
       Start-ScheduledTask -TaskName 'SentinelBlueAgent'
       Get-ScheduledTask -TaskName 'SentinelBlueAgent' -ErrorAction Stop | Out-Null
@@ -740,7 +797,7 @@ try {{
       $taskInfo = Get-ScheduledTaskInfo -TaskName 'SentinelBlueAgent' -ErrorAction Stop
       if ($taskInfo.LastTaskResult -notin @(0,267009)) {{ throw ('Sentinel Blue task failed with result ' + $taskInfo.LastTaskResult) }}
       if ((Get-FileHash -Algorithm SHA256 $package).Hash.ToLowerInvariant() -ne '{checksum}') {{ throw 'Sentinel Blue post-install checksum mismatch' }}
-      py -3 $package --version | Out-Null
+      & '{remote_python}' {python_prefix}$package --version | Out-Null
       if ($LASTEXITCODE -ne 0) {{ throw ('Sentinel Blue runtime check failed with exit code ' + $LASTEXITCODE) }}
     }} catch {{
       try {{
@@ -1029,7 +1086,13 @@ def execute_plan(
     expected_checksum: str | None,
     controller: str,
     token: str,
+    *, max_parallel_hosts: int = 4, budget_seconds: float = 180,
 ) -> list[dict[str, Any]]:
+    if type(max_parallel_hosts) is not int or not 1 <= max_parallel_hosts <= 16:
+        raise ValueError("deployment max_parallel_hosts must be from 1 to 16")
+    if type(budget_seconds) not in {int, float} or not 0 < budget_seconds <= 1800:
+        raise ValueError("deployment budget_seconds must be positive and at most 1800")
+    deadline = time.monotonic() + budget_seconds
     package_report = validate_runtime_package(package)
     checksum = str(package_report["sha256"])
     if expected_checksum and checksum.casefold() != expected_checksum.casefold():
@@ -1038,9 +1101,12 @@ def execute_plan(
     if len(token) < 16:
         raise ValueError("deployment token must be at least 16 characters")
     networks = [str(value) for value in inventory["authorized_networks"]]
-    results: list[dict[str, Any]] = []
-    for step in plan:
+    def deploy(step):
+        context = _DEPLOYMENT_DEADLINE.set(deadline)
+        started = time.monotonic()
         try:
+            if started >= deadline:
+                return {"status": "deadline", "host": step.host, "transport": step.transport}
             deployment_token = token
             if step.options.get("_enrollment_bound"):
                 agent_id = step.options.get("agent_id")
@@ -1073,10 +1139,40 @@ def execute_plan(
                     "host": step.host,
                     "reason": "portal-console and agentless devices use their approved adapter",
                 }
-        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
-            result = {"status": "failed", "transport": step.transport, "host": step.host, "error": str(exc)}
-        results.append(result)
-    return results
+            if time.monotonic() >= deadline:
+                result = {"status": "deadline", "host": step.host, "transport": step.transport,
+                          "reason": "deployment did not complete within the shared deadline"}
+        except (TimeoutError, subprocess.TimeoutExpired, DeploymentUncertain):
+            result = {"status": "uncertain", "transport": step.transport, "host": step.host,
+                      "reason": "command completion is unknown; inspect remote state before retrying"}
+        except (OSError, RuntimeError, ValueError) as exc:
+            result = {"status": "failed", "transport": step.transport, "host": step.host,
+                      "error": type(exc).__name__}
+        finally:
+            _DEPLOYMENT_DEADLINE.reset(context)
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    groups = {}
+    for index, step in enumerate(plan):
+        key = "local" if step.transport == "local" else step.address
+        groups.setdefault(key, []).append((index, step))
+    def deploy_host(items):
+        results = []
+        held = False
+        for index, step in items:
+            if held:
+                result = {"status": "blocked", "host": step.host, "reason": "earlier operation on this host was uncertain"}
+            else:
+                result = deploy(step)
+                held = result["status"] in {"uncertain", "deadline"}
+            results.append((index, result))
+        return results
+    ordered = []
+    with ThreadPoolExecutor(max_workers=max_parallel_hosts) as pool:
+        for group in pool.map(deploy_host, groups.values()):
+            ordered.extend(group)
+    return [result for _, result in sorted(ordered)]
 
 
 def run(args: argparse.Namespace) -> None:
@@ -1137,6 +1233,8 @@ def run(args: argparse.Namespace) -> None:
             expected_checksum,
             args.controller,
             token,
+            max_parallel_hosts=getattr(args, "max_parallel_hosts", 4),
+            budget_seconds=getattr(args, "budget_seconds", 180),
         )
         print(
             json.dumps(
@@ -1149,7 +1247,7 @@ def run(args: argparse.Namespace) -> None:
                 indent=2,
             )
         )
-        if any(result.get("status") == "failed" for result in results):
+        if any(result.get("status") not in {"deployed", "staged"} for result in results):
             raise SystemExit(2)
         return
     print(
