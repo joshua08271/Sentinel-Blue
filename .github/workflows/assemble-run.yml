@@ -1,0 +1,34 @@
+name: Assemble offline installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".run-upload/**"
+      - ".github/workflows/assemble-run.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble and verify installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="sentinel-blue-2.0.1-linux-gui1-x86_64.run"
+          cat .run-upload/sentinel-blue-2.0.1-linux-gui1-x86_64.run.part* > "$target"
+          echo "511166065c293d6ab6fd80768cad1c65acc48cfcdd7f2054a5620f97aeba0e72  $target" | sha256sum --check --strict
+          chmod +x "$target"
+      - name: Commit installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sentinel-blue-2.0.1-linux-gui1-x86_64.run
+          git commit -m "Add Sentinel Blue 2.0.1 offline installer"
+          git push

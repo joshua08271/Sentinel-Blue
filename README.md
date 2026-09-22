@@ -6,8 +6,8 @@ The program can configure supported local services, monitor their health, and pe
 
 ## Current script
 
-`sentinel-blue.pyz` is the current Sentinel Blue 2.0.1 Linux GUI 1 application archive. It contains the Linux application code and Python dependencies. Windows-specific source is retained internally but was not changed by this Linux update.
+`sentinel-blue-2.0.1-linux-gui1-x86_64.run` is the complete offline, double-clickable Sentinel Blue 2.0.1 Linux GUI 1 installer for an x86-64 Linux desktop. Download it, enable **Allow executing file as program** in its file properties if necessary, and double-click it to start Sentinel Blue.
 
-This `.pyz` is intended for an existing compatible Python/Linux desktop environment. The larger self-contained offline `.run` installer is not included in this repository upload.
+`sentinel-blue.pyz` is the smaller application archive for an existing compatible Python/Linux desktop environment. The `.run` installer is the recommended download because it includes the application runtime.
 
 Use Sentinel Blue only on systems you own or are authorized to administer, and review competition rules before enabling automated changes.
