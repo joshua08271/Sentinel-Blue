@@ -1,13 +1,15 @@
 # Sentinel Blue
 
-Sentinel Blue is a defensive automation assistant for Linux cyber-range and blue-team environments. The current release provides a desktop GUI for reviewing and approving local setup, monitoring configured services, handling alerts and verification prompts, storing credentials, recording sessions, and using pause, recovery, and withdrawal controls.
+Sentinel Blue is a defensive automation assistant for Linux cyber-range and blue-team environments. Its desktop GUI provides local setup review and approval, service monitoring, alerts and verification prompts, credential storage, session recording, pause/resume, recovery, and withdrawal controls.
 
-The program can configure supported local services, monitor their health, and perform guarded recovery actions according to the mode selected by the operator. Actions that need human judgment are surfaced in the GUI with the reason and requested response.
+## Current script: 2.0.19 Linux test candidate
 
-## Current script
+Download [sentinel-blue-2.0.19-linux-gui1-x86_64.run](sentinel-blue-2.0.19-linux-gui1-x86_64.run?raw=true). This single x86-64 Linux desktop installer includes the offline application runtime. Enable **Allow executing file as program** in its file properties if necessary, then double-click it.
 
-`sentinel-blue-2.0.1-linux-gui1-x86_64.run` is the complete offline, double-clickable Sentinel Blue 2.0.1 Linux GUI 1 installer for an x86-64 Linux desktop. Download it, enable **Allow executing file as program** in its file properties if necessary, and double-click it to start Sentinel Blue.
+Installer SHA-256: `6bb4432dd91b3fb0845c6d3515aaea50e986867785aba5b33f8da2b0110d5fb1`.
 
-`sentinel-blue.pyz` is the smaller application archive for an existing compatible Python/Linux desktop environment. The `.run` installer is the recommended download because it includes the application runtime.
+The smaller `sentinel-blue.pyz` contains the same application for a compatible existing Python/Linux desktop environment.
+
+Version 2.0.19 corrects process-identity and process-group cleanup handling in nested Linux PID namespaces. Process identity, ownership, approval, ledger, and recovery guards remain enforced. This is a test candidate; native service and desktop acceptance testing is unfinished.
 
 Use Sentinel Blue only on systems you own or are authorized to administer, and review competition rules before enabling automated changes.
