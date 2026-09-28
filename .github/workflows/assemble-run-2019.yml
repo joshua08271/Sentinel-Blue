@@ -1,0 +1,36 @@
+name: Assemble Sentinel Blue 2.0.19 installer
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".run-upload-2019/**"
+      - ".github/workflows/assemble-run-2019.yml"
+permissions:
+  contents: read
+concurrency:
+  group: sentinel-blue-installer-upload
+  cancel-in-progress: false
+jobs:
+  assemble:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Assemble and verify the exact test candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="sentinel-blue-2.0.19-linux-gui1-x86_64.run"
+          cat .run-upload-2019/installer.part* > "$target"
+          echo "6bb4432dd91b3fb0845c6d3515aaea50e986867785aba5b33f8da2b0110d5fb1  $target" | sha256sum --check --strict
+          echo "377306e37a629cd9d41b0e572432f55e809e9615a59a4542b7665d42aa7d9d61  .run-upload-2019/sentinel-blue.pyz" | sha256sum --check --strict
+          chmod +x "$target"
+          cp .run-upload-2019/sentinel-blue.pyz sentinel-blue.pyz
+          cp .run-upload-2019/README-final.md README.md
+          git rm -r -- .run-upload-2019 .github/workflows/assemble-run-2019.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$target" sentinel-blue.pyz README.md
+          git commit -m "Publish verified Sentinel Blue 2.0.19 test candidate; remove transfer pieces"
+          git push origin HEAD:main
