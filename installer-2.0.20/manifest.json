@@ -1,0 +1,81 @@
+{
+  "format": "sentinel-blue-exact-file-split-v1",
+  "release": "2.0.20",
+  "original": {
+    "name": "sentinel-blue-2.0.20-linux-gui1-x86_64.run",
+    "bytes": 79638062,
+    "sha256": "b9c969ecb5f6984b5a56d3d8cc53b6e3fa16b49c3856eddd371bd7ca6b506da8"
+  },
+  "parts": [
+    {
+      "number": 1,
+      "name": "installer.part001",
+      "archive": "installer.part001.zip",
+      "bytes": 8000001,
+      "sha256": "b426369370af8895aa9b2366c4bce40aabe90e31afa127a11b0dd7d9e6932767"
+    },
+    {
+      "number": 2,
+      "name": "installer.part002",
+      "archive": "installer.part002.zip",
+      "bytes": 8000001,
+      "sha256": "fbd146d996a46363a292845ff01c4f474c7bf7ec5339111a71ecc75fd730ca3a"
+    },
+    {
+      "number": 3,
+      "name": "installer.part003",
+      "archive": "installer.part003.zip",
+      "bytes": 8000001,
+      "sha256": "ceba91527c6f87d5fdec856232540893f7fab562da2d197299558406eda13cd9"
+    },
+    {
+      "number": 4,
+      "name": "installer.part004",
+      "archive": "installer.part004.zip",
+      "bytes": 8000001,
+      "sha256": "d19bb90fc8e61ad92bd7f90bd9b9e2489f5bab85c69e6da80a1c691dd8b744ea"
+    },
+    {
+      "number": 5,
+      "name": "installer.part005",
+      "archive": "installer.part005.zip",
+      "bytes": 8000001,
+      "sha256": "afd69a1d6e1d8724d9cdd6d529d7aa0851c690855235f2dfe6f25d9586e5aa3d"
+    },
+    {
+      "number": 6,
+      "name": "installer.part006",
+      "archive": "installer.part006.zip",
+      "bytes": 8000001,
+      "sha256": "2a44dc626c741ecb9aced0233f64bd2bb544af41367407eb56cfd8cfc1fbb81a"
+    },
+    {
+      "number": 7,
+      "name": "installer.part007",
+      "archive": "installer.part007.zip",
+      "bytes": 8000001,
+      "sha256": "30a9a7a8d2c77bdb4c740f64eb5218597b44bb6e8756180c893d9084780cdeb0"
+    },
+    {
+      "number": 8,
+      "name": "installer.part008",
+      "archive": "installer.part008.zip",
+      "bytes": 8000001,
+      "sha256": "2cc54022026f27dfca182c008c9aa2cab92c19abc423300f89f93020f5b18247"
+    },
+    {
+      "number": 9,
+      "name": "installer.part009",
+      "archive": "installer.part009.zip",
+      "bytes": 8000001,
+      "sha256": "65b89522569fab7dca877916b52fc893e4bf61394fa63d5fd58ec699aa776c88"
+    },
+    {
+      "number": 10,
+      "name": "installer.part010",
+      "archive": "installer.part010.zip",
+      "bytes": 7638053,
+      "sha256": "1926ed7b472b9062e66e265af1b47df2687a2ba010bc3981b88ff699a5078c46"
+    }
+  ]
+}
