@@ -13,6 +13,16 @@ This release includes guarded recovery, durable inverse evidence, approved immut
 
 The code ZIP contains seven generic Python files. Extract it privately and bind `SB_PYZ` to the exact application archive. Start with `preflight.py` on an idle authorized disposable VM. Run `nft_syntax.py` only with `unshare --net`; it refuses the host namespace. The immutable check uses unique temporary files and restores their native flags in its cleanup. Fault campaigns require an already reviewed running session, approved targets, authenticated baseline, declared transactions and an available recovery budget.
 
+The separate [owned content lab helper](owned_content_lab.py?raw=true) prepares a new disposable fixture when no reviewed lab session exists. It requires root, real systemd, exactly one operator login and explicit approval of its newly owned fixture. It refuses hypervisors, existing Sentinel processes and an existing host ledger. Its profile is limited to one new loopback HTTP service, two owned files and one content fault target; it never approves a production release or an existing session. An occupancy change stops its own session. The helper exercises one content fault followed by two bounded campaign rounds, retains a complete 180-second observation window, and checks its own process and service cleanup. Private evidence remains local; sampled transaction availability does not establish continuous or competition uptime.
+
+Download the helper, application archive and unchanged validation ZIP into a private folder on an idle disposable VM. Review the helper before using its approval flags. Run with a compatible root Python environment:
+
+```sh
+sudo -n python3 -I -B owned_content_lab.py --ack-disposable-vm --approve-owned-fixture --console-evidence
+```
+
+The helper verifies the application and validation ZIP hashes above before creating its fixture. The optional console evidence contains private sanitized timelines; keep it out of public repositories. A held result requires review before another run.
+
 Native 2.0.28 acceptance and availability measurements remain unfinished; prior 2.0.20 measurements below do not certify this release.
 
 ## Historical 2.0.20 validation
