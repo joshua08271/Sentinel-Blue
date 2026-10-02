@@ -2,9 +2,22 @@
 
 Sentinel Blue is a defensive automation assistant for authorized Linux cyber-range and blue-team environments.
 
-## Current Linux test candidate: 2.0.20
+## Current Linux test candidate: 2.0.28
 
-The current application is [sentinel-blue.pyz](sentinel-blue.pyz?raw=true). It requires a compatible existing Python environment. Matching source and rehearsal tools are in [candidate-2.0.20/source.tar.gz](candidate-2.0.20/source.tar.gz?raw=true).
+Download the exact [sentinel-blue.pyz](sentinel-blue.pyz?raw=true) and [native validation code](validation-2.0.28.zip?raw=true). The application needs a compatible existing Python environment (3.11 or newer). The current 2.0.28 offline installer remains in the existing three-part download; the historical 2.0.20 installer below is a different release.
+
+Application SHA-256: `9e3a7d254d4866be393eac5649211e656446ae1c16651ee0d4f64933a33d3ab5`.
+Validation ZIP SHA-256: `416f1239f35f8028fa2f882f16dfe12d0cfe269e7daa25ad91f3a32cbf653aba`.
+
+This release includes guarded recovery, durable inverse evidence, approved immutable-file protection, and independently guarded nftables/RouterOS 7 network recovery. Network recovery and SQL writes retain human approval per action. The validation scripts add read-only preflight, a real immutable enforcement check, isolated native nft JSON checks, fixed-window probe observation, and bounded approved-fault campaigns. Every script uses operator-provided paths and reviewed scope. They create no approval and provide no automatic campaign cleanup or resume.
+
+The code ZIP contains seven generic Python files. Extract it privately and bind `SB_PYZ` to the exact application archive. Start with `preflight.py` on an idle authorized disposable VM. Run `nft_syntax.py` only with `unshare --net`; it refuses the host namespace. The immutable check uses unique temporary files and restores their native flags in its cleanup. Fault campaigns require an already reviewed running session, approved targets, authenticated baseline, declared transactions and an available recovery budget.
+
+Native 2.0.28 acceptance and availability measurements remain unfinished; prior 2.0.20 measurements below do not certify this release.
+
+## Historical 2.0.20 validation
+
+The historical application is [the 2.0.20 archive](https://github.com/joshua08271/Sentinel-Blue/blob/2d809502a794d427603e28806cdd06308751a0e8/sentinel-blue.pyz). It requires a compatible existing Python environment. Matching source and rehearsal tools are in [candidate-2.0.20/source.tar.gz](candidate-2.0.20/source.tar.gz?raw=true).
 
 The complete offline x86-64 Linux installer is published as transport pieces in [installer-2.0.20](installer-2.0.20/). Download its ten `installer.partNNN` files and `Join_Installer_2.0.20.py` into one folder, then run `python3 Join_Installer_2.0.20.py`. The standard-library joiner verifies all pieces and the complete file, refuses overwrite, and does not execute the installer. Enable execution on the assembled `.run` file, then open it. The installer includes Python and Tk; no dependency download is required.
 
