@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import fcntl
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import socket
@@ -32,6 +34,7 @@ FAULT_BYTES = b'# Sentinel disposable coverage fault\n'
 CODE_NAMES = {'campaign.py', 'kernel_immutable.py', 'measurement.py', 'nft_syntax.py',
               'observer.py', 'preflight.py', 'scored_scenarios.py'}
 LOGIN_ROWS = None
+TRANSACTIONS = Path('/var/lib/sentinel-blue-setup-transactions')
 
 
 def digest(data):
@@ -63,6 +66,8 @@ def admission(args):
         raise ValueError('requires explicit approval for an idle disposable guest with native systemd; hypervisors refused')
     if os.environ.get('SENTINEL_LEDGER_DIR') or os.path.lexists('/var/lib/sentinel-blue-ledger'):
         raise ValueError('existing host ledger or ledger override requires separate review; no fixture created')
+    if os.path.lexists(TRANSACTIONS):
+        raise ValueError('existing native setup transactions require separate ownership review; no fixture created')
     for entry in Path('/proc').iterdir():
         if not entry.name.isdecimal() or int(entry.name) == os.getpid():
             continue
@@ -188,6 +193,105 @@ def require_owned_file(path, allowed, expected_metadata):
         raise ValueError('fixture bytes or security metadata changed outside the known test; preserve it for review')
 
 
+def setup_evidence(report):
+    """Keep bounded worker diagnostics, excluding private command output/inputs."""
+    fields = {'status', 'error_type', 'reason', 'pause_reason', 'elapsed_seconds',
+              'task_count', 'tasks_ready', 'all_declared_services_ready', 'changed',
+              'healthy', 'returncode', 'uncertain', 'attempts', 'kind', 'seconds',
+              'failure_reason', 'rollback_error_type', 'rollback_confirmed',
+              'already_ready', 'latency_ms', 'output_sha256', 'output_bytes'}
+    def project(value, depth=0):
+        if depth > 8:
+            return {'diagnostic_limit': True}
+        if isinstance(value, list):
+            return [project(item, depth + 1) for item in value[:64]]
+        if not isinstance(value, dict):
+            return value if value is None or type(value) in {bool, int, float} else str(value)[:500]
+        result = {key: project(item, depth + 1) for key, item in value.items() if key in fields}
+        for key in ('checks', 'final_checks', 'admission', 'apply', 'rollback', 'commit'):
+            if key in value:
+                result[key] = project(value[key], depth + 1)
+        if 'tasks' in value:
+            result['tasks'] = {name: project(row, depth + 1) for name, row in list(value['tasks'].items())[:8]}
+        return result
+    return project(report)
+
+
+def remove_owned_transactions(unit, evidence=None, *, fixture_absent=False, expected_root=None, review_only=False):
+    """Delete only completed records for this disposable unit under its lock.
+
+    Refuse another transaction, pending resource claim, unknown file, or a
+    live Sentinel process. Failed/uncertain transactions keep their ledger.
+    """
+    if not os.path.lexists(TRANSACTIONS):
+        return []
+    from sentinel_blue.state import read_private_json, write_private_json
+    private_root(TRANSACTIONS)
+    lock = TRANSACTIONS / 'lock'
+    info = lock.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022:
+        raise ValueError('native transaction lock changed; preserve records')
+    fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.fstat(fd).st_ino != info.st_ino:
+            raise ValueError('native transaction lock was replaced')
+        entries = list(TRANSACTIONS.iterdir())
+        records = []
+        for entry in entries:
+            if entry == lock:
+                continue
+            if not re.fullmatch('[0-9a-f]{32}', entry.name):
+                raise ValueError('another native resource or unknown entry requires review')
+            private_root(entry)
+            if {p.name for p in entry.iterdir()} != {'state.json'}:
+                raise ValueError('native transaction has additional files; preserve it')
+            row = read_private_json(entry / 'state.json')
+            spec = row.get('spec', {})
+            if (row.get('status') not in {'committed', 'rolled-back'}
+                    or spec.get('service') != unit or spec.get('recipe') != 'linux-service'
+                    or spec.get('files') != []):
+                raise ValueError('uncompleted or different native transaction requires its retained ledger')
+            records.append({'transaction': entry.name, 'state': row})
+        if review_only:
+            if evidence is not None:
+                write_private_json(evidence / 'completed-native-transactions.json', records)
+            return records
+        if fixture_absent:
+            nonce = unit.removeprefix('sb-content-').removesuffix('.service')
+            root = Path('/srv/sb-content-' + nonce)
+            if (not re.fullmatch('[0-9a-f]{16}', nonce)
+                    or os.path.lexists(root) and expected_root != root
+                    or os.path.lexists('/etc/systemd/system/' + unit)
+                    or command('systemctl', 'show', unit, '--property=LoadState', '--value').stdout.strip() != 'not-found'):
+                raise ValueError('disposable fixture is not proved absent')
+        else:
+            raise ValueError('stop and remove the disposable fixture before deleting its completed native records')
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+                continue
+            try:
+                argv = (entry / 'cmdline').read_bytes().split(b'\0')
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if any(b'sentinel-blue' in arg.lower() or b'sentinel_blue' in arg.lower() for arg in argv):
+                raise ValueError('a Sentinel process remains; preserve native transaction records')
+        if evidence is not None:
+            write_private_json(evidence / 'completed-native-transactions.json', records)
+        for record in records:
+            entry = TRANSACTIONS / record['transaction']
+            if read_private_json(entry / 'state.json') != record['state']:
+                raise ValueError('native transaction changed before cleanup')
+            safe_remove_tree(entry)
+        if set(TRANSACTIONS.iterdir()) != {lock}:
+            raise ValueError('native transaction directory changed during cleanup')
+        lock.unlink()
+        TRANSACTIONS.rmdir()
+        return records
+    finally:
+        os.close(fd)
+
+
 def run(args):
     app, code = admission(args)
     nonce = secrets.token_hex(8)
@@ -311,7 +415,12 @@ def run(args):
         report_path = job_path.parent / 'result.json'
         wait_for('owned setup completion', 120, lambda: report_path.exists())
         setup_report = read_private_json(report_path)
-        if setup_report.get('status') not in {'passed', 'ready'} or worker.wait(timeout=20) != 0:
+        collected['setup'] = setup_evidence(setup_report)
+        write_private_json(evidence / 'setup-diagnostics.json', collected['setup'])
+        result['setup'] = collected['setup']
+        worker_code = worker.wait(timeout=20)
+        result['setup_worker_exit_code'] = worker_code
+        if setup_report.get('status') not in {'passed', 'ready'} or worker_code != 0:
             raise RuntimeError('owned setup did not pass; no fault injected')
         approve_clean_baseline(config, client)
         result['phase'] = 'recovery_budget'
@@ -344,7 +453,7 @@ def run(args):
                 runner=lambda opt: (occupancy(), fault(opt))[1])
         result['status'] = ('passed' if collected['campaign'].get('status') == 'completed' else 'held')
     except (Exception, KeyboardInterrupt) as exc:
-        result.update(status='held', error_type=type(exc).__name__)
+        result.update(status='held', error_type=type(exc).__name__, reason=str(exc)[:500])
     finally:
         # Keep the entire observer window even when a fault held.
         if observation:
@@ -401,6 +510,7 @@ def run(args):
             except Exception as exc:
                 result.update(status='held', cleanup_error=type(exc).__name__)
         try:
+            remove_owned_transactions(unit.name, evidence, review_only=True)
             for path, allowed in ((server, {server_bytes}), (body, {good, FAULT_BYTES})):
                 require_owned_file(path, allowed, owned_metadata[str(path)])
             if str(unit) in owned_metadata and not os.path.lexists(unit):
@@ -416,6 +526,10 @@ def run(args):
                 unit.unlink(); command('systemctl', 'daemon-reload')
             if (runner and runner.poll() is None) or (worker and worker.poll() is None):
                 raise RuntimeError('owned runtime still active; preserve its files')
+            # Keep the private job and ledger if transaction ownership needs
+            # review. Never erase the only authenticated recovery evidence.
+            completed = remove_owned_transactions(unit.name, evidence, fixture_absent=True, expected_root=root)
+            result['completed_native_transactions_removed'] = len(completed)
             safe_remove_tree(root)
             result['fixture_removed'] = True
         except Exception as exc:
@@ -444,4 +558,22 @@ if __name__ == '__main__':
     parser.add_argument('--ack-disposable-vm', action='store_true')
     parser.add_argument('--approve-owned-fixture', action='store_true')
     parser.add_argument('--console-evidence', action='store_true', help='print compressed private sanitized timelines for retention')
-    raise SystemExit(run(parser.parse_args()))
+    parser.add_argument('--cleanup-completed-fixture', help='review and remove completed native records for an already absent disposable sb-content unit; no test starts')
+    args = parser.parse_args()
+    if args.cleanup_completed_fixture:
+        if (not args.ack_disposable_vm or not args.approve_owned_fixture or os.geteuid() != 0
+                or Path('/proc/1/comm').read_text().strip() != 'systemd'
+                or Path('/etc/pve').exists() or Path('/usr/bin/pveversion').exists()
+                or not re.fullmatch(r'sb-content-[0-9a-f]{16}\.service', args.cleanup_completed_fixture)
+                or os.environ.get('SENTINEL_LEDGER_DIR') or os.path.lexists('/var/lib/sentinel-blue-ledger')):
+            raise ValueError('completed-fixture cleanup requires explicit owned disposable guest approval and no existing host ledger')
+        occupancy()
+        runtime = Path(args.runtime).absolute()
+        if digest(runtime.read_bytes()) != APP_SHA:
+            raise ValueError('cleanup requires the frozen reviewed application')
+        sys.path.insert(0, str(runtime))
+        records = remove_owned_transactions(args.cleanup_completed_fixture, fixture_absent=True)
+        print(json.dumps({'schema': 1, 'status': 'completed', 'unit': args.cleanup_completed_fixture,
+                          'completed_native_transactions_removed': len(records), 'retained_states': records}, indent=2))
+        raise SystemExit(0)
+    raise SystemExit(run(args))
