@@ -114,9 +114,19 @@ def review_profile(config, body, unit):
         raise ValueError('fixture review refuses accounts, data stores or additional services')
     if sorted(manifest['repair_policy']['restore_files']) != owned:
         raise ValueError('generated repair scope differs from the two owned fixture files')
-    # Omit normal host-wide integrity observations from this narrow rehearsal.
-    manifest['required_files'] = owned
-    manifest['repair_policy']['host_files'] = []
+    # The frozen agent always collects its default integrity inventory. Its
+    # initial baseline is aggregate: every observed file needs explicit
+    # capture authority. Keep those observations capture-only; only the two
+    # new fixture files may be repaired, and no host integrity restore action
+    # is authorized by this manifest. Private snapshots never leave the guest.
+    from sentinel_blue.collectors import integrity_watch_paths
+    read_only = sorted({path for path in integrity_watch_paths(owned)
+                        if Path(path).is_file()} - set(owned))
+    manifest['required_files'] = sorted([*owned, *read_only])
+    manifest['repair_policy']['host_files'] = read_only
+    if any(action in manifest[key] for key in ('allowed_automatic_actions', 'approval_actions')
+           for action in ('restore_integrity', 'rollback_integrity', 'quarantine_account', 'terminate_session')):
+        raise ValueError('read-only host baseline coverage must not grant host integrity or account mutations')
     raw = coverage_candidate(raw, 'local-linux', unit.name,
                              [{'path': str(body), 'kind': 'content'}], repeated_disruption=True)
     pending = EventProfile.from_dict(raw)
@@ -137,8 +147,8 @@ def review_profile(config, body, unit):
     write_private_json(directory / 'enrollment.json',
                        {'token': derive_enrollment_ticket(master, profile.fingerprint, 'local-linux')})
     probes = manifest['expected_transactions']
-    write_private_json(directory / 'probes.json', {'probes': probes, 'protected_paths': owned})
-    config['baseline_capture_paths'] = owned
+    write_private_json(directory / 'probes.json', {'probes': probes, 'protected_paths': manifest['required_files']})
+    config['baseline_capture_paths'] = manifest['required_files']
     config['repair_coverage'][unit.name]['alert_only'] = []
     write_private_json(directory / 'session.json', config)
     inventory = read_private_json(config['inventory'])
@@ -197,7 +207,7 @@ def setup_evidence(report):
     """Keep bounded worker diagnostics, excluding private command output/inputs."""
     fields = {'status', 'error_type', 'reason', 'pause_reason', 'elapsed_seconds',
               'task_count', 'tasks_ready', 'all_declared_services_ready', 'changed',
-              'healthy', 'returncode', 'uncertain', 'attempts', 'kind', 'seconds',
+              'healthy', 'returncode', 'uncertain', 'attempts', 'kind', 'seconds', 'error',
               'failure_reason', 'rollback_error_type', 'rollback_confirmed',
               'already_ready', 'latency_ms', 'output_sha256', 'output_bytes'}
     def project(value, depth=0):
